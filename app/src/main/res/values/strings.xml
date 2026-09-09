@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ShizuPosed Manager</string>
+    
+    <!-- Navigation -->
+    <string name="nav_home">Home</string>
+    <string name="nav_modules">Modules</string>
+    <string name="nav_logs">Logs</string>
+    <string name="nav_settings">Settings</string>
+    
+    <!-- Home -->
+    <string name="status">Status</string>
+    <string name="hooked_processes">Hooked Processes</string>
+    <string name="total_apps">Total Apps</string>
+    <string name="refresh">Refresh</string>
+    <string name="start_service">Start Service</string>
+    <string name="service_running">Running</string>
+    <string name="service_stopped">Stopped</string>
+    
+    <!-- Modules -->
+    <string name="modules">Modules</string>
+    <string name="search_modules">Search modules...</string>
+    <string name="filter_all">All</string>
+    <string name="filter_enabled">Enabled</string>
+    <string name="filter_disabled">Disabled</string>
+    <string name="add_module">Add Module</string>
+    <string name="no_modules">No modules installed</string>
+    <string name="module_details">Module Details</string>
+    <string name="uninstall_module">Uninstall Module</string>
+    <string name="confirm_uninstall">Are you sure you want to uninstall this module?</string>
+    
+    <!-- Logs -->
+    <string name="logs">Logs</string>
+    <string name="search_logs">Search logs...</string>
+    <string name="clear_logs">Clear Logs</string>
+    <string name="export_logs">Export Logs</string>
+    <string name="no_logs">No logs available</string>
+    <string name="confirm_clear_logs">Are you sure you want to clear all logs?</string>
+    
+    <!-- Settings -->
+    <string name="settings">Settings</string>
+    <string name="auto_start">Auto Start</string>
+    <string name="auto_start_desc">Start service on boot</string>
+    <string name="debug_mode">Debug Mode</string>
+    <string name="debug_mode_desc">Enable debug logging</string>
+    <string name="log_to_file">Log to File</string>
+    <string name="log_to_file_desc">Save logs to internal storage</string>
+    <string name="scan_interval">Scan Interval (ms)</string>
+    <string name="hook_delay">Hook Delay (ms)</string>
+    <string name="restart_service">Restart Service</string>
+    <string name="clear_cache">Clear Cache</string>
+    <string name="export_config">Export Config</string>
+    <string name="shizuku_status">Shizuku</string>
+    <string name="service_status">Service</string>
+    <string name="hooked_count">Hooked</string>
+    
+    <!-- Shizuku -->
+    <string name="shizuku_available">Available</string>
+    <string name="shizuku_unavailable">Unavailable</string>
+    <string name="shizuku_authorized">Authorized</string>
+    <string name="shizuku_unauthorized">Not Authorized</string>
+    <string name="grant_shizuku">Grant Shizuku Permission</string>
+    <string name="shizuku_permission_required">Shizuku permission required for privileged operations</string>
+    
+    <!-- Errors -->
+    <string name="error">Error</string>
+    <string name="success">Success</string>
+    <string name="failed">Failed</string>
+    <string name="retry">Retry</string>
+    <string name="cancel">Cancel</string>
+    <string name="ok">OK</string>
+    <string name="yes">Yes</string>
+    <string name="no">No</string>
+</resources>

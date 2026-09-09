@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Button styles -->
+    <style name="Widget.MaterialComponents.Button.OutlinedButton" parent="Widget.AppCompat.Button.Borderless">
+        <item name="android:background">@android:drawable/btn_default</item>
+        <item name="android:textColor">?attr/colorPrimary</item>
+    </style>
+
+    <!-- Chip styles -->
+    <style name="Widget.MaterialComponents.Chip.Filter" parent="Widget.AppCompat.Button">
+        <item name="android:background">@android:drawable/btn_default</item>
+    </style>
+
+    <!-- Card styles -->
+    <style name="Widget.MaterialComponents.CardView" parent="CardView">
+        <item name="cardCornerRadius">@dimen/card_corner_radius</item>
+        <item name="cardElevation">@dimen/card_elevation</item>
+    </style>
+</resources>
