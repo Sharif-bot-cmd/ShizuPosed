@@ -11,17 +11,16 @@ import android.widget.Toast;
 import com.shizuposed.manager.utils.Logger;
 import com.shizuposed.manager.utils.ShellUtils;
 
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import rikka.shizuku.Shizuku;
 import rikka.sui.Sui;
-
-import java.io.BufferedReader;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
 
 public class ShizukuHelper {
     private static final String TAG = "ShizukuHelper";
@@ -30,8 +29,8 @@ public class ShizukuHelper {
 
     private Context context;
     private Logger logger;
-    private boolean isAvailable = false;
-    private boolean isAuthorized = false;
+    private volatile boolean isAvailable = false;
+    private volatile boolean isAuthorized = false;
     private int shizukuVersion = 0;
     private boolean isSui = false;
     private boolean binderStatus = false;
@@ -39,8 +38,14 @@ public class ShizukuHelper {
     private static final String SHIZUKU_API_PACKAGE = "moe.shizuku.privileged.api";
     private static final String SHIZUKU_MANAGER_PACKAGE = "moe.shizuku.manager";
 
-    // ✅ Guards against requesting permission more than once at a time
+    // Guards against requesting permission more than once at a time
     private final AtomicBoolean permissionRequestInFlight = new AtomicBoolean(false);
+
+    // Ensures Shizuku listeners are registered at most once
+    private final AtomicBoolean listenersRegistered = new AtomicBoolean(false);
+
+    // Guards against re-entering autoStartServiceIfPossible on the same stack
+    private final AtomicBoolean inAutoStart = new AtomicBoolean(false);
 
     // ─────────────────────────────────────────────────────────────
     // Permission listeners
@@ -58,6 +63,7 @@ public class ShizukuHelper {
             permissionListeners.add(l);
         }
         if (isAuthorized) {
+            // Never call the listener synchronously on the caller's stack.
             new Handler(Looper.getMainLooper()).post(l::onPermissionGranted);
         }
     }
@@ -89,8 +95,8 @@ public class ShizukuHelper {
         public void onBinderReceived() {
             binderStatus = true;
             isAvailable = true;
-            checkPermission();
             logger.i("Shizuku binder received");
+            checkPermission();
         }
     };
 
@@ -112,13 +118,11 @@ public class ShizukuHelper {
         public void onRequestPermissionResult(int requestCode, int grantResult) {
             if (requestCode != SHIZUKU_CODE) return;
 
-            // ✅ Clear the in-flight flag on every result
             permissionRequestInFlight.set(false);
 
             if (grantResult == PackageManager.PERMISSION_GRANTED) {
                 isAuthorized = true;
                 logger.i("✅ Shizuku permission GRANTED!");
-                autoStartServiceIfPossible();
                 notifyPermissionGranted();
                 if (context instanceof ShizuPosedManagerApp) {
                     ShizuPosedManagerApp app = (ShizuPosedManagerApp) context;
@@ -155,7 +159,10 @@ public class ShizukuHelper {
                 if (isSui) {
                     logger.i("✅ Sui detected and initialized!");
                     isAvailable = true;
-                    checkPermission();
+                    // Defer registration: no sticky callbacks until after
+                    // the constructor has returned and `instance` is cached.
+                    postRegisterListeners();
+                    checkPermissionDeferred();
                     return;
                 }
             } catch (NoClassDefFoundError e) {
@@ -182,22 +189,25 @@ public class ShizukuHelper {
                 logger.i("✅ Shizuku Manager installed (moe.shizuku.manager)");
             }
 
-            Shizuku.addBinderReceivedListenerSticky(binderListener);
-            Shizuku.addBinderDeadListener(binderDeadListener);
-            Shizuku.addRequestPermissionResultListener(permissionResultListener);
-
+            // Read binder status WITHOUT registering listeners
             binderStatus = Shizuku.pingBinder();
 
             if (binderStatus && !Shizuku.isPreV11()) {
                 isAvailable = true;
                 shizukuVersion = Shizuku.getVersion();
-                checkPermission();
                 logger.i("✅ Shizuku v" + shizukuVersion + " available");
             } else {
                 isAvailable = false;
                 logger.w("❌ Shizuku is not active");
                 logger.w("   binder: " + binderStatus + ", preV11: " + Shizuku.isPreV11());
             }
+
+            // Now that we're done reading state, schedule listener registration.
+            postRegisterListeners();
+
+            // And schedule the initial permission check to run after listeners
+            // are wired up.
+            checkPermissionDeferred();
 
         } catch (NoClassDefFoundError e) {
             logger.e("Shizuku API not found: " + e.getMessage());
@@ -206,6 +216,26 @@ public class ShizukuHelper {
             logger.e("Shizuku init failed: " + e.getMessage());
             isAvailable = false;
         }
+    }
+
+    private void postRegisterListeners() {
+        new Handler(Looper.getMainLooper()).post(this::registerListeners);
+    }
+
+    private void registerListeners() {
+        if (!listenersRegistered.compareAndSet(false, true)) return;
+        try {
+            Shizuku.addBinderReceivedListenerSticky(binderListener);
+            Shizuku.addBinderDeadListener(binderDeadListener);
+            Shizuku.addRequestPermissionResultListener(permissionResultListener);
+            logger.d("Shizuku listeners registered");
+        } catch (Throwable t) {
+            logger.e("Failed to register Shizuku listeners: " + t.getMessage());
+        }
+    }
+
+    private void checkPermissionDeferred() {
+        new Handler(Looper.getMainLooper()).post(this::checkPermission);
     }
 
     private boolean isShizukuApiInstalled() {
@@ -245,10 +275,13 @@ public class ShizukuHelper {
 
         try {
             if (isSui) {
+                boolean was = isAuthorized;
                 isAuthorized = true;
                 logger.i("✅ Sui is active");
-                autoStartServiceIfPossible();
-                notifyPermissionGranted();
+                if (!was) {
+                    notifyPermissionGranted();
+                    autoStartServiceIfPossible();
+                }
                 return;
             }
 
@@ -258,11 +291,12 @@ public class ShizukuHelper {
 
             if (isAuthorized) {
                 logger.i("✅ Shizuku permission GRANTED");
-                autoStartServiceIfPossible();
-                if (!wasAuthorized) notifyPermissionGranted();
+                if (!wasAuthorized) {
+                    notifyPermissionGranted();
+                    autoStartServiceIfPossible();
+                }
             } else {
                 logger.w("⚠️ Shizuku permission NOT GRANTED");
-                // ✅ Only schedule the request if one isn't already pending
                 if (permissionRequestInFlight.compareAndSet(false, true)) {
                     new Handler(Looper.getMainLooper()).postDelayed(() -> {
                         permissionRequestInFlight.set(false);
@@ -278,13 +312,30 @@ public class ShizukuHelper {
         }
     }
 
+    /**
+     * Nudge the Application to start the service.
+     *
+     * Do NOT call getInstance() or isAuthorized() from inside this method —
+     * it runs on the permission-grant path, and the Application may itself
+     * be mid-initialization. The Application reads its own flags; we just
+     * signal it.
+     */
     private void autoStartServiceIfPossible() {
+        if (!inAutoStart.compareAndSet(false, true)) {
+            // Already inside this call chain on the current thread
+            return;
+        }
         try {
             if (context instanceof ShizuPosedManagerApp) {
-                ((ShizuPosedManagerApp) context).autoStartService();
+                ShizuPosedManagerApp app = (ShizuPosedManagerApp) context;
+                // Post to the looper so we never run on the binder / permission
+                // callback thread, and so any re-entrancy has a chance to settle.
+                new Handler(Looper.getMainLooper()).post(app::autoStartService);
             }
-        } catch (Exception e) {
-            logger.e("Failed to auto-start service: " + e.getMessage());
+        } catch (Throwable t) {
+            logger.e("Failed to auto-start service: " + t.getMessage());
+        } finally {
+            inAutoStart.set(false);
         }
     }
 
@@ -297,8 +348,6 @@ public class ShizukuHelper {
             logger.i("Shizuku already authorized");
             return;
         }
-
-        // ✅ Single-flight guard: at most one outstanding request
         if (!permissionRequestInFlight.compareAndSet(false, true)) {
             logger.d("Shizuku permission request already in flight — skipping");
             return;
@@ -316,7 +365,6 @@ public class ShizukuHelper {
             );
 
         } catch (Exception e) {
-            // ✅ Allow retry on failure
             permissionRequestInFlight.set(false);
             logger.e("Failed to request permission: " + e.getMessage());
         }
@@ -473,6 +521,7 @@ public class ShizukuHelper {
             Shizuku.removeBinderDeadListener(binderDeadListener);
             Shizuku.removeRequestPermissionResultListener(permissionResultListener);
         } catch (Exception ignored) {}
+        listenersRegistered.set(false);
         permissionListeners.clear();
     }
 
