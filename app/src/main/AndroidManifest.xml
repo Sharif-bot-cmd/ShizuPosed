@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Permissions -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Shizuku Permission -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+
+    <!--
+        Android 11+ package visibility.
+        Allows the ShizuPosed app itself to see and query its own provider
+        (needed on some OEM ROMs), and lets anything that asks about the
+        provider authority resolve it without hitting the visibility wall.
+    -->
+    <queries>
+        <provider android:authorities="com.shizuposed.manager.status" />
+    </queries>
+
+    <application
+        android:name=".ShizuPosedManagerApp"
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@drawable/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.ShizuPosedManager"
+        android:requestLegacyExternalStorage="true"
+        android:usesCleartextTraffic="true"
+        android:resizeableActivity="true"
+        android:screenOrientation="portrait"
+        tools:targetApi="31">
+
+        <!-- ✅ Shizuku Provider - ONLY Shizuku -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!--
+            ═══════════════════════════════════════════════════════
+            ModuleStatusProvider
+            Exposes read-only module enable/disable status to external
+            modules so they can show "Module is Active / Inactive" in
+            their own config UIs.
+            The provider shares the app's process, so it sees the same
+            ModuleLoader singleton the rest of the manager uses.
+            ═══════════════════════════════════════════════════════
+        -->
+        <provider
+            android:name=".status.ModuleStatusProvider"
+            android:authorities="com.shizuposed.manager.status"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.ShizuPosedManager"
+            android:windowSoftInputMode="adjustResize"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            ShizuPosedService
+            NOTE: android:process=":shizuposed" REMOVED.
+            Keeping the service in the default process lets ProcessMonitor /
+            ShizuPosedManagerApp share singletons, which is required for the
+            dex-deploy flow to find the service instance.
+        -->
+        <service
+            android:name=".service.ShizuPosedService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- ✅ Boot Receiver -->
+        <receiver
+            android:name=".receiver.BootReceiver"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.REBOOT" />
+            </intent-filter>
+        </receiver>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+    </application>
+
+</manifest>

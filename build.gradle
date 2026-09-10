@@ -1,0 +1,26 @@
+// build.gradle
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url 'https://jitpack.io' }
+        maven { url 'https://maven.rikka.dev/releases' }
+    }
+    dependencies {
+        // Android Gradle Plugin 8.7.0 is compatible with JDK 21
+        classpath 'com.android.tools.build:gradle:8.7.0'
+    }
+}
+
+// Set Java version for all subprojects
+subprojects {
+    tasks.withType(JavaCompile) {
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
+        options.compilerArgs << '-Xlint:unchecked' << '-Xlint:deprecation'
+    }
+}
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}
