@@ -73,7 +73,7 @@ public class SettingsFragment extends Fragment {
         tvServiceStatus = view.findViewById(R.id.tvServiceStatus);
         tvHookedCount = view.findViewById(R.id.tvHookedCount);
 
-        tvVersion.setText("v1.9");
+        tvVersion.setText("Post v1.9");
     }
 
     private void setupListeners() {
