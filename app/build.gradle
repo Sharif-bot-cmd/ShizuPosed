@@ -11,7 +11,7 @@ android {
         minSdk 29
         targetSdk 35
         versionCode 15
-        versionName "Post 1.9"
+        versionName "Post 2.0"
     }
 
     buildTypes {

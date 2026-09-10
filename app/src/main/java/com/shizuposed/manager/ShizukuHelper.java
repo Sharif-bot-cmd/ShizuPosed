@@ -38,18 +38,13 @@ public class ShizukuHelper {
     private static final String SHIZUKU_API_PACKAGE = "moe.shizuku.privileged.api";
     private static final String SHIZUKU_MANAGER_PACKAGE = "moe.shizuku.manager";
 
-    // Guards against requesting permission more than once at a time
     private final AtomicBoolean permissionRequestInFlight = new AtomicBoolean(false);
-
-    // Ensures Shizuku listeners are registered at most once
     private final AtomicBoolean listenersRegistered = new AtomicBoolean(false);
-
-    // Guards against re-entering autoStartServiceIfPossible on the same stack
     private final AtomicBoolean inAutoStart = new AtomicBoolean(false);
 
-    // ─────────────────────────────────────────────────────────────
-    // Permission listeners
-    // ─────────────────────────────────────────────────────────────
+    // ✅ Show the "Please grant permission" toast at most once per session.
+    private final AtomicBoolean grantToastShown = new AtomicBoolean(false);
+
     public interface PermissionListener {
         void onPermissionGranted();
         void onPermissionDenied();
@@ -63,7 +58,6 @@ public class ShizukuHelper {
             permissionListeners.add(l);
         }
         if (isAuthorized) {
-            // Never call the listener synchronously on the caller's stack.
             new Handler(Looper.getMainLooper()).post(l::onPermissionGranted);
         }
     }
@@ -86,9 +80,6 @@ public class ShizukuHelper {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Shizuku binder listeners
-    // ─────────────────────────────────────────────────────────────
     private final Shizuku.OnBinderReceivedListener binderListener =
         new Shizuku.OnBinderReceivedListener() {
         @Override
@@ -108,6 +99,7 @@ public class ShizukuHelper {
             isAvailable = false;
             isAuthorized = false;
             permissionRequestInFlight.set(false);
+            grantToastShown.set(false);   // allow the toast again next session
             logger.w("Shizuku binder dead");
         }
     };
@@ -122,6 +114,7 @@ public class ShizukuHelper {
 
             if (grantResult == PackageManager.PERMISSION_GRANTED) {
                 isAuthorized = true;
+                grantToastShown.set(true);   // no need to nudge anymore
                 logger.i("✅ Shizuku permission GRANTED!");
                 notifyPermissionGranted();
                 if (context instanceof ShizuPosedManagerApp) {
@@ -159,8 +152,6 @@ public class ShizukuHelper {
                 if (isSui) {
                     logger.i("✅ Sui detected and initialized!");
                     isAvailable = true;
-                    // Defer registration: no sticky callbacks until after
-                    // the constructor has returned and `instance` is cached.
                     postRegisterListeners();
                     checkPermissionDeferred();
                     return;
@@ -189,7 +180,6 @@ public class ShizukuHelper {
                 logger.i("✅ Shizuku Manager installed (moe.shizuku.manager)");
             }
 
-            // Read binder status WITHOUT registering listeners
             binderStatus = Shizuku.pingBinder();
 
             if (binderStatus && !Shizuku.isPreV11()) {
@@ -202,11 +192,7 @@ public class ShizukuHelper {
                 logger.w("   binder: " + binderStatus + ", preV11: " + Shizuku.isPreV11());
             }
 
-            // Now that we're done reading state, schedule listener registration.
             postRegisterListeners();
-
-            // And schedule the initial permission check to run after listeners
-            // are wired up.
             checkPermissionDeferred();
 
         } catch (NoClassDefFoundError e) {
@@ -312,24 +298,13 @@ public class ShizukuHelper {
         }
     }
 
-    /**
-     * Nudge the Application to start the service.
-     *
-     * Do NOT call getInstance() or isAuthorized() from inside this method —
-     * it runs on the permission-grant path, and the Application may itself
-     * be mid-initialization. The Application reads its own flags; we just
-     * signal it.
-     */
     private void autoStartServiceIfPossible() {
         if (!inAutoStart.compareAndSet(false, true)) {
-            // Already inside this call chain on the current thread
             return;
         }
         try {
             if (context instanceof ShizuPosedManagerApp) {
                 ShizuPosedManagerApp app = (ShizuPosedManagerApp) context;
-                // Post to the looper so we never run on the binder / permission
-                // callback thread, and so any re-entrancy has a chance to settle.
                 new Handler(Looper.getMainLooper()).post(app::autoStartService);
             }
         } catch (Throwable t) {
@@ -358,11 +333,14 @@ public class ShizukuHelper {
             Shizuku.requestPermission(SHIZUKU_CODE);
             logger.i("Shizuku permission requested");
 
-            new Handler(Looper.getMainLooper()).post(() ->
-                Toast.makeText(context,
-                    "Please grant permission in Shizuku app",
-                    Toast.LENGTH_LONG).show()
-            );
+            // ✅ Toast only once per session
+            if (grantToastShown.compareAndSet(false, true)) {
+                new Handler(Looper.getMainLooper()).post(() ->
+                    Toast.makeText(context,
+                        "Please grant permission in Shizuku app",
+                        Toast.LENGTH_LONG).show()
+                );
+            }
 
         } catch (Exception e) {
             permissionRequestInFlight.set(false);
@@ -375,9 +353,6 @@ public class ShizukuHelper {
     public int getVersion() { return shizukuVersion; }
     public boolean isSui() { return isSui; }
 
-    // ═════════════════════════════════════════════════════════════
-    // executeCommand() — runs as shell uid (2000) via AIDL
-    // ═════════════════════════════════════════════════════════════
     public ShellUtils.CommandResult executeCommand(String command) {
         ShellUtils.CommandResult result = new ShellUtils.CommandResult();
 

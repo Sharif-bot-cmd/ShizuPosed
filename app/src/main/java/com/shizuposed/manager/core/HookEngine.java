@@ -7,11 +7,22 @@ import java.lang.reflect.Method;
 import java.util.concurrent.ConcurrentHashMap;
 
 import de.robv.android.xposed.XC_MethodHook;
-import top.canyie.pine.Pine;
-import top.canyie.pine.callback.MethodHook;
 
 /**
- * HookEngine — Pine 0.3.0 backend, exposed via XposedHookBridge.
+ * HookEngine
+ *
+ * Front door to the hook subsystem. Registers all available backends
+ * with HookDispatcher, chooses the primary one, and exposes the same
+ * public API as before.
+ *
+ * Backends (in priority order):
+ *   1. Pine (AUTO mode)         — fastest, works on most methods
+ *   2. Pine (REPLACEMENT mode)  — slower, catches methods AUTO can't hook
+ *   3. Proxy                    — interface methods only, pure Java
+ *   4. Noop                     — always succeeds, does nothing
+ *
+ * The dispatcher tries each in order per hook, so one backend failing
+ * on a specific method doesn't take down the whole framework.
  */
 public class HookEngine {
 
@@ -20,7 +31,7 @@ public class HookEngine {
 
     private final ConcurrentHashMap<String, Method> registeredHooks = new ConcurrentHashMap<>();
     private volatile boolean initialized = false;
-    private volatile boolean pineInstalled = false;
+    private volatile boolean backendsInstalled = false;
 
     private HookEngine() {}
 
@@ -32,131 +43,92 @@ public class HookEngine {
     public synchronized void init() {
         if (initialized) return;
         initialized = true;
-        installPineBackend();
-        log("HookEngine initialized (backend="
-            + XposedHookBridge.getBackend().getClass().getSimpleName() + ")");
+
+        installBackends();
+
+        HookDispatcher d = HookDispatcher.getInstance();
+        log("HookEngine initialized (primary="
+            + (d.getPrimary() != null ? d.getPrimary().name() : "none") + ")");
     }
 
+    /**
+     * Idempotent. Safe to call before every hook operation.
+     */
     public static void ensureBackendInstalled() {
-        getInstance().installPineBackend();
+        getInstance().installBackends();
     }
 
-    // ─── Pine backend ────────────────────────────────────────────────
+    // ═════════════════════════════════════════════════════════════════
+    // BACKEND REGISTRATION
+    // ═════════════════════════════════════════════════════════════════
 
-    private synchronized void installPineBackend() {
-        if (pineInstalled) return;
+    private synchronized void installBackends() {
+        if (backendsInstalled) return;
+        backendsInstalled = true;
 
+        HookDispatcher d = HookDispatcher.getInstance();
+
+        // Register in priority order. The dispatcher picks the first
+        // one that reports itself available as the primary, then tries
+        // that one first for every hook.
+
+        // 1. Pine AUTO mode — fastest when it works
+        d.register(new com.shizuposed.manager.core.backends.PineBackend());
+
+        // 2. Pine REPLACEMENT mode — catches methods Pine AUTO rejects
+        d.register(new com.shizuposed.manager.core.backends.PineReplaceBackend());
+
+        // 3. Proxy — interface methods only
+        d.register(new com.shizuposed.manager.core.backends.ProxyBackend());
+
+        // 4. Noop — always succeeds, never fails the caller
+        d.register(new com.shizuposed.manager.core.backends.NoopBackend());
+
+        // Let the dispatcher pick the primary and be ready for hooks
+        d.initialize();
+
+        // Point XposedHookBridge at the dispatcher. This is the seam
+        // every module's findAndHookMethod funnels through.
         XposedHookBridge.setBackend(new XposedHookBridge.HookBackend() {
 
             @Override
             public void hook(Method original, XC_MethodHook callback) {
                 if (original == null || callback == null) return;
 
-                try { original.setAccessible(true); } catch (Throwable ignored) {}
+                // Try the dispatcher chain
+                boolean ok = d.installHook(original, callback);
 
-                try {
-                    Pine.hook(original, new MethodHook() {
-
-                        @Override
-                        public void beforeCall(Pine.CallFrame callFrame) throws Throwable {
-                            XC_MethodHook.MethodHookParam mp =
-                                new XC_MethodHook.MethodHookParam();
-                            mp.thisObject = callFrame.thisObject;
-                            mp.args = callFrame.args;
-
-                            callback.callBeforeHookedMethod(mp);
-
-                            if (mp.hasThrowable) {
-                                throw mp.getThrowable();
-                            }
-                            if (mp.hasResult) {
-                                callFrame.setResult(mp.getResult());
-                            }
-                        }
-
-                        @Override
-                        public void afterCall(Pine.CallFrame callFrame) throws Throwable {
-                            XC_MethodHook.MethodHookParam mp =
-                                new XC_MethodHook.MethodHookParam();
-                            mp.thisObject = callFrame.thisObject;
-                            mp.args = callFrame.args;
-                            mp.setResult(callFrame.getResult());
-
-                            callback.callAfterHookedMethod(mp);
-
-                            if (mp.hasThrowable) {
-                                throw mp.getThrowable();
-                            }
-                            if (mp.hasResult) {
-                                callFrame.setResult(mp.getResult());
-                            }
-                        }
-                    });
-
+                if (ok) {
                     String key = original.getDeclaringClass().getName()
                         + "." + original.getName();
                     registeredHooks.put(key, original);
-                    log("[Pine] hooked " + key);
-
-                } catch (Throwable t) {
-                    log("[Pine] hook FAILED on "
-                        + original.getDeclaringClass().getName() + "."
-                        + original.getName() + " — " + t);
                 }
+                // If !ok, the Noop backend would have "succeeded" anyway,
+                // so this branch is effectively unreachable in practice —
+                // but we keep the check for clarity.
             }
 
             @Override
             public void hookConstructor(Constructor<?> original, XC_MethodHook callback) {
                 if (original == null || callback == null) return;
 
-                try { original.setAccessible(true); } catch (Throwable ignored) {}
-
-                try {
-                    Pine.hook(original, new MethodHook() {
-
-                        @Override
-                        public void beforeCall(Pine.CallFrame callFrame) throws Throwable {
-                            XC_MethodHook.MethodHookParam mp =
-                                new XC_MethodHook.MethodHookParam();
-                            mp.thisObject = callFrame.thisObject;
-                            mp.args = callFrame.args;
-
-                            callback.callBeforeHookedMethod(mp);
-
-                            if (mp.hasThrowable) throw mp.getThrowable();
-                            if (mp.hasResult) callFrame.setResult(mp.getResult());
-                        }
-
-                        @Override
-                        public void afterCall(Pine.CallFrame callFrame) throws Throwable {
-                            XC_MethodHook.MethodHookParam mp =
-                                new XC_MethodHook.MethodHookParam();
-                            mp.thisObject = callFrame.thisObject;
-                            mp.args = callFrame.args;
-                            mp.setResult(callFrame.getResult());
-
-                            callback.callAfterHookedMethod(mp);
-
-                            if (mp.hasThrowable) throw mp.getThrowable();
-                            if (mp.hasResult) callFrame.setResult(mp.getResult());
-                        }
-                    });
-
+                boolean ok = d.installConstructorHook(original, callback);
+                if (ok) {
                     String key = original.getDeclaringClass().getName()
                         + ".<init>" + original.getParameterCount();
-                    log("[Pine] hooked constructor " + key);
-
-                } catch (Throwable t) {
-                    log("[Pine] ctor hook FAILED on "
-                        + original.getDeclaringClass().getName() + " — " + t);
+                    log("[dispatcher] hooked constructor " + key);
                 }
             }
         });
 
-        pineInstalled = true;
+        HookDispatcher.Backend primary = d.getPrimary();
+        log("Backends installed. Primary="
+            + (primary != null ? primary.name() : "none"));
     }
 
-    // ─── public API (kept stable) ────────────────────────────────────
+    // ═════════════════════════════════════════════════════════════════
+    // PUBLIC API (kept stable for callers)
+    // ═════════════════════════════════════════════════════════════════
 
     public boolean hookMethod(Method originalMethod, XC_MethodHook callback) {
         if (!initialized) init();
@@ -169,6 +141,7 @@ public class HookEngine {
         }
     }
 
+    /** Legacy signature — accepts the callback as Object. */
     public boolean hookMethod(Method originalMethod, Object callback) {
         if (callback instanceof XC_MethodHook) {
             return hookMethod(originalMethod, (XC_MethodHook) callback);
@@ -185,6 +158,13 @@ public class HookEngine {
 
     public boolean isInitialized() { return initialized; }
     public int getHookedCount() { return registeredHooks.size(); }
+
+    /**
+     * Expose the dispatcher for callers who want to inspect backends.
+     */
+    public HookDispatcher getDispatcher() {
+        return HookDispatcher.getInstance();
+    }
 
     private static void log(String msg) {
         try {

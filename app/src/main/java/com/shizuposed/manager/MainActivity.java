@@ -27,19 +27,19 @@ import androidx.fragment.app.Fragment;
 import androidx.viewpager2.widget.ViewPager2;
 
 import com.google.android.material.bottomnavigation.BottomNavigationView;
-import com.google.android.material.snackbar.Snackbar;
 import com.shizuposed.manager.adapter.MainPagerAdapter;
 import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.ui.HomeFragment;
 import com.shizuposed.manager.ui.LogsFragment;
 import com.shizuposed.manager.ui.ModulesFragment;
-import com.shizuposed.manager.ui.SettingsFragment;
 import com.shizuposed.manager.utils.Logger;
 
 import java.util.ArrayList;
 import java.util.List;
 
 public class MainActivity extends AppCompatActivity {
+    private static final String VERSION_LABEL = "v2.0";
+
     private ViewPager2 viewPager;
     private BottomNavigationView bottomNavigation;
     private Toolbar toolbar;
@@ -66,7 +66,6 @@ public class MainActivity extends AppCompatActivity {
                 if (allGranted) {
                     logger.i("✅ All runtime permissions granted");
                 } else {
-                    // Log at debug level — non-fatal, Shizuku is the real requirement
                     logger.d("Optional runtime permissions not granted: " + result);
                 }
 
@@ -92,12 +91,6 @@ public class MainActivity extends AppCompatActivity {
         checkAndRequestPermissions();
     }
 
-    /**
-     * Only request what we actually use. We need POST_NOTIFICATIONS on
-     * Android 13+ for the foreground service notification. Nothing else
-     * is required — module APKs are read via SAF and the hook dex lives in
-     * external app storage (no permission needed).
-     */
     private void checkAndRequestPermissions() {
         List<String> permissionsNeeded = new ArrayList<>();
 
@@ -118,31 +111,32 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * Called by ShizuPosedManagerApp when Shizuku grants us permission.
+     * No Snackbar — the toolbar status is the notification.
+     */
     public void onShizukuPermissionGranted() {
         runOnUiThread(() -> {
             shizukuAuthorized = true;
             isShizukuAvailable = true;
             shizukuChecked = true;
-            updateToolbarStatus("v1.9 • 🔑 Privileged");
-            Snackbar.make(findViewById(android.R.id.content),
-                "✅ Shizuku permission granted!", Snackbar.LENGTH_LONG).show();
+            updateToolbarStatus(VERSION_LABEL + " • 🔑 Privileged");
             refreshAll();
         });
     }
 
+    /**
+     * Called by ShizuPosedManagerApp when the service auto-starts.
+     * No Snackbar — the Home card and toolbar convey the state.
+     */
     public void onServiceAutoStarted() {
-        runOnUiThread(() -> {
-            Snackbar.make(findViewById(android.R.id.content),
-                "✅ Service started!", Snackbar.LENGTH_SHORT).show();
-            refreshAll();
-        });
+        runOnUiThread(this::refreshAll);
     }
 
     private void checkShizukuAndRequestPermission() {
-        // Don't re-run if we already know we're authorized
         if (shizukuChecked && shizukuAuthorized) {
             logger.d("Shizuku already checked and authorized");
-            updateToolbarStatus("v1.9 • 🔑 Privileged");
+            updateToolbarStatus(VERSION_LABEL + " • 🔑 Privileged");
             return;
         }
 
@@ -159,30 +153,26 @@ public class MainActivity extends AppCompatActivity {
                 ShizukuHelper.ShizukuStatus status = helper.checkShizukuActive();
                 if (status == ShizukuHelper.ShizukuStatus.NOT_INSTALLED) {
                     showShizukuNotInstalledDialog();
-                    updateToolbarStatus("v1.9 • ❌ Shizuku Not Installed");
+                    updateToolbarStatus(VERSION_LABEL + " • ❌ Shizuku Not Installed");
                 } else if (status == ShizukuHelper.ShizukuStatus.NOT_ACTIVE) {
                     showShizukuNotActiveDialog();
-                    updateToolbarStatus("v1.9 • ⚠️ Shizuku Not Running");
+                    updateToolbarStatus(VERSION_LABEL + " • ⚠️ Shizuku Not Running");
                 } else {
-                    updateToolbarStatus("v1.9 • ❌ Shizuku Error");
+                    updateToolbarStatus(VERSION_LABEL + " • ❌ Shizuku Error");
                 }
                 return;
             }
 
             if (!shizukuAuthorized) {
-                updateToolbarStatus("v1.9 • ⚠️ Not Authorized");
-                // ShizukuHelper's single-flight guard prevents stacking
+                updateToolbarStatus(VERSION_LABEL + " • ⚠️ Not Authorized");
                 helper.requestPermission();
             } else {
-                updateToolbarStatus("v1.9 • 🔑 Privileged");
-                if (app.isServiceAutoStarted()) {
-                    Snackbar.make(findViewById(android.R.id.content),
-                        "✅ Service running!", Snackbar.LENGTH_SHORT).show();
-                }
+                updateToolbarStatus(VERSION_LABEL + " • 🔑 Privileged");
+                // (removed the "Service running" Snackbar)
             }
         } catch (Exception e) {
             logger.e("Shizuku check error: " + e.getMessage());
-            updateToolbarStatus("v1.9 • ❌ Error");
+            updateToolbarStatus(VERSION_LABEL + " • ❌ Error");
         }
     }
 
@@ -203,7 +193,7 @@ public class MainActivity extends AppCompatActivity {
                         Uri.parse("https://github.com/RikkaApps/Shizuku/releases")));
                 }
             })
-            .setNegativeButton("Skip", (d, w) -> updateToolbarStatus("v1.9 • ⚠️ Limited"))
+            .setNegativeButton("Skip", (d, w) -> updateToolbarStatus(VERSION_LABEL + " • ⚠️ Limited"))
             .setCancelable(false)
             .show();
     }
@@ -225,7 +215,7 @@ public class MainActivity extends AppCompatActivity {
                     Toast.makeText(this, "Please open Shizuku manually", Toast.LENGTH_SHORT).show();
                 }
             })
-            .setNegativeButton("Skip", (d, w) -> updateToolbarStatus("v1.9 • ⚠️ Limited"))
+            .setNegativeButton("Skip", (d, w) -> updateToolbarStatus(VERSION_LABEL + " • ⚠️ Limited"))
             .setCancelable(false)
             .show();
     }
@@ -243,7 +233,7 @@ public class MainActivity extends AppCompatActivity {
             shizukuChecked = false;
             mainHandler.postDelayed(this::checkShizukuAndRequestPermission, 200);
         } else {
-            updateToolbarStatus("v1.9 • 🔑 Privileged");
+            updateToolbarStatus(VERSION_LABEL + " • 🔑 Privileged");
         }
     }
 
@@ -322,6 +312,10 @@ public class MainActivity extends AppCompatActivity {
         return super.onOptionsItemSelected(item);
     }
 
+    /**
+     * Refresh fragments. No Toast — the user-initiated refresh is
+     * already visible from the fragment UI updating.
+     */
     private void refreshAll() {
         for (int i = 0; i < pagerAdapter.getItemCount(); i++) {
             Fragment fragment = pagerAdapter.getFragment(i);
@@ -335,7 +329,6 @@ public class MainActivity extends AppCompatActivity {
         }
         shizukuChecked = false;
         checkShizukuAndRequestPermission();
-        Toast.makeText(this, "Refreshed", Toast.LENGTH_SHORT).show();
     }
 
     private void restartServices() {
@@ -353,7 +346,7 @@ public class MainActivity extends AppCompatActivity {
         boolean isSui = helper.isSui();
         boolean serviceStarted = app.isServiceAutoStarted();
 
-        String status = "ShizuPosed Manager v1.9\n\n" +
+        String status = "ShizuPosed Manager " + VERSION_LABEL + "\n\n" +
                        "Permissions: " + (permissionsGranted ? "✅ Granted" : "⚠️ Missing") + "\n" +
                        "Shizuku Status: " + (available ? "✅ Available" : "❌ Unavailable") + "\n" +
                        "Authorization: " + (authorized ? "✅ Authorized" : "❌ Not Authorized") + "\n" +

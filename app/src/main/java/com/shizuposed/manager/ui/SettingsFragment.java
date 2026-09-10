@@ -1,5 +1,6 @@
 package com.shizuposed.manager.ui;
 
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -9,6 +10,7 @@ import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.CompoundButton;
 import android.widget.EditText;
 import android.widget.Switch;
 import android.widget.TextView;
@@ -17,7 +19,6 @@ import android.widget.Toast;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.fragment.app.Fragment;
-import android.content.ComponentName;
 
 import com.shizuposed.manager.R;
 import com.shizuposed.manager.ShizukuHelper;
@@ -40,6 +41,41 @@ public class SettingsFragment extends Fragment {
     private ExecutorService executor = Executors.newSingleThreadExecutor();
     private ShizukuHelper shizukuHelper;
     private SharedPreferences prefs;
+
+    // ─────────────────────────────────────────────────────────────
+    // NAMED LISTENERS
+    // Kept as fields so loadSettings() can detach them while it
+    // programmatically sets the switch state, and reattach after.
+    // ─────────────────────────────────────────────────────────────
+    private final CompoundButton.OnCheckedChangeListener autoStartListener =
+        (buttonView, isChecked) -> {
+            saveSetting("auto_start", isChecked);
+            if (isChecked) {
+                enableBootReceiver();
+                Toast.makeText(requireContext(), "Auto-start enabled", Toast.LENGTH_SHORT).show();
+            } else {
+                disableBootReceiver();
+                Toast.makeText(requireContext(), "Auto-start disabled", Toast.LENGTH_SHORT).show();
+            }
+        };
+
+    private final CompoundButton.OnCheckedChangeListener debugModeListener =
+        (buttonView, isChecked) -> {
+            saveSetting("debug_mode", isChecked);
+            Logger.getInstance(requireContext()).setDebug(isChecked);
+            Toast.makeText(requireContext(),
+                isChecked ? "Debug mode enabled" : "Debug mode disabled",
+                Toast.LENGTH_SHORT).show();
+        };
+
+    private final CompoundButton.OnCheckedChangeListener logToFileListener =
+        (buttonView, isChecked) -> {
+            saveSetting("log_to_file", isChecked);
+            Logger.getInstance(requireContext()).setLogToFile(isChecked);
+            Toast.makeText(requireContext(),
+                isChecked ? "Logging to file enabled" : "Logging to file disabled",
+                Toast.LENGTH_SHORT).show();
+        };
 
     @Nullable
     @Override
@@ -73,7 +109,7 @@ public class SettingsFragment extends Fragment {
         tvServiceStatus = view.findViewById(R.id.tvServiceStatus);
         tvHookedCount = view.findViewById(R.id.tvHookedCount);
 
-        tvVersion.setText("Post v1.9");
+        tvVersion.setText("Post v2.0");
     }
 
     private void setupListeners() {
@@ -81,32 +117,9 @@ public class SettingsFragment extends Fragment {
         btnClearCache.setOnClickListener(v -> clearCacheSafe());
         btnExportConfig.setOnClickListener(v -> exportConfig());
 
-        swAutoStart.setOnCheckedChangeListener((buttonView, isChecked) -> {
-            saveSetting("auto_start", isChecked);
-            if (isChecked) {
-                enableBootReceiver();
-                Toast.makeText(requireContext(), "Auto-start enabled", Toast.LENGTH_SHORT).show();
-            } else {
-                disableBootReceiver();
-                Toast.makeText(requireContext(), "Auto-start disabled", Toast.LENGTH_SHORT).show();
-            }
-        });
-
-        swDebugMode.setOnCheckedChangeListener((buttonView, isChecked) -> {
-            saveSetting("debug_mode", isChecked);
-            Logger.getInstance(requireContext()).setDebug(isChecked);
-            Toast.makeText(requireContext(),
-                isChecked ? "Debug mode enabled" : "Debug mode disabled",
-                Toast.LENGTH_SHORT).show();
-        });
-
-        swLogToFile.setOnCheckedChangeListener((buttonView, isChecked) -> {
-            saveSetting("log_to_file", isChecked);
-            Logger.getInstance(requireContext()).setLogToFile(isChecked);
-            Toast.makeText(requireContext(),
-                isChecked ? "Logging to file enabled" : "Logging to file disabled",
-                Toast.LENGTH_SHORT).show();
-        });
+        swAutoStart.setOnCheckedChangeListener(autoStartListener);
+        swDebugMode.setOnCheckedChangeListener(debugModeListener);
+        swLogToFile.setOnCheckedChangeListener(logToFileListener);
     }
 
     private void enableBootReceiver() {
@@ -139,12 +152,25 @@ public class SettingsFragment extends Fragment {
         }
     }
 
+    /**
+     * Populate the switches from prefs WITHOUT firing their listeners.
+     * This is what stops "Logging to file enabled" from showing up
+     * every time the fragment becomes visible.
+     */
     private void loadSettings() {
+        swAutoStart.setOnCheckedChangeListener(null);
+        swDebugMode.setOnCheckedChangeListener(null);
+        swLogToFile.setOnCheckedChangeListener(null);
+
         swAutoStart.setChecked(prefs.getBoolean("auto_start", false));
         swDebugMode.setChecked(prefs.getBoolean("debug_mode", false));
         swLogToFile.setChecked(prefs.getBoolean("log_to_file", true));
         etScanInterval.setText(prefs.getString("scan_interval", "1"));
         etHookDelay.setText(prefs.getString("hook_delay", "5"));
+
+        swAutoStart.setOnCheckedChangeListener(autoStartListener);
+        swDebugMode.setOnCheckedChangeListener(debugModeListener);
+        swLogToFile.setOnCheckedChangeListener(logToFileListener);
 
         Logger logger = Logger.getInstance(requireContext());
         logger.setDebug(prefs.getBoolean("debug_mode", false));
@@ -165,7 +191,6 @@ public class SettingsFragment extends Fragment {
         requireActivity().runOnUiThread(() -> {
             if (!isAdded()) return;
 
-            // Shizuku status
             boolean shizukuAvailable = shizukuHelper.isAvailable();
             boolean shizukuAuthorized = shizukuHelper.isAuthorized();
             boolean isSui = shizukuHelper.isSui();
@@ -192,7 +217,6 @@ public class SettingsFragment extends Fragment {
                 tvShizukuStatus.setTextColor(requireContext().getColor(android.R.color.holo_red_light));
             }
 
-            // Service status — read the static flag set by ShizuPosedService
             ShizuPosedManagerApp app = ShizuPosedManagerApp.getInstance();
             boolean serviceRunning =
                 ShizuPosedService.isServiceRunning()
@@ -206,7 +230,6 @@ public class SettingsFragment extends Fragment {
                 tvServiceStatus.setTextColor(requireContext().getColor(android.R.color.holo_red_light));
             }
 
-            // Hooked count — real value from ProcessMonitor
             int hookedCount = getHookedProcessCount();
             tvHookedCount.setText(String.valueOf(hookedCount));
         });
@@ -342,10 +365,8 @@ public class SettingsFragment extends Fragment {
     @Override
     public void onResume() {
         super.onResume();
-        swAutoStart.setChecked(prefs.getBoolean("auto_start", false));
-        swDebugMode.setChecked(prefs.getBoolean("debug_mode", false));
-        swLogToFile.setChecked(prefs.getBoolean("log_to_file", true));
-
+        // Re-sync switches without firing their listeners
+        loadSettings();
         updateRealStatus();
     }
 

@@ -1,14 +1,15 @@
 # ShizuPosed - Xposed via Shizuku | Non-Root Hook Framework
 
-[![Version](https://img.shields.io/badge/version-1.9-green.svg)](https://github.com/Sharif-bot-cmd/ShizuPosed)
+[![Version](https://img.shields.io/badge/version-2.0-green.svg)](https://github.com/Sharif-bot-cmd/ShizuPosed)
 [![Android](https://img.shields.io/badge/Android-10%2B-brightgreen.svg)](https://developer.android.com)
 [![API](https://img.shields.io/badge/API-29%2B-blue.svg)](https://developer.android.com)
 [![License](https://img.shields.io/badge/License-Apache%202.0-red.svg)](LICENSE)
 
 **ShizuPosed** is a **non-root Xposed-style hook framework** for Android 10+ (API 29+).
 It runs a shell-side hook process via [Shizuku](https://github.com/thedjchi/Shizuku)
-(UID 2000) and installs method hooks using [Pine](https://github.com/canyie/pine),
-a pure-Java ART hooking library.
+(UID 2000) and installs method hooks using a **multi-backend dispatcher** whose
+primary engine is [Pine](https://github.com/canyie/pine), a pure-Java ART hooking
+library.
 
 It is **not** a replacement for LSPosed at zygote timing. Hooks are installed
 **after** the target app's `Application.onCreate()` has run, from inside the
@@ -22,6 +23,8 @@ target process. That trade-off is documented in detail below.
 - [Timing Model](#timing-model)
 - [How It Works](#how-it-works)
 - [Architecture](#architecture)
+- [Hook Dispatcher](#hook-dispatcher)
+- [Module Status API](#module-status-api)
 - [Features](#features)
 - [Requirements](#requirements)
 - [Installation](#installation)
@@ -38,8 +41,8 @@ target process. That trade-off is documented in detail below.
 
 ShizuPosed lets you run standard Xposed modules against apps on your device
 without modifying the system partition and without unlocking the bootloader.
-It does this by asking Shizuku for a shell-UID process, loading the hook
-payload into that process, and using Pine to replace ART method bodies.
+It asks Shizuku for a shell-UID process, loads a hook payload into that
+process, and installs ART method hooks via a fallback-capable dispatcher.
 
 ### What ShizuPosed is
 
@@ -47,6 +50,8 @@ payload into that process, and using Pine to replace ART method bodies.
 - Compatible with modules that use the standard `de.robv.android.xposed.*` API
   surface (via shim classes bundled with the manager).
 - **App-scoped**: you choose which apps each module applies to.
+- **Resilient**: multiple hook backends are tried per method, so one failure
+  doesn't take down the whole module.
 - **Non-persistent**: no system partition changes, no boot image changes.
 
 ### What ShizuPosed is not
@@ -127,7 +132,7 @@ works fine.
 │  │  │ 4. Load module dex via DexClassLoader                │  │    │
 │  │  │ 5. Call module.handleLoadPackage(LoadPackageParam)   │  │    │
 │  │  │ 6. Each findAndHookMethod → XposedHookBridge →       │  │    │
-│  │  │    HookEngine → Pine.hook(Method, MethodHook)        │  │    │
+│  │  │    HookDispatcher → first working backend wins       │  │    │
 │  │  └──────────────────────────────────────────────────────┘  │    │
 │  └────────────────────────────────────────────────────────────┘    │
 │                                                                      │
@@ -146,21 +151,15 @@ XposedHelpersImpl.findAndHookMethod(...)   (com.shizuposed.manager.core)
 XposedHookBridge.installHook(method, callback)
         │
         ▼
-HookEngine → Pine.hook(Method, MethodHook)
-        │
+HookDispatcher  ── tries backends in order ──►  Pine → Pine(REPLACEMENT)
+        │                                        → Proxy → Noop
         ▼
-MethodHook#beforeCall / #afterCall invoke the module's XC_MethodHook
+First backend that returns success wins
 ```
 
 The shim classes live in the `de.robv.android.xposed` package so that modules
 compiled against the standard Xposed API resolve correctly without any
 code changes on the module side.
-
-### Hook backend
-
-Pine is used as the actual ART manipulation layer. Pine is a pure-Java
-hooker: it detects the ART method structure at runtime, generates a stub,
-and swaps the method's entry point. No native `.so` is required.
 
 ---
 
@@ -197,12 +196,18 @@ ShizuPosedManager/
 │       │   │   └── ShizuPosedService.java      # Foreground + hook launcher
 │       │   ├── core/
 │       │   │   ├── XposedHook.java             # Runs inside target process
-│       │   │   ├── HookEngine.java             # Pine backend adapter
+│       │   │   ├── HookEngine.java             # Registers backends
+│       │   │   ├── HookDispatcher.java        # Multi-backend dispatcher
 │       │   │   ├── XposedHookBridge.java       # Backend seam
 │       │   │   ├── XposedHelpersImpl.java      # Standard Xposed helper impl
 │       │   │   ├── ModuleLoader.java           # Module persistence + scan
 │       │   │   ├── ProcessMonitor.java         # /proc scanning
-│       │   │   └── ResourceHooking.java        # Resource override registry
+│       │   │   ├── ResourceHooking.java        # Resource override registry
+│       │   │   └── backends/
+│       │   │       ├── PineBackend.java        # Pine AUTO mode
+│       │   │       ├── PineReplaceBackend.java # Pine REPLACEMENT mode
+│       │   │       ├── ProxyBackend.java       # Interface methods only
+│       │   │       └── NoopBackend.java        # Last-resort no-op
 │       │   ├── status/
 │       │   │   └── ModuleStatusProvider.java   # Exported ContentProvider
 │       │   ├── utils/
@@ -236,11 +241,103 @@ ShizuPosedManager/
 |---|---|
 | `ShizuPosedService` | Foreground service. Stages `XposedHook.dex` to external app storage, deploys it to `/data/user/0/com.android.shell/files/` via Shizuku, pushes module descriptors, launches targets under ShizuPosed. |
 | `ShizukuHelper` | Talks to Shizuku over the `IShizukuService` AIDL binder. Provides `executeCommand(String)` running as shell UID and `launchXposedHook(...)`. |
-| `XposedHook` | Runs inside the spawned `app_process`. Reads module JSONs, loads module dexes, calls `handleLoadPackage`, wires every `findAndHookMethod` to Pine. |
-| `HookEngine` | Installs Pine as the active hook backend. Translates `XC_MethodHook` to Pine's `MethodHook` and `Pine.CallFrame`. |
+| `XposedHook` | Runs inside the spawned `app_process`. Reads module JSONs, loads module dexes, calls `handleLoadPackage`, wires every `findAndHookMethod` to the dispatcher. |
+| `HookDispatcher` | Tries each registered backend per hook. First success wins. Never throws. |
+| `HookEngine` | Registers backends with the dispatcher and points `XposedHookBridge` at it. |
 | `ModuleStatusProvider` | Exported read-only ContentProvider that answers "is module X enabled?" for modules running in their own app process. |
 | `ModuleLoader` | Reads/writes `<moduleDir>/<pkg>.json`, scans module APKs for `assets/xposed_init`, caches the module dex under `.syscall_cache/`. |
 | `ProcessMonitor` | Scans `/proc` for app processes. Updates `HookedProcesses` in the Home tab. |
+
+---
+
+## Hook Dispatcher
+
+The dispatcher is the framework's resilience layer. Instead of a single hook
+backend that either works or crashes the framework, it registers several
+backends and tries each in order until one succeeds.
+
+### Backends (in priority order)
+
+| # | Backend | What it does | When it's the one that wins |
+|---|---|---|---|
+| 1 | `PineBackend` | Uses `Pine.hook(...)` in AUTO mode | Method can be compiled / hooked normally |
+| 2 | `PineReplaceBackend` | Uses Pine in REPLACEMENT mode | Method needs the slower, no-JIT path |
+| 3 | `ProxyBackend` | Java `Proxy` for interface methods | Method is on an interface and Pine can't reach it |
+| 4 | `NoopBackend` | Accepts the hook, does nothing | Everything else failed — no crash, no interception |
+
+### What this protects against
+
+| Failure | Old behavior | New behavior |
+|---|---|---|
+| Pine `.so` fails to load | `findAndHookMethod` throws, module dies | `PineBackend.isAvailable()` is false; Proxy/Noop handle the rest. No crash. |
+| Pine can't hook a specific method | `findAndHookMethod` throws, module dies | Dispatcher tries REPLACEMENT, then Proxy, then Noop. Method may still be unhooked, but the module survives. |
+| A future Android version breaks AUTO mode | Every hook throws | REPLACEMENT gets tried automatically for every method. |
+| `Pine.hook` throws mid-hook | Framework unstable | Dispatcher catches per-method, moves on. |
+
+### Adding your own backend
+
+```java
+HookDispatcher d = HookDispatcher.getInstance();
+d.register(new HookDispatcher.Backend() {
+    @Override public String name() { return "MyBackend"; }
+    @Override public boolean isAvailable() { return true; }
+    @Override public boolean hook(Method original, XC_MethodHook callback) {
+        // install the hook
+        return true;
+    }
+});
+```
+
+Register it **before** `HookEngine.ensureBackendInstalled()` runs, or add it as
+a custom step in `HookEngine.installBackends()`.
+
+---
+
+## Module Status API
+
+ShizuPosed exposes a read-only `ContentProvider` so external modules running
+in their own app process can ask whether the framework considers them enabled.
+
+### Authority
+
+```
+com.shizuposed.manager.status
+```
+
+### Endpoints
+
+| URI | Returns |
+|---|---|
+| `content://com.shizuposed.manager.status/module/<pkg>` | One row: `package`, `enabled` (0/1), `value` ("0"/"1") |
+| `content://com.shizuposed.manager.status/modules` | One row per enabled module: `package` |
+| `content://com.shizuposed.manager.status/info` | One row: `framework`, `version`, `count`, `enabled` |
+
+### From a module's own UI
+
+```java
+boolean active = XposedBridge.isModuleEnabled(getPackageName());
+textView.setText(active ? "Module is Active" : "Module is Inactive");
+```
+
+No permission required. No modification to the module.
+
+### From adb
+
+```bash
+adb shell content query --uri content://com.shizuposed.manager.status/modules
+adb shell content query --uri content://com.shizuposed.manager.status/module/com.example.module
+adb shell content query --uri content://com.shizuposed.manager.status/info
+```
+
+### Broadcasts
+
+ShizuPosed also fires the LSPosed-style broadcasts when you toggle a module:
+
+- `de.robv.android.xposed.action.MODULE_ENABLED`
+- `de.robv.android.xposed.action.MODULE_DISABLED`
+
+Both deliver only to the target module's package, with an extra string
+`"module"` containing the package name.
 
 ---
 
@@ -253,7 +350,7 @@ ShizuPosedManager/
 | No root required | ✅ |
 | No bootloader unlock | ✅ |
 | Non-system-modifying | ✅ (all files under shell's data dir) |
-| Non-root hook install via Pine | ✅ |
+| Multi-backend hook dispatcher | ✅ |
 | App-scoped hooking (per-module scope) | ✅ |
 | Module enable/disable persistence | ✅ |
 | Module install from APK file | ✅ |
@@ -353,14 +450,14 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ### Notes on the build
 
 - `XposedHook.dex` is built at compile time by the `:app:makeDex` task. It
-  compiles the app's `core/` and `de.robv.android.xposed/` packages together
-  with Pine, then links them into a single dex via `d8`.
+  compiles the app's `core/`, `core/backends/`, and `de.robv.android.xposed/`
+  packages together with Pine, then links them into a single dex via `d8`.
 - The `:app:copyHookDex` task copies the resulting dex into
   `app/src/main/assets/XposedHook.dex` before asset merging, so it's
   packaged into the APK.
 - `Pine` is vendored as `libs/pine-0.3.0.jar`. Do not bump the Pine version
   without re-checking the `Pine.hook(Method, MethodHook)` signature used in
-  `HookEngine.java`.
+  `PineBackend.java`.
 
 ---
 
@@ -438,28 +535,6 @@ The manager stores one JSON per module under
 
 This file is written by the manager. Do not edit it from the module.
 
-### Reporting "active" status in a module UI
-
-Modules that have their own config Activity can display accurate
-Active/Inactive state by querying ShizuPosed's exported provider:
-
-```java
-// Queries com.shizuposed.manager.status
-boolean enabled = XposedBridge.isModuleEnabled(getPackageName());
-textView.setText(enabled ? "Module is Active" : "Module is Inactive");
-```
-
-Where `XposedBridge` is the shim from this project. Any module that already
-calls `XposedBridge.isModuleEnabled(...)` gets this behaviour for free once
-ShizuPosed is installed.
-
-Modules that watch for LSPosed broadcasts will also receive:
-
-- `de.robv.android.xposed.action.MODULE_ENABLED`
-- `de.robv.android.xposed.action.MODULE_DISABLED`
-
-delivered only to their own package, with an extra `"module"` string.
-
 ---
 
 ## Module Compatibility
@@ -487,8 +562,9 @@ delivered only to their own package, with an extra `"module"` string.
 ### Known limitations
 
 - **`system_server` is not hooked.** Skipped deliberately to avoid soft-bricking.
-- **No constructor hooking through the shim.** `findAndHookConstructor(...)`
-  is currently a no-op logged at INFO; only method hooks are wired.
+- **Constructor hooks go through Pine's API only.** The shim's
+  `findAndHookConstructor(...)` is wired but only the Pine backends implement
+  it; Proxy and Noop return false for constructors.
 - **Resource hooking is incomplete.** `ResourceHooking.setReplacement(...)` is
   stored but not applied to a live `Resources` instance.
 - **No hot-reload of modules.** Changing a module requires re-launching the
@@ -515,9 +591,10 @@ Check, in order:
 3. That the target app was launched via the ModuleDetailSheet's
    "Launch App under ShizuPosed…" action, not from the launcher.
 
-Hooks that run inside a normally-launched app cannot be installed; the
-post-Application timing model requires the app to be launched under
-ShizuPosed's control.
+Look for `[PineBackend] hooked ...` or `[HookDispatcher] Fallback backend ...`
+in the log. If you see `[HookDispatcher] All backends failed for ...`, the
+method couldn't be hooked by any backend — that's when the Noop backend
+took over.
 
 ### `Cannot hook externally-launched process`
 
@@ -568,8 +645,9 @@ a shell-side hook process.
 
 **Q: How does it hook without root?**
 A: Shizuku gives the manager the ability to run `app_process` as shell UID.
-That process loads `XposedHook.dex` and uses Pine to replace method entry
-points inside the target app's own process.
+That process loads `XposedHook.dex` and uses the hook dispatcher — which
+tries Pine, then Pine REPLACEMENT, then Proxy, then Noop — to install
+method hooks inside the target app's own process.
 
 **Q: Why not just use LSPosed?**
 A: LSPosed requires Zygisk or Riru, which on most devices means a bootloader
@@ -579,6 +657,12 @@ timing and a narrower module compatibility surface.
 **Q: Can I hook `system_server`?**
 A: Deliberately no. `XposedHook` skips `system_server` to prevent bootloops
 and other systemic failures.
+
+**Q: What happens if Pine fails on my device?**
+A: The dispatcher falls through to the REPLACEMENT backend, then the Proxy
+backend (interfaces only), then the Noop backend. Modules still load;
+methods Pine can't reach just won't be intercepted. The framework never
+crashes because of a single hook failure.
 
 **Q: Where are the hook logs written?**
 A: `/data/user/0/com.android.shell/files/.syscall_cache/xposed.log`, readable
@@ -590,6 +674,12 @@ A: Open the module's config UI (if it has one). It can query ShizuPosed's
 `ModuleStatusProvider` and display "Active". Modules that don't show a status
 will still install their hooks; whether they work depends on timing and the
 API surface they use.
+
+**Q: What's new in v2.0?**
+A: A multi-backend hook dispatcher (Pine AUTO → Pine REPLACEMENT → Proxy →
+Noop), the LSPosed-style module detail sheet, real launcher icons in the
+module list, the `ModuleStatusProvider` ContentProvider, and a cleaner
+startup path with no spurious toasts on state changes.
 
 ---
 
@@ -617,7 +707,7 @@ limitations under the License.
 
 | Project | Author | Use |
 |---|---|---|
-| [Shizuku](https://github.com/thedjchi/Shizuku) | djchi | Privileged shell bridge |
+| [Shizuku Fork](https://github.com/thedjchi/Shizuku) | djchi | Privileged shell bridge |
 | [Pine](https://github.com/canyie/pine) | canyie | Pure-Java ART hooking backend |
 | [Xposed API](https://github.com/rovo89/XposedBridge) | rovo89 | Module-facing interface (shimmed) |
 | [LSPosed](https://github.com/LSPosed/LSPosed) | LSPosed team | Reference for module UX patterns |
