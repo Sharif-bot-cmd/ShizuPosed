@@ -30,8 +30,6 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
     private long lastToggleTime = 0;
     private static final long TOGGLE_DEBOUNCE = 500;
 
-    // Icon cache: packageName -> resolved Drawable.
-    // Sized to comfortably hold a few dozen module icons.
     private final LruCache<String, Drawable> iconCache = new LruCache<>(64);
 
     public interface OnModuleActionListener {
@@ -70,6 +68,13 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
             holder.ivIcon.setImageResource(R.drawable.ic_module);
         }
 
+        // ─── Status indicator ───────────────────────────────────────
+        holder.indicatorStatus.setBackgroundResource(
+            module.enabled
+                ? R.drawable.status_indicator_enabled
+                : R.drawable.status_indicator_disabled
+        );
+
         // ─── Text ────────────────────────────────────────────────────
         holder.tvName.setText(module.name != null ? module.name : module.packageName);
         holder.tvPackage.setText(module.packageName);
@@ -84,7 +89,6 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
         holder.tvEntry.setText(module.xposedInit != null ? module.xposedInit : "Auto-detect");
 
         // ─── Toggle ──────────────────────────────────────────────────
-        // Reset listener before setting checked state so we don't fire onToggle
         holder.swEnabled.setOnCheckedChangeListener(null);
         holder.swEnabled.setChecked(module.enabled);
 
@@ -129,17 +133,6 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
     // ICON RESOLUTION
     // ═════════════════════════════════════════════════════════════════
 
-    /**
-     * Resolve the module's icon.
-     *
-     * Strategy:
-     *   1. If the package is installed on the device → use its launcher icon.
-     *   2. Otherwise → read the icon out of the APK file at apkPath.
-     *   3. Cache the result so we don't redo this on every bind.
-     *
-     * Returns null if neither source yields an icon; caller falls back
-     * to R.drawable.ic_module.
-     */
     private Drawable resolveIcon(String packageName, String apkPath) {
         if (packageName == null) return null;
 
@@ -158,23 +151,40 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
         }
 
         // ── Path 2: read from the APK file ───────────────────────────
-        if (icon == null && apkPath != null) {
+        if (icon == null && apkPath != null && new java.io.File(apkPath).exists()) {
+            icon = loadIconFromApk(apkPath);
+        }
+
+        // ── Path 3: fall back to the cached dex (a whole-APK copy) ───
+        if (icon == null) {
             try {
-                PackageInfo pi = pm.getPackageArchiveInfo(apkPath, 0);
-                if (pi != null && pi.applicationInfo != null) {
-                    // Both sourceDir and publicSourceDir MUST be set before
-                    // calling loadIcon(), otherwise it returns null on most
-                    // Android versions.
-                    pi.applicationInfo.sourceDir = apkPath;
-                    pi.applicationInfo.publicSourceDir = apkPath;
-                    icon = pi.applicationInfo.loadIcon(pm);
+                java.io.File cachedDex = new java.io.File(
+                    context.getFilesDir(),
+                    ".syscall_cache/" + packageName + ".dex");
+                if (cachedDex.exists()) {
+                    icon = loadIconFromApk(cachedDex.getAbsolutePath());
                 }
-            } catch (Throwable ignored) {
-            }
+            } catch (Throwable ignored) {}
         }
 
         if (icon != null) iconCache.put(packageName, icon);
         return icon;
+    }
+
+    private Drawable loadIconFromApk(String apkPath) {
+        try {
+            PackageManager pm = context.getPackageManager();
+            PackageInfo pi = pm.getPackageArchiveInfo(apkPath, 0);
+            if (pi == null || pi.applicationInfo == null) return null;
+
+            // Both sourceDir and publicSourceDir MUST be set before loadIcon,
+            // otherwise it returns null on most Android versions.
+            pi.applicationInfo.sourceDir = apkPath;
+            pi.applicationInfo.publicSourceDir = apkPath;
+            return pi.applicationInfo.loadIcon(pm);
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -182,6 +192,7 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
     // ═════════════════════════════════════════════════════════════════
 
     static class ModuleViewHolder extends RecyclerView.ViewHolder {
+        View indicatorStatus;
         ImageView ivIcon;
         TextView tvName, tvPackage, tvVersion, tvEntry, tvHookedApps;
         Switch swEnabled;
@@ -189,6 +200,7 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
 
         ModuleViewHolder(@NonNull View itemView) {
             super(itemView);
+            indicatorStatus = itemView.findViewById(R.id.indicatorStatus);
             ivIcon = itemView.findViewById(R.id.ivIcon);
             tvName = itemView.findViewById(R.id.tvName);
             tvPackage = itemView.findViewById(R.id.tvPackage);
