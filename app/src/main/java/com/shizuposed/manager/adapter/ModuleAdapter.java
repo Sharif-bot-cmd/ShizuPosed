@@ -1,11 +1,7 @@
 package com.shizuposed.manager.adapter;
 
 import android.content.Context;
-import android.content.pm.ApplicationInfo;
-import android.content.pm.PackageInfo;
-import android.content.pm.PackageManager;
 import android.graphics.drawable.Drawable;
-import android.util.LruCache;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -29,8 +25,6 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
     private OnModuleActionListener listener;
     private long lastToggleTime = 0;
     private static final long TOGGLE_DEBOUNCE = 500;
-
-    private final LruCache<String, Drawable> iconCache = new LruCache<>(64);
 
     public interface OnModuleActionListener {
         void onToggle(ModuleInfo module, boolean enable);
@@ -60,22 +54,20 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
     public void onBindViewHolder(@NonNull ModuleViewHolder holder, int position) {
         ModuleInfo module = modules.get(position);
 
-        // ─── Icon ────────────────────────────────────────────────────
-        Drawable icon = resolveIcon(module.packageName, module.apkPath);
+        // Real launcher icon — same resolution as the detail sheet uses.
+        Drawable icon = IconResolver.resolve(context, module.packageName, module.apkPath);
         if (icon != null) {
             holder.ivIcon.setImageDrawable(icon);
         } else {
             holder.ivIcon.setImageResource(R.drawable.ic_module);
         }
 
-        // ─── Status indicator ───────────────────────────────────────
         holder.indicatorStatus.setBackgroundResource(
             module.enabled
                 ? R.drawable.status_indicator_enabled
                 : R.drawable.status_indicator_disabled
         );
 
-        // ─── Text ────────────────────────────────────────────────────
         holder.tvName.setText(module.name != null ? module.name : module.packageName);
         holder.tvPackage.setText(module.packageName);
 
@@ -88,7 +80,6 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
 
         holder.tvEntry.setText(module.xposedInit != null ? module.xposedInit : "Auto-detect");
 
-        // ─── Toggle ──────────────────────────────────────────────────
         holder.swEnabled.setOnCheckedChangeListener(null);
         holder.swEnabled.setChecked(module.enabled);
 
@@ -99,12 +90,10 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
             if (listener != null) listener.onToggle(module, isChecked);
         });
 
-        // ─── Hooked apps count ──────────────────────────────────────
         int hookedCount = module.hookedApps != null ? module.hookedApps.size() : 0;
         holder.tvHookedApps.setText("Hooked Apps: " + hookedCount
             + (module.hookAllApps ? " (All)" : ""));
 
-        // ─── Click handlers ─────────────────────────────────────────
         holder.itemView.setOnClickListener(v -> {
             if (listener != null) listener.onDetail(module);
         });
@@ -128,68 +117,6 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
         this.modules = newModules != null ? newModules : new ArrayList<>();
         notifyDataSetChanged();
     }
-
-    // ═════════════════════════════════════════════════════════════════
-    // ICON RESOLUTION
-    // ═════════════════════════════════════════════════════════════════
-
-    private Drawable resolveIcon(String packageName, String apkPath) {
-        if (packageName == null) return null;
-
-        Drawable cached = iconCache.get(packageName);
-        if (cached != null) return cached;
-
-        PackageManager pm = context.getPackageManager();
-        Drawable icon = null;
-
-        // ── Path 1: installed package ────────────────────────────────
-        try {
-            ApplicationInfo ai = pm.getApplicationInfo(packageName, 0);
-            icon = ai.loadIcon(pm);
-        } catch (PackageManager.NameNotFoundException ignored) {
-        } catch (Throwable ignored) {
-        }
-
-        // ── Path 2: read from the APK file ───────────────────────────
-        if (icon == null && apkPath != null && new java.io.File(apkPath).exists()) {
-            icon = loadIconFromApk(apkPath);
-        }
-
-        // ── Path 3: fall back to the cached dex (a whole-APK copy) ───
-        if (icon == null) {
-            try {
-                java.io.File cachedDex = new java.io.File(
-                    context.getFilesDir(),
-                    ".syscall_cache/" + packageName + ".dex");
-                if (cachedDex.exists()) {
-                    icon = loadIconFromApk(cachedDex.getAbsolutePath());
-                }
-            } catch (Throwable ignored) {}
-        }
-
-        if (icon != null) iconCache.put(packageName, icon);
-        return icon;
-    }
-
-    private Drawable loadIconFromApk(String apkPath) {
-        try {
-            PackageManager pm = context.getPackageManager();
-            PackageInfo pi = pm.getPackageArchiveInfo(apkPath, 0);
-            if (pi == null || pi.applicationInfo == null) return null;
-
-            // Both sourceDir and publicSourceDir MUST be set before loadIcon,
-            // otherwise it returns null on most Android versions.
-            pi.applicationInfo.sourceDir = apkPath;
-            pi.applicationInfo.publicSourceDir = apkPath;
-            return pi.applicationInfo.loadIcon(pm);
-        } catch (Throwable ignored) {
-            return null;
-        }
-    }
-
-    // ═════════════════════════════════════════════════════════════════
-    // VIEW HOLDER
-    // ═════════════════════════════════════════════════════════════════
 
     static class ModuleViewHolder extends RecyclerView.ViewHolder {
         View indicatorStatus;

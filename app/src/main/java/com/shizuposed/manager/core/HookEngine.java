@@ -68,23 +68,22 @@ public class HookEngine {
 
         HookDispatcher d = HookDispatcher.getInstance();
 
-        // Register in priority order. The dispatcher picks the first
-        // one that reports itself available as the primary, then tries
-        // that one first for every hook.
-
         // 1. Pine AUTO mode — fastest when it works
         d.register(new com.shizuposed.manager.core.backends.PineBackend());
 
         // 2. Pine REPLACEMENT mode — catches methods Pine AUTO rejects
         d.register(new com.shizuposed.manager.core.backends.PineReplaceBackend());
 
-        // 3. Proxy — interface methods only
+        // 3. Instrumentation — handles Application / Activity lifecycle
+        //    hooks when Pine can't install them
+        d.register(new com.shizuposed.manager.core.backends.InstrumentationBackend());
+
+        // 4. Proxy — interface methods only
         d.register(new com.shizuposed.manager.core.backends.ProxyBackend());
 
-        // 4. Noop — always succeeds, never fails the caller
+        // 5. Noop — always succeeds, never fails the caller
         d.register(new com.shizuposed.manager.core.backends.NoopBackend());
 
-        // Let the dispatcher pick the primary and be ready for hooks
         d.initialize();
 
         // Point XposedHookBridge at the dispatcher. This is the seam

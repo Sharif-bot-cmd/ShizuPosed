@@ -2,11 +2,13 @@ package com.shizuposed.manager.ui;
 
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.graphics.drawable.Drawable;
 import android.os.Bundle;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.ImageView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -17,6 +19,7 @@ import androidx.fragment.app.Fragment;
 import com.google.android.material.bottomsheet.BottomSheetDialogFragment;
 import com.shizuposed.manager.R;
 import com.shizuposed.manager.ShizukuHelper;
+import com.shizuposed.manager.adapter.IconResolver;
 import com.shizuposed.manager.core.ModuleLoader;
 import com.shizuposed.manager.model.ModuleInfo;
 import com.shizuposed.manager.service.ShizuPosedService;
@@ -27,10 +30,6 @@ import java.util.List;
 
 /**
  * Module detail sheet — LSPosed-style.
- *
- * Launched from ModulesFragment. Communicates back to it via
- * getParentFragment() for actions that need to update the list (edit
- * scope, uninstall).
  */
 public class ModuleDetailSheet extends BottomSheetDialogFragment {
 
@@ -82,9 +81,18 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
     // ═════════════════════════════════════════════════════════════
 
     private void bindHeader(View v) {
+        ImageView icon = v.findViewById(R.id.ivModuleIcon);
         TextView name = v.findViewById(R.id.tvModuleName);
         TextView pkgv = v.findViewById(R.id.tvModulePackage);
         TextView status = v.findViewById(R.id.tvModuleStatus);
+
+        // ✅ Same resolver the list uses — real launcher icon, or ic_module fallback
+        if (icon != null) {
+            Drawable d = IconResolver.resolve(requireContext(),
+                module.packageName, module.apkPath);
+            if (d != null) icon.setImageDrawable(d);
+            else icon.setImageResource(R.drawable.ic_module);
+        }
 
         name.setText(module.name != null ? module.name : module.packageName);
         pkgv.setText(module.packageName
@@ -101,7 +109,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
         Button forceStop = v.findViewById(R.id.btnForceStopScoped);
         Button uninstall = v.findViewById(R.id.btnUninstallModule);
 
-        // 1. Open the module's own launcher activity, if it has one.
         Intent launch = pm.getLaunchIntentForPackage(module.packageName);
         if (launch != null) {
             openApp.setEnabled(true);
@@ -119,19 +126,14 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             openApp.setText("Module has no UI");
         }
 
-        // 2. Force-stop every app in the module's scope so hooks re-apply
-        //    on next launch.
         forceStop.setOnClickListener(x -> forceStopScopedApps());
 
-        // 3. Uninstall — delegate to the parent ModulesFragment so the
-        //    list updates without a manual reload.
         uninstall.setOnClickListener(x -> {
             Fragment parent = getParentFragment();
             if (parent instanceof ModulesFragment) {
                 ((ModulesFragment) parent).uninstallModule(module);
                 dismiss();
             } else {
-                // Fallback: do it here directly
                 boolean removed = ModuleLoader.getInstance(requireContext())
                     .uninstallModule(module.packageName);
                 if (removed) {
@@ -182,8 +184,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             list.setText(sb.toString());
         }
 
-        // Edit scope — delegate to the parent ModulesFragment which owns
-        // the app-selection dialog.
         edit.setOnClickListener(x -> {
             Fragment parent = getParentFragment();
             if (parent instanceof ModulesFragment) {
@@ -191,8 +191,7 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                 ((ModulesFragment) parent).openScopeEditor(module);
             } else {
                 Toast.makeText(requireContext(),
-                    "Edit scope from the Modules tab",
-                    Toast.LENGTH_SHORT).show();
+                    "Edit scope from the Modules tab", Toast.LENGTH_SHORT).show();
             }
         });
     }
@@ -210,7 +209,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
 
         try {
             ShizukuHelper h = ShizukuHelper.getInstance(requireContext());
-
             if (!h.isAvailable() || !h.isAuthorized()) {
                 Toast.makeText(requireContext(),
                     "Shizuku not authorized", Toast.LENGTH_SHORT).show();

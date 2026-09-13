@@ -23,7 +23,6 @@ import androidx.fragment.app.Fragment;
 import com.shizuposed.manager.R;
 import com.shizuposed.manager.ShizukuHelper;
 import com.shizuposed.manager.ShizuPosedManagerApp;
-import com.shizuposed.manager.core.ProcessMonitor;
 import com.shizuposed.manager.receiver.BootReceiver;
 import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.utils.Logger;
@@ -36,7 +35,7 @@ public class SettingsFragment extends Fragment {
     private Switch swAutoStart, swDebugMode, swLogToFile;
     private EditText etScanInterval, etHookDelay;
     private Button btnRestartService, btnClearCache, btnExportConfig;
-    private TextView tvVersion, tvShizukuStatus, tvServiceStatus, tvHookedCount;
+    private TextView tvVersion, tvShizukuStatus, tvServiceStatus;
     private Logger logger;
     private ExecutorService executor = Executors.newSingleThreadExecutor();
     private ShizukuHelper shizukuHelper;
@@ -107,9 +106,8 @@ public class SettingsFragment extends Fragment {
         tvVersion = view.findViewById(R.id.tvVersion);
         tvShizukuStatus = view.findViewById(R.id.tvShizukuStatus);
         tvServiceStatus = view.findViewById(R.id.tvServiceStatus);
-        tvHookedCount = view.findViewById(R.id.tvHookedCount);
 
-        tvVersion.setText("Post v2.0");
+        tvVersion.setText("v2.9");
     }
 
     private void setupListeners() {
@@ -154,8 +152,6 @@ public class SettingsFragment extends Fragment {
 
     /**
      * Populate the switches from prefs WITHOUT firing their listeners.
-     * This is what stops "Logging to file enabled" from showing up
-     * every time the fragment becomes visible.
      */
     private void loadSettings() {
         swAutoStart.setOnCheckedChangeListener(null);
@@ -229,20 +225,7 @@ public class SettingsFragment extends Fragment {
                 tvServiceStatus.setText("❌ Stopped");
                 tvServiceStatus.setTextColor(requireContext().getColor(android.R.color.holo_red_light));
             }
-
-            int hookedCount = getHookedProcessCount();
-            tvHookedCount.setText(String.valueOf(hookedCount));
         });
-    }
-
-    private int getHookedProcessCount() {
-        try {
-            ProcessMonitor pm = ProcessMonitor.getInstance(requireContext());
-            return pm != null ? pm.getHookedProcessCount() : 0;
-        } catch (Exception e) {
-            logger.e("getHookedProcessCount error: " + e.getMessage());
-            return 0;
-        }
     }
 
     private void clearCacheSafe() {

@@ -64,6 +64,23 @@
         android:background="@android:drawable/editbox_background"
         android:layout_marginBottom="12dp" />
 
+    <TextView
+        android:id="@+id/tvSelectedCount"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="0 selected"
+        android:textSize="12sp"
+        android:textColor="?android:attr/textColorSecondary"
+        android:layout_marginBottom="4dp" />
+
+    <CheckBox
+        android:id="@+id/cbHideSystem"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Hide system apps"
+        android:checked="true"
+        android:layout_marginBottom="8dp" />
+
     <!-- App List -->
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/appRecyclerView"

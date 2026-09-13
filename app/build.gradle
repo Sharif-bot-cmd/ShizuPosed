@@ -2,22 +2,52 @@ plugins {
     id 'com.android.application'
 }
 
+def keystorePropsFile = rootProject.file('keystore.properties')
+def keystoreProps = new Properties()
+if (keystorePropsFile.exists()) {
+    keystoreProps.load(new FileInputStream(keystorePropsFile))
+}
+
 android {
     namespace 'com.shizuposed.manager'
-    compileSdk 35
+
+    // API 37 uses minor-versioned platforms (android-37.0, 37.1, 37.2).
+    // AGP 8.10+ exposes compileSdkMinor. If your AGP is older and rejects
+    // it, comment the line out — AGP will fall back to "android-37".
+    compileSdk 37
+    compileSdkMinor 0
 
     defaultConfig {
         applicationId "com.shizuposed.manager"
         minSdk 29
-        targetSdk 35
-        versionCode 15
-        versionName "Post 2.0"
+        targetSdk 37
+        versionCode 17
+        versionName "2.9"
+    }
+
+    signingConfigs {
+        release {
+            if (keystorePropsFile.exists()) {
+                storeFile file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            }
+        }
     }
 
     buildTypes {
         release {
-            minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'),
+                          'proguard-rules.pro'
+
+            if (keystorePropsFile.exists()) {
+                signingConfig signingConfigs.release
+            } else {
+                logger.warn("keystore.properties missing — release APK will be unsigned")
+            }
         }
         debug {
             minifyEnabled false
@@ -35,18 +65,11 @@ android {
         dataBinding true
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // ASSETS
-    // XposedHook.dex is rebuilt from the current sources by :app:makeDex
-    // and copied into app/src/main/assets/ by :app:copyHookDex before
-    // asset merging runs. noCompress keeps it as a stored entry.
-    // ═══════════════════════════════════════════════════════════════
-    aaptOptions {
-        noCompress "dex"
-        ignoreAssetsPattern "!.svn:!.git:!.ds_store:!*.scc:!CVS:!thumbs.db:!picasa.ini:!*~"
+    androidResources {
+        ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:!CVS:!thumbs.db:!picasa.ini:!*~'
     }
 
-    packagingOptions {
+    packaging {
         resources {
             excludes += [
                 'META-INF/DEPENDENCIES',
@@ -57,71 +80,75 @@ android {
             ]
         }
     }
+
+    sourceSets {
+        main {
+            assets.srcDirs += layout.buildDirectory.dir('outputs/dex')
+        }
+    }
+
+    lint {
+        abortOnError true
+        checkReleaseBuilds true
+    }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
 }
 
 dependencies {
-    // ============================================================
-    // SHIZUKU + PINE  (local jars in app/libs/)
-    // ============================================================
     implementation files('libs/shizuku-api.jar')
     implementation files('libs/shizuku-provider.jar')
     implementation files('libs/shizuku-aidl.jar')
     implementation files('libs/shizuku-shared.jar')
     implementation files('libs/pine-0.3.0.jar')
 
-    // ============================================================
-    // ANDROIDX CORE
-    // ============================================================
     implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'com.google.android.material:material:1.12.0'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
     implementation 'androidx.core:core:1.13.1'
-    implementation 'androidx.lifecycle:lifecycle-viewmodel:2.8.0'
-    implementation 'androidx.lifecycle:lifecycle-livedata:2.8.0'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel:2.8.4'
+    implementation 'androidx.lifecycle:lifecycle-livedata:2.8.4'
     implementation 'androidx.recyclerview:recyclerview:1.3.2'
     implementation 'androidx.cardview:cardview:1.0.0'
     implementation 'androidx.preference:preference:1.2.1'
 
-    // ============================================================
-    // OTHER
-    // ============================================================
     implementation 'com.google.code.gson:gson:2.11.0'
-    // NOTE: Epic dependency removed — Pine is vendored from libs/.
 
-    // ============================================================
-    // TESTING
-    // ============================================================
     testImplementation 'junit:junit:4.13.2'
     androidTestImplementation 'androidx.test.ext:junit:1.2.0'
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.6.0'
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// makeDex
+// ─────────────────────────────────────────────────────────────────────────
+// XposedHook.dex pipeline
 //
-// Builds a self-contained XposedHook.dex from:
-//   • the manager's compiled .class files (core/ + de/robv/android/xposed/)
-//   • Pine's classes extracted from libs/pine-0.3.0.jar
-//
-// Output: app/build/outputs/dex/XposedHook.dex
-// ═══════════════════════════════════════════════════════════════════
+// Notes:
+//  • Uses AGP's android.jar from the resolved compileSdk platform, not
+//    android.bootClasspath (removed in newer AGP).
+//  • Uses android.defaultConfig.minSdk for --min-api.
+//  • Output-only inputs (see below) — no `inputs.dir` on the classes dir.
+//  • Writes only into build/, never into src/.
+// ─────────────────────────────────────────────────────────────────────────
+
 tasks.register('makeDex') {
     description = 'Build XposedHook.dex from compiled classes + Pine'
     group = 'build'
 
-    // Ordering is handled by dependsOn. We do NOT declare the classes
-    // directory as an input because Gradle validates inputs before any
-    // task in the graph runs, and on a clean build that directory does
-    // not exist yet. Outputs are declared so the task is still cacheable.
     dependsOn 'compileDebugJavaWithJavac'
 
     def classesDirProvider = layout.buildDirectory.dir('intermediates/javac/debug/classes')
     def outDirProvider     = layout.buildDirectory.dir('outputs/dex')
     def outDexProvider     = outDirProvider.map { dir -> new File(dir.asFile, 'XposedHook.dex') }
 
+    // Output-only. Gradle tracks these for up-to-date checks without
+    // needing the input directory to exist at configuration time.
+    outputs.dir(outDirProvider)
     outputs.file(outDexProvider)
 
-    // Locate d8 at configuration time.
     def sdkDir = System.getenv('ANDROID_HOME')
         ?: System.getenv('ANDROID_SDK_ROOT')
         ?: project.findProperty('android.sdk.dir')
@@ -147,19 +174,55 @@ tasks.register('makeDex') {
             "d8 not found under $buildToolsRoot. Install build-tools via sdkmanager.")
     }
 
+    // Resolve android.jar once at configuration time. We know the
+    // compileSdk and the minor version from the android { } block above.
+    // API 37 uses a versioned platform dir (android-37.0) on newer AGP;
+    // fall back to android-37 for older AGP, then to android-36 as a
+    // last resort so the build still works on the API 36 preview SDK.
+    def compileSdkVersion = android.compileSdk
+    def compileSdkMinor   = 0
+    try {
+        compileSdkMinor = android.compileSdkMinor
+    } catch (Throwable ignored) {}
+
+    def platformsRoot = new File(sdkDir, 'platforms')
+    def candidatePlatformDirs = [
+        compileSdkMinor > 0 ? "android-${compileSdkVersion}.${compileSdkMinor}" : null,
+        "android-${compileSdkVersion}",
+        "android-36",
+        "android-35",
+    ].findAll { it != null }
+
+    File platformJar = null
+    File platformDirUsed = null
+    for (String name : candidatePlatformDirs) {
+        File candidate = new File(platformsRoot, "${name}/android.jar")
+        if (candidate.exists()) {
+            platformJar = candidate
+            platformDirUsed = new File(platformsRoot, name)
+            break
+        }
+    }
+
+    if (platformJar == null) {
+        throw new GradleException(
+            "Could not locate android.jar under ${platformsRoot.absolutePath}. " +
+            "Tried: ${candidatePlatformDirs.join(', ')}. " +
+            "Install the platform with sdkmanager, e.g. " +
+            "`sdkmanager \"platforms;android-${compileSdkVersion}\"`.")
+    }
+
     doLast {
         def classesDir = classesDirProvider.get().asFile
         def outDir     = outDirProvider.get().asFile
         def outDex     = new File(outDir, 'XposedHook.dex')
 
-        // Make sure the directories we need exist before we read/write.
         if (!classesDir.exists()) {
             println "makeDex: classes dir missing (${classesDir.absolutePath}) — creating empty"
             classesDir.mkdirs()
         }
         outDir.mkdirs()
 
-        // ── 1. App .class files ──────────────────────────────────
         def wanted = []
         classesDir.eachFileRecurse { f ->
             if (!f.name.endsWith('.class')) return
@@ -169,7 +232,6 @@ tasks.register('makeDex') {
             }
         }
 
-        // ── 2. Extract Pine classes from its jar and add them ────
         def pineJar = file("${projectDir}/libs/pine-0.3.0.jar")
         if (pineJar.exists()) {
             def pineExtract = new File(outDir, 'pine-classes')
@@ -194,7 +256,6 @@ tasks.register('makeDex') {
         }
         println "makeDex: ${wanted.size()} .class files matched"
 
-        // ── 3. Classpath libs for symbol resolution ──────────────
         def libJars = []
         try {
             configurations.debugCompileClasspath.resolve().each { f ->
@@ -217,13 +278,14 @@ tasks.register('makeDex') {
             println "makeDex: warning — could not resolve debugCompileClasspath: ${t.message}"
         }
 
-        // Explicitly add the platform android.jar so d8 can resolve
-        // framework classes even if it wasn't in the classpath.
-        def platformJar = new File(sdkDir, 'platforms/android-35/android.jar')
-        if (platformJar.exists()) libJars << platformJar.absolutePath
+        // Add the resolved android.jar as a --lib entry.
+        libJars << platformJar.absolutePath
+        println "makeDex: using platform jar ${platformJar.absolutePath}"
+        println "makeDex: platform dir ${platformDirUsed.absolutePath}"
 
-        // ── 4. Run d8 ────────────────────────────────────────────
-        def cmd = [d8.absolutePath, '--release', '--min-api', '29',
+        def minSdk = android.defaultConfig.minSdk
+
+        def cmd = [d8.absolutePath, '--release', '--min-api', "$minSdk",
                    '--output', outDir.absolutePath]
         cmd.addAll(wanted)
         libJars.each { j -> cmd.addAll(['--lib', j]) }
@@ -240,7 +302,6 @@ tasks.register('makeDex') {
             throw new GradleException("d8 failed with exit code ${proc.exitValue()}")
         }
 
-        // Rename classes.dex → XposedHook.dex
         def produced = new File(outDir, 'classes.dex')
         if (produced.exists()) {
             if (outDex.exists()) outDex.delete()
@@ -257,30 +318,13 @@ tasks.register('makeDex') {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// copyHookDex
-// ═══════════════════════════════════════════════════════════════════
-tasks.register('copyHookDex', Copy) {
-    description = 'Refresh app/src/main/assets/XposedHook.dex'
-    group = 'build'
+// ─────────────────────────────────────────────────────────────────────────
+// Task wiring
+// ─────────────────────────────────────────────────────────────────────────
 
-    dependsOn 'makeDex'
-
-    from layout.buildDirectory.file('outputs/dex/XposedHook.dex')
-    into layout.projectDirectory.dir('src/main/assets')
-
-    doFirst {
-        def assetsDir = layout.projectDirectory.dir('src/main/assets').asFile
-        if (!assetsDir.exists()) assetsDir.mkdirs()
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// Wiring
-// ═══════════════════════════════════════════════════════════════════
 tasks.matching { it.name == 'mergeDebugAssets' ||
                  it.name == 'mergeReleaseAssets' }.configureEach {
-    dependsOn 'copyHookDex'
+    dependsOn 'makeDex'
 }
 
 tasks.matching { it.name == 'assembleDebug' ||
@@ -288,7 +332,21 @@ tasks.matching { it.name == 'assembleDebug' ||
     dependsOn 'makeDex'
 }
 
+tasks.matching { it.name.startsWith('generate') &&
+                 it.name.contains('LintVital') &&
+                 it.name.endsWith('ReportModel') }.configureEach {
+    dependsOn 'makeDex'
+}
+
+tasks.matching { it.name.startsWith('generate') &&
+                 it.name.endsWith('LintReportModel') }.configureEach {
+    dependsOn 'makeDex'
+}
+
+tasks.matching { it.name.startsWith('lint') }.configureEach {
+    mustRunAfter 'makeDex'
+}
+
 clean.doLast {
-    def staleAsset = layout.projectDirectory.file('src/main/assets/XposedHook.dex').asFile
-    if (staleAsset.exists()) staleAsset.delete()
+    // The dex lives under build/outputs/dex and is wiped by `clean` already.
 }

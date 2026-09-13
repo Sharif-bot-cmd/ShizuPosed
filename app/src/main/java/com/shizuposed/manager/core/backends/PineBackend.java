@@ -1,6 +1,8 @@
 package com.shizuposed.manager.core.backends;
 
 import com.shizuposed.manager.core.HookDispatcher;
+import com.shizuposed.manager.core.compat.AndroidCompat;
+import com.shizuposed.manager.core.compat.HiddenApiBypass;
 import com.shizuposed.manager.utils.Logger;
 
 import java.lang.reflect.Method;
@@ -11,7 +13,17 @@ import top.canyie.pine.callback.MethodHook;
 
 /**
  * Pine backend for HookDispatcher.
- * Uses top.canyie.pine.Pine.
+ *
+ * Wraps top.canyie.pine.Pine. Availability is probed once via
+ * Pine.ensureInitialized(); after that the flag is cached.
+ *
+ * Android 16+ compatibility is handled by two things:
+ *   1. Access to the target Method is obtained through
+ *      HiddenApiBypass.forceAccessible(...), which tries multiple
+ *      strategies before giving up.
+ *   2. If Pine's own isInitialized() returns false for any reason
+ *      (missing .so, wrong ABI, unsupported ART layout), the
+ *      dispatcher falls through to the next backend.
  */
 public final class PineBackend implements HookDispatcher.Backend {
 
@@ -26,6 +38,11 @@ public final class PineBackend implements HookDispatcher.Backend {
         if (checked) return available;
         checked = true;
         try {
+            // Log the effective SDK once so cross-version issues are
+            // diagnosable from the log alone.
+            log("Detected " + AndroidCompat.describe()
+                + ", preRelease=" + AndroidCompat.IS_PRE_RELEASE);
+
             Pine.ensureInitialized();
             available = Pine.isInitialized();
             log("Pine availability: " + available);
@@ -40,9 +57,15 @@ public final class PineBackend implements HookDispatcher.Backend {
     public boolean hook(Method original, XC_MethodHook callback) throws Throwable {
         if (!available) return false;
 
-        try {
-            original.setAccessible(true);
-        } catch (Throwable ignored) {}
+        // Force-access via the compat layer. On API 28+ this handles the
+        // hidden-API restrictions; on older versions it's a no-op
+        // wrapper around setAccessible(true).
+        boolean accessible = HiddenApiBypass.forceAccessible(original);
+        if (!accessible) {
+            log("Cannot make " + original.getDeclaringClass().getName()
+                + "." + original.getName() + " accessible — refusing to hook");
+            return false;
+        }
 
         Pine.hook(original, new MethodHook() {
 

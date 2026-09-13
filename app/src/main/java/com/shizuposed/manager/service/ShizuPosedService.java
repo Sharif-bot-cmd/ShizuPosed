@@ -32,28 +32,20 @@ public class ShizuPosedService extends Service {
     private static final String CHANNEL_NAME = "ShizuPosed Service";
     private static final int NOTIFICATION_ID = 1001;
 
-    // ═════════════════════════════════════════════════════════════
-    // Public actions (used by ModulesFragment, ShizuPosedManagerApp,
-    // and anyone else who wants to talk to the service via Intent).
-    // ═════════════════════════════════════════════════════════════
     public static final String ACTION_REPUSH_MODULES =
         "com.shizuposed.manager.ACTION_REPUSH_MODULES";
     public static final String ACTION_LAUNCH_APP =
         "com.shizuposed.manager.ACTION_LAUNCH_APP";
     public static final String EXTRA_LAUNCH_PACKAGE = "package";
 
-    // Shell's writable paths — everything that the shell-spawned
-    // app_process needs to read lives under here.
-    private static final String SHELL_FILES_DIR = "/data/user/0/com.android.shell/files";
-    private static final String SHELL_DEX_PATH  = SHELL_FILES_DIR + "/XposedHook.dex";
-    private static final String SHELL_CACHE_DIR = SHELL_FILES_DIR + "/.syscall_cache";
+    private static final String SHELL_FILES_DIR  = "/data/user/0/com.android.shell/files";
+    private static final String SHELL_DEX_PATH   = SHELL_FILES_DIR + "/XposedHook.dex";
+    private static final String SHELL_CACHE_DIR  = SHELL_FILES_DIR + "/.syscall_cache";
     private static final String SHELL_MODULES_DIR = SHELL_CACHE_DIR + "/modules";
+    private static final String SHELL_HOOKED_DIR = SHELL_CACHE_DIR + "/hooked";
 
-    // Local staging (external app storage so shell can read what we write)
     private String localStagingDexPath;
     private String localStagingModulesDir;
-
-    // Final path used by app_process (lives in shell's dir)
     private String xposedHookDexPath;
 
     private static volatile boolean isServiceRunning = false;
@@ -68,10 +60,6 @@ public class ShizuPosedService extends Service {
     private boolean isRunning = false;
     private boolean xposedHookStarted = false;
     private boolean dexDeployed = false;
-
-    // ═════════════════════════════════════════════════════════════
-    // Lifecycle
-    // ═════════════════════════════════════════════════════════════
 
     @Override
     public void onCreate() {
@@ -223,9 +211,13 @@ public class ShizuPosedService extends Service {
                 return false;
             }
 
-            // Ensure module directory exists on shell side
+            // Make sure all shell-side directories exist
+            shizukuHelper.executeCommand("mkdir -p " + SHELL_CACHE_DIR);
             shizukuHelper.executeCommand("mkdir -p " + SHELL_MODULES_DIR);
-            shizukuHelper.executeCommand("chmod 755 " + SHELL_CACHE_DIR + " " + SHELL_MODULES_DIR);
+            shizukuHelper.executeCommand("mkdir -p " + SHELL_HOOKED_DIR);
+            shizukuHelper.executeCommand("chmod 755 " + SHELL_CACHE_DIR
+                + " " + SHELL_MODULES_DIR
+                + " " + SHELL_HOOKED_DIR);
 
             logger.i("✅ XposedHook.dex deployed to: " + SHELL_DEX_PATH);
             dexDeployed = true;
@@ -250,10 +242,6 @@ public class ShizuPosedService extends Service {
     // MODULE PUSH
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Copy each enabled module's descriptor JSON and cached dex file into
-     * shell's module dir, so the shell-uid XposedHook can find them.
-     */
     private boolean pushModulesToShellDir(List<ModuleInfo> modules) {
         if (!shizukuHelper.isAuthorized()) return false;
 
@@ -265,7 +253,6 @@ public class ShizuPosedService extends Service {
             for (ModuleInfo module : modules) {
                 if (module == null || !module.enabled) continue;
 
-                // 1. Write JSON locally
                 String json = gson.toJson(module);
                 File localJson = new File(localStagingModulesDir, module.packageName + ".json");
                 try (FileOutputStream fos = new FileOutputStream(localJson)) {
@@ -274,7 +261,6 @@ public class ShizuPosedService extends Service {
                 }
                 localJson.setReadable(true, false);
 
-                // 2. Copy JSON into shell dir
                 String dstJson = SHELL_MODULES_DIR + "/" + module.packageName + ".json";
                 String copyJson = "sh -c 'cat \"" + localJson.getAbsolutePath()
                     + "\" > \"" + dstJson + "\"'";
@@ -285,7 +271,6 @@ public class ShizuPosedService extends Service {
                     continue;
                 }
 
-                // 3. Copy cached dex if present
                 if (module.cachedDexPath != null) {
                     File localDex = new File(module.cachedDexPath);
                     if (localDex.exists()) {
@@ -296,8 +281,6 @@ public class ShizuPosedService extends Service {
                         if (r2.isSuccess()) {
                             shizukuHelper.executeCommand("chmod 644 " + dstDex);
 
-                            // Rewrite cachedDexPath in the pushed JSON so XposedHook
-                            // loads the dex from the shell-side path.
                             String patchedJson = json.replace(
                                 localDex.getAbsolutePath(), dstDex);
                             File patchedLocal =
@@ -364,11 +347,6 @@ public class ShizuPosedService extends Service {
         });
     }
 
-    /**
-     * Prepares the payload (dex + modules) for later launch. Does NOT spawn
-     * a monitor process — hooking happens inside the target app process,
-     * launched via launchAppUnderShizuPosed().
-     */
     private void startXposedHook() {
         if (xposedHookStarted) return;
 
@@ -400,15 +378,13 @@ public class ShizuPosedService extends Service {
 
     // ═════════════════════════════════════════════════════════════
     // LAUNCH UNDER SHIZUPOSED
+    //
+    // Uses ShizukuHelper.getAppProcessBinary() to pick the correct
+    // app_process variant for the device. If no candidate works, we
+    // log a clear error and stop, rather than failing on a vague
+    // "app_process not found".
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Launch a target app inside a shell-spawned app_process so that
-     * XposedHook runs in the SAME pid as the target.
-     *
-     * @return true if the process was spawned. Does NOT guarantee hooking;
-     *         verify via the status file under SHELL_CACHE_DIR.
-     */
     public boolean launchAppUnderShizuPosed(String packageName) {
         if (!shizukuHelper.isAuthorized()) {
             logger.w("❌ Shizuku not authorized, cannot launch " + packageName);
@@ -422,29 +398,50 @@ public class ShizuPosedService extends Service {
             logger.w("⚠️ No applicable modules for " + packageName);
         }
 
+        // Ask ShizukuHelper which app_process binary actually works here.
+        String binary = shizukuHelper.getAppProcessBinary();
+        if (binary == null) {
+            logger.e("❌ No usable app_process binary on this ROM. " +
+                     "Hooking is not possible on this device.");
+            updateNotification("app_process unavailable");
+            return false;
+        }
+
         try {
+            // Resolve the target's uid so XposedHook can switch to it.
+            int targetUid = -1;
+            try {
+                android.content.pm.ApplicationInfo ai =
+                    getPackageManager().getApplicationInfo(packageName, 0);
+                targetUid = ai.uid;
+            } catch (Throwable ignored) {}
+
             String cmd = String.format(
-                "CLASSPATH=%s app_process " +
+                "CLASSPATH=%s %s " +
                 "-Xverify:none -Xallowinmemorycompilation " +
                 "-Xcompiler-option --target-api=%d " +
                 "-Djava.class.path=%s " +
-                "/system/bin com.shizuposed.manager.core.XposedHook %s &",
+                "/system/bin com.shizuposed.manager.core.XposedHook %s 0 %d &",
                 SHELL_DEX_PATH,
+                binary,
                 Build.VERSION.SDK_INT,
                 SHELL_DEX_PATH,
-                packageName
+                packageName,
+                targetUid
             );
 
-            logger.i("🚀 Launching " + packageName + " under ShizuPosed");
+            logger.i("🚀 Launching " + packageName + " under ShizuPosed"
+                + " (binary=" + binary + ", uid=" + targetUid + ")");
             logger.i("Executing: " + cmd);
 
             ShellUtils.CommandResult result = shizukuHelper.executeCommand(cmd);
             if (!result.isSuccess()) {
-                logger.e("❌ app_process launch failed: " + result.getStderrString());
+                logger.e("❌ " + binary + " launch failed: "
+                    + result.getStderrString());
                 return false;
             }
 
-            logger.i("✅ app_process spawned for " + packageName);
+            logger.i("✅ " + binary + " spawned for " + packageName);
             return true;
 
         } catch (Exception e) {
@@ -453,11 +450,6 @@ public class ShizuPosedService extends Service {
         }
     }
 
-    /**
-     * Legacy injection entry point. In the post-Application timing model,
-     * hooking a *running* process is not possible without native injection.
-     * Retained so callers compile; reports honestly.
-     */
     public boolean injectProcess(String packageName, int pid, int uid, List<ModuleInfo> modules) {
         logger.i("📥 injectProcess(" + packageName + ", pid=" + pid + ", uid=" + uid + ")");
 

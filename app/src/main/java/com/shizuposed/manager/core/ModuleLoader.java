@@ -13,6 +13,7 @@ import com.shizuposed.manager.utils.Logger;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -27,10 +28,20 @@ import java.util.zip.ZipFile;
  * ModuleLoader
  *
  * Responsible for:
- *   • Reading installed module descriptors (JSON) from app-internal storage
+ *   • Reading installed module descriptors (JSON)
  *   • Installing / uninstalling / saving modules
  *   • Scanning APKs for entry points (assets/xposed_init) and caching the
  *     module dex so XposedHook can load it from the shell side.
+ *
+ * Storage layout note:
+ *
+ *   The module JSONs live in app-internal storage (getFilesDir) because
+ *   only the manager reads them.
+ *
+ *   The module .dex copies live in EXTERNAL app storage
+ *   (getExternalFilesDir) because the shell uid has to read them when
+ *   pushing to /data/user/0/com.android.shell/files/. Shell cannot read
+ *   anything under /data/user/0/<our-pkg>/files/ — SELinux forbids it.
  */
 public class ModuleLoader {
     private static final String TAG = "ModuleLoader";
@@ -39,19 +50,38 @@ public class ModuleLoader {
     private final Context context;
     private final Logger logger;
     private final Gson gson;
-    private final File moduleDir;         // <app>/files/.syscall_cache/modules
-    private final File dexCacheDir;       // <app>/files/.syscall_cache (dex next to json)
+
+    // Module descriptors — internal storage, only the manager reads these
+    private final File moduleDir;
+
+    // Module .dex copies — external app storage so shell can read them
+    private final File dexCacheDir;
+
+    // Old internal dex cache — kept so we can migrate existing modules
+    private final File legacyDexCacheDir;
+
     private final ConcurrentHashMap<String, ModuleInfo> loadedModules = new ConcurrentHashMap<>();
 
     private ModuleLoader(Context context) {
         this.context = context.getApplicationContext();
         this.logger = Logger.getInstance(context);
         this.gson = new Gson();
+
+        // Internal: module JSON descriptors
         this.moduleDir = new File(context.getFilesDir(), ".syscall_cache/modules");
-        this.dexCacheDir = new File(context.getFilesDir(), ".syscall_cache");
+
+        // External: module .dex copies (shell-readable)
+        File external = context.getExternalFilesDir(null);
+        File dexBase = external != null ? external : context.getFilesDir();
+        this.dexCacheDir = new File(dexBase, ".syscall_cache");
+
+        // Old internal dex location — used only for one-time migration
+        this.legacyDexCacheDir = new File(context.getFilesDir(), ".syscall_cache");
 
         if (!moduleDir.exists()) moduleDir.mkdirs();
         if (!dexCacheDir.exists()) dexCacheDir.mkdirs();
+
+        migrateLegacyDexFiles();
     }
 
     public static synchronized ModuleLoader getInstance(Context context) {
@@ -59,6 +89,41 @@ public class ModuleLoader {
             instance = new ModuleLoader(context);
         }
         return instance;
+    }
+
+    /**
+     * Copy any .dex files sitting under the old internal path into
+     * external app storage so shell can read them. Runs once at startup;
+     * cheap because it only touches .dex files that exist.
+     */
+    private void migrateLegacyDexFiles() {
+        try {
+            if (legacyDexCacheDir.equals(dexCacheDir)) return;   // no-op if external unavailable
+            File[] files = legacyDexCacheDir.listFiles();
+            if (files == null) return;
+
+            int migrated = 0;
+            for (File f : files) {
+                if (!f.isFile() || !f.getName().endsWith(".dex")) continue;
+                File dst = new File(dexCacheDir, f.getName());
+                if (dst.exists() && dst.length() == f.length()) continue;
+
+                try (FileInputStream in = new FileInputStream(f);
+                     FileOutputStream out = new FileOutputStream(dst)) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                    out.flush();
+                }
+                dst.setReadable(true, false);
+                migrated++;
+            }
+            if (migrated > 0) {
+                logger.i("Migrated " + migrated + " dex file(s) to external storage");
+            }
+        } catch (Throwable t) {
+            logger.w("migrateLegacyDexFiles: " + t.getMessage());
+        }
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -80,10 +145,47 @@ public class ModuleLoader {
                         ModuleInfo module = gson.fromJson(json, ModuleInfo.class);
                         if (module == null || module.packageName == null) continue;
 
-                        // Backfill missing cachedDexPath if we can find one on disk
-                        if (module.cachedDexPath == null || !new File(module.cachedDexPath).exists()) {
-                            File fallback = new File(dexCacheDir, module.packageName + ".dex");
-                            if (fallback.exists()) module.cachedDexPath = fallback.getAbsolutePath();
+                        // If cachedDexPath is missing or points at a file that
+                        // doesn't exist, look for one under the external cache
+                        // directory, then under the legacy internal one.
+                        if (module.cachedDexPath == null
+                                || !new File(module.cachedDexPath).exists()) {
+
+                            File externalDex = new File(dexCacheDir, module.packageName + ".dex");
+                            if (externalDex.exists()) {
+                                module.cachedDexPath = externalDex.getAbsolutePath();
+                            } else {
+                                File legacyDex = new File(legacyDexCacheDir,
+                                    module.packageName + ".dex");
+                                if (legacyDex.exists()) {
+                                    // Re-stage to external
+                                    File dst = new File(dexCacheDir,
+                                        module.packageName + ".dex");
+                                    try (FileInputStream in = new FileInputStream(legacyDex);
+                                         FileOutputStream out = new FileOutputStream(dst)) {
+                                        byte[] buf = new byte[8192];
+                                        int n;
+                                        while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                                        out.flush();
+                                    }
+                                    dst.setReadable(true, false);
+                                    module.cachedDexPath = dst.getAbsolutePath();
+                                }
+                            }
+                        }
+
+                        // Also patch cachedDexPath if it points at an internal
+                        // file that no longer exists but an external copy does.
+                        if (module.cachedDexPath != null) {
+                            String cp = module.cachedDexPath;
+                            String internalBase = context.getFilesDir().getAbsolutePath();
+                            if (cp.startsWith(internalBase)) {
+                                File externalDex = new File(dexCacheDir,
+                                    module.packageName + ".dex");
+                                if (externalDex.exists()) {
+                                    module.cachedDexPath = externalDex.getAbsolutePath();
+                                }
+                            }
                         }
 
                         loadedModules.put(module.packageName, module);
@@ -113,20 +215,10 @@ public class ModuleLoader {
     // INSTALL / SAVE / UNINSTALL
     // ═════════════════════════════════════════════════════════════════
 
-    /**
-     * Install a new module.
-     *
-     * The APK at module.apkPath is scanned for assets/xposed_init and the
-     * dex is cached under <files>/.syscall_cache/<pkg>.dex. The JSON is
-     * written only after we've populated cachedDexPath, so any downstream
-     * consumer (ShizuPosedService.pushModulesToShellDir, XposedHook) sees
-     * a usable module.
-     */
     public boolean installModule(ModuleInfo module) {
         try {
             if (module == null || module.packageName == null) return false;
 
-            // Fill in metadata from the installed package if possible
             try {
                 PackageManager pm = context.getPackageManager();
                 android.content.pm.PackageInfo pkgInfo = pm.getPackageInfo(module.packageName, 0);
@@ -137,22 +229,21 @@ public class ModuleLoader {
                     }
                 }
             } catch (PackageManager.NameNotFoundException ignored) {
-                // Module isn't installed as a live package — fine, we work from the APK file
             }
 
-            // Ensure apkPath is present
             if (module.apkPath == null || !new File(module.apkPath).exists()) {
                 String fromPm = findModuleApkPath(module.packageName);
                 if (fromPm != null) module.apkPath = fromPm;
             }
 
-            // Cache the dex + discover entry point BEFORE writing JSON
             if (module.apkPath != null && new File(module.apkPath).exists()) {
                 File cachedDex = new File(dexCacheDir, module.packageName + ".dex");
-                if (!cachedDex.exists()) {
+                if (!cachedDex.exists() || cachedDex.length() == 0) {
                     scanModuleForEntryPoints(module);
                 } else {
                     module.cachedDexPath = cachedDex.getAbsolutePath();
+                    // Make sure the external copy is shell-readable
+                    cachedDex.setReadable(true, false);
                 }
             }
 
@@ -198,9 +289,14 @@ public class ModuleLoader {
                 logger.w("Module not found in cache: " + packageName);
             }
 
-            File dexFile = new File(dexCacheDir, packageName + ".dex");
-            if (dexFile.exists() && dexFile.delete()) {
-                logger.i("Deleted cached dex: " + dexFile.getAbsolutePath());
+            // Delete both possible dex copies (external and legacy internal)
+            File externalDex = new File(dexCacheDir, packageName + ".dex");
+            if (externalDex.exists() && externalDex.delete()) {
+                logger.i("Deleted cached dex: " + externalDex.getAbsolutePath());
+            }
+            File legacyDex = new File(legacyDexCacheDir, packageName + ".dex");
+            if (legacyDex.exists() && legacyDex.delete()) {
+                logger.i("Deleted legacy dex: " + legacyDex.getAbsolutePath());
             }
 
             return true;
@@ -240,14 +336,12 @@ public class ModuleLoader {
         }
     }
 
-    /** Real count of apps selected for a module. */
     public int getHookedAppCount(String modulePackage) {
         ModuleInfo m = loadedModules.get(modulePackage);
         if (m == null || m.hookedApps == null) return 0;
         return m.hookedApps.size();
     }
 
-    /** Delegate to the service's static running flag. */
     public boolean isServiceRunning() {
         try {
             return ShizuPosedService.isServiceRunning();
@@ -264,13 +358,6 @@ public class ModuleLoader {
     // APK SCAN + DEX CACHE
     // ═════════════════════════════════════════════════════════════════
 
-    /**
-     * Read the APK at module.apkPath. Looks for:
-     *   • assets/xposed_init       → module entry class name
-     *   • assets/native_init       → optional native entry (unused for now)
-     * Copies the APK bytes to <dexCacheDir>/<pkg>.dex so downstream code
-     * has a stable dex path independent of the APK's install location.
-     */
     private void scanModuleForEntryPoints(ModuleInfo module) {
         if (module == null || module.apkPath == null) return;
         File apk = new File(module.apkPath);
@@ -279,13 +366,13 @@ public class ModuleLoader {
             return;
         }
 
-        // 1. Cache the raw APK bytes as a .dex file. This is what the shell
-        //    process will load via DexClassLoader; it's technically the whole
-        //    APK, which DexClassLoader accepts as a valid dex container.
+        // Copy APK bytes into the external dex cache. This is what the
+        // shell process will load via DexClassLoader; the whole APK is
+        // a valid dex container, so we don't need to extract classes.dex.
         try {
             File cached = new File(dexCacheDir, module.packageName + ".dex");
             if (!cached.exists() || cached.length() == 0) {
-                try (InputStream is = new java.io.FileInputStream(apk);
+                try (FileInputStream is = new FileInputStream(apk);
                      FileOutputStream os = new FileOutputStream(cached)) {
                     byte[] buf = new byte[8192];
                     int n;
@@ -301,7 +388,6 @@ public class ModuleLoader {
             logger.e("Failed to cache dex for " + module.packageName + ": " + e.getMessage());
         }
 
-        // 2. Read assets/xposed_init for the entry class
         try (ZipFile zip = new ZipFile(apk)) {
             Enumeration<? extends ZipEntry> entries = zip.entries();
             while (entries.hasMoreElements()) {
@@ -325,7 +411,6 @@ public class ModuleLoader {
                         if (line != null && !line.isEmpty()) {
                             logger.i("Found native_init for " + module.packageName
                                 + ": " + line.trim());
-                            // module.nativeInit not part of your model yet; log only
                         }
                     }
                 }
@@ -335,10 +420,6 @@ public class ModuleLoader {
         }
     }
 
-    /**
-     * Locate the APK for a package via PackageManager. Public so callers
-     * outside this class can use it.
-     */
     @Nullable
     public String findModuleApkPath(String packageName) {
         try {

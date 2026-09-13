@@ -1,16 +1,12 @@
 package com.shizuposed.manager;
 
 import android.Manifest;
-import android.content.ComponentName;
-import android.content.Context;
 import android.content.Intent;
-import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
-import android.os.IBinder;
 import android.os.Looper;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -32,20 +28,20 @@ import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.ui.HomeFragment;
 import com.shizuposed.manager.ui.LogsFragment;
 import com.shizuposed.manager.ui.ModulesFragment;
+import com.shizuposed.manager.ui.RepoFragment;
 import com.shizuposed.manager.utils.Logger;
 
 import java.util.ArrayList;
 import java.util.List;
 
 public class MainActivity extends AppCompatActivity {
-    private static final String VERSION_LABEL = "v2.0";
+    private static final String VERSION_LABEL = "v2.9";
 
     private ViewPager2 viewPager;
     private BottomNavigationView bottomNavigation;
     private Toolbar toolbar;
     private MainPagerAdapter pagerAdapter;
     private ShizuPosedManagerApp app;
-    private boolean isServiceConnected = false;
     private Logger logger;
     private boolean shizukuAuthorized = false;
     private boolean isShizukuAvailable = false;
@@ -113,7 +109,6 @@ public class MainActivity extends AppCompatActivity {
 
     /**
      * Called by ShizuPosedManagerApp when Shizuku grants us permission.
-     * No Snackbar — the toolbar status is the notification.
      */
     public void onShizukuPermissionGranted() {
         runOnUiThread(() -> {
@@ -127,7 +122,6 @@ public class MainActivity extends AppCompatActivity {
 
     /**
      * Called by ShizuPosedManagerApp when the service auto-starts.
-     * No Snackbar — the Home card and toolbar convey the state.
      */
     public void onServiceAutoStarted() {
         runOnUiThread(this::refreshAll);
@@ -168,7 +162,6 @@ public class MainActivity extends AppCompatActivity {
                 helper.requestPermission();
             } else {
                 updateToolbarStatus(VERSION_LABEL + " • 🔑 Privileged");
-                // (removed the "Service running" Snackbar)
             }
         } catch (Exception e) {
             logger.e("Shizuku check error: " + e.getMessage());
@@ -253,37 +246,51 @@ public class MainActivity extends AppCompatActivity {
     private void setupViewPager() {
         pagerAdapter = new MainPagerAdapter(this);
         viewPager.setAdapter(pagerAdapter);
-        viewPager.setOffscreenPageLimit(3);
+        // There are now 5 pages; keep them all resident so tab switches
+        // are instant and fragments retain their state.
+        viewPager.setOffscreenPageLimit(4);
         viewPager.setUserInputEnabled(false);
     }
 
+    /**
+     * Bottom navigation. Five items now:
+     *   0 = Home
+     *   1 = Modules
+     *   2 = Repo
+     *   3 = Logs
+     *   4 = Settings
+     */
     private void setupBottomNavigation() {
         bottomNavigation.setOnItemSelectedListener(item -> {
             int itemId = item.getItemId();
-            if (itemId == R.id.nav_home) { viewPager.setCurrentItem(0); return true; }
-            if (itemId == R.id.nav_modules) { viewPager.setCurrentItem(1); return true; }
-            if (itemId == R.id.nav_logs) { viewPager.setCurrentItem(2); return true; }
-            if (itemId == R.id.nav_settings) { viewPager.setCurrentItem(3); return true; }
+            if (itemId == R.id.nav_home)     { viewPager.setCurrentItem(0); return true; }
+            if (itemId == R.id.nav_modules)  { viewPager.setCurrentItem(1); return true; }
+            if (itemId == R.id.nav_repo)     { viewPager.setCurrentItem(2); return true; }
+            if (itemId == R.id.nav_logs)     { viewPager.setCurrentItem(3); return true; }
+            if (itemId == R.id.nav_settings) { viewPager.setCurrentItem(4); return true; }
             return false;
         });
     }
 
+    /**
+     * Start the foreground service. No bindService — the service does
+     * not expose a binder, and the manager's state about "is the
+     * service running" comes from ShizuPosedService.isServiceRunning()
+     * and ShizuPosedManagerApp.isServiceAutoStarted(), which are the
+     * authoritative sources.
+     */
     private void startServices() {
-        Intent serviceIntent = new Intent(this, ShizuPosedService.class);
-        startService(serviceIntent);
-        bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE);
+        try {
+            Intent serviceIntent = new Intent(this, ShizuPosedService.class);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent);
+            } else {
+                startService(serviceIntent);
+            }
+        } catch (Throwable t) {
+            logger.e("Failed to start service: " + t.getMessage());
+        }
     }
-
-    private final ServiceConnection serviceConnection = new ServiceConnection() {
-        @Override public void onServiceConnected(ComponentName name, IBinder service) {
-            isServiceConnected = true;
-            logger.i("Connected to ShizuPosedService");
-        }
-        @Override public void onServiceDisconnected(ComponentName name) {
-            isServiceConnected = false;
-            logger.w("Disconnected from ShizuPosedService");
-        }
-    };
 
     @Override
     public boolean onCreateOptionsMenu(Menu menu) {
@@ -312,10 +319,6 @@ public class MainActivity extends AppCompatActivity {
         return super.onOptionsItemSelected(item);
     }
 
-    /**
-     * Refresh fragments. No Toast — the user-initiated refresh is
-     * already visible from the fragment UI updating.
-     */
     private void refreshAll() {
         for (int i = 0; i < pagerAdapter.getItemCount(); i++) {
             Fragment fragment = pagerAdapter.getFragment(i);
@@ -323,6 +326,8 @@ public class MainActivity extends AppCompatActivity {
                 ((HomeFragment) fragment).refresh();
             } else if (fragment instanceof ModulesFragment) {
                 ((ModulesFragment) fragment).refresh();
+            } else if (fragment instanceof RepoFragment) {
+                ((RepoFragment) fragment).refresh();
             } else if (fragment instanceof LogsFragment) {
                 ((LogsFragment) fragment).refresh();
             }
@@ -332,42 +337,72 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void restartServices() {
-        Intent serviceIntent = new Intent(this, ShizuPosedService.class);
-        stopService(serviceIntent);
-        startService(serviceIntent);
-        Toast.makeText(this, "Service restarted", Toast.LENGTH_SHORT).show();
+        try {
+            Intent serviceIntent = new Intent(this, ShizuPosedService.class);
+            stopService(serviceIntent);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent);
+            } else {
+                startService(serviceIntent);
+            }
+            Toast.makeText(this, "Service restarted", Toast.LENGTH_SHORT).show();
+        } catch (Throwable t) {
+            Toast.makeText(this, "Failed to restart service", Toast.LENGTH_SHORT).show();
+            logger.e("Restart service error: " + t.getMessage());
+        }
     }
 
+    /**
+     * Status dialog.
+     *
+     * Service state comes from ShizuPosedService.isServiceRunning() and
+     * ShizuPosedManagerApp.isServiceAutoStarted() — not from whether
+     * the activity is bound, because the service returns a null binder
+     * and never fires onServiceConnected.
+     *
+     * Sui is only shown when it's actually active. Shizuku-only users
+     * don't need to see a red "No" next to a framework they don't use.
+     */
     private void showStatusDialog() {
         ShizukuHelper helper = ShizukuHelper.getInstance(this);
         boolean available = helper.isAvailable();
         boolean authorized = helper.isAuthorized();
         int version = helper.getVersion();
         boolean isSui = helper.isSui();
-        boolean serviceStarted = app.isServiceAutoStarted();
 
-        String status = "ShizuPosed Manager " + VERSION_LABEL + "\n\n" +
-                       "Permissions: " + (permissionsGranted ? "✅ Granted" : "⚠️ Missing") + "\n" +
-                       "Shizuku Status: " + (available ? "✅ Available" : "❌ Unavailable") + "\n" +
-                       "Authorization: " + (authorized ? "✅ Authorized" : "❌ Not Authorized") + "\n" +
-                       "Shizuku Version: " + version + "\n" +
-                       "Sui Active: " + (isSui ? "✅ Yes" : "❌ No") + "\n\n" +
-                       "Service: " + (serviceStarted ? "✅ Started" : "❌ Not Started") + "\n" +
-                       "Service Connected: " + (isServiceConnected ? "✅ Connected" : "❌ Disconnected") + "\n\n" +
-                       "Privileged Mode: " + (authorized ? "🔑 Enabled" : "⚠️ Limited");
+        boolean serviceRunning =
+            ShizuPosedService.isServiceRunning()
+            || (app != null && app.isServiceAutoStarted());
+
+        StringBuilder status = new StringBuilder();
+        status.append("ShizuPosed Manager ").append(VERSION_LABEL).append("\n\n");
+        status.append("Permissions: ")
+              .append(permissionsGranted ? "✅ Granted" : "⚠️ Missing").append("\n");
+        status.append("Shizuku Status: ")
+              .append(available ? "✅ Available" : "❌ Unavailable").append("\n");
+        status.append("Authorization: ")
+              .append(authorized ? "✅ Authorized" : "❌ Not Authorized").append("\n");
+        status.append("Shizuku Version: ").append(version).append("\n");
+        if (isSui) {
+            status.append("Sui Active: ✅ Yes\n");
+        }
+        status.append("\n");
+        status.append("Service: ")
+              .append(serviceRunning ? "✅ Running" : "❌ Stopped").append("\n");
+        status.append("\n");
+        status.append("Privileged Mode: ")
+              .append(authorized ? "🔑 Enabled" : "⚠️ Limited");
 
         new AlertDialog.Builder(this)
             .setTitle("Status")
-            .setMessage(status)
+            .setMessage(status.toString())
             .setPositiveButton("OK", null)
             .show();
     }
 
     @Override
     protected void onDestroy() {
-        if (isServiceConnected) {
-            try { unbindService(serviceConnection); } catch (Throwable ignored) {}
-        }
         super.onDestroy();
+        // No unbindService — we never bound.
     }
 }

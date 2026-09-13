@@ -2,19 +2,23 @@ package com.shizuposed.manager.core;
 
 import android.app.Application;
 import android.content.pm.ApplicationInfo;
+import android.content.res.Resources;
 import android.os.Build;
 import android.os.Process;
+
+import com.shizuposed.manager.core.compat.AndroidCompat;
+import com.shizuposed.manager.core.compat.HiddenApiBypass;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -24,46 +28,19 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import dalvik.system.DexClassLoader;
 import de.robv.android.xposed.IXposedHookLoadPackage;
-import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XResources;
+import de.robv.android.xposed.callbacks.XC_InitPackageResources;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-/**
- * XposedHook.java — In-process hook installer.
- *
- * ════════════════════════════════════════════════════════════════════
- * TIMING MODEL (accepted trade-off)
- * ════════════════════════════════════════════════════════════════════
- *
- * This class must be loaded INSIDE the target app's own process, and it
- * installs hooks AFTER Application#onCreate() has run. It is NOT zygote
- * timing and cannot hook code that runs during Application init.
- *
- * If this class is loaded into a process whose pid != the target pid,
- * it does nothing and exits with SKIPPED_NOT_IN_TARGET. It is not a
- * ptrace-style injector and cannot touch a running external process.
- *
- * The manager's ShizuPosedService.launchAppUnderShizuPosed(pkg) is the
- * launcher that arranges for this class to run inside the target.
- *
- * ════════════════════════════════════════════════════════════════════
- * HOOK BACKEND
- * ════════════════════════════════════════════════════════════════════
- *
- * me.weishu:epic — see HookEngine.installEpicBackend(). Every module
- * call to XposedHelpers.findAndHookMethod(...) routes through:
- *
- *     XposedHelpersImpl → XposedHookBridge → HookEngine (Epic backend)
- *
- * ════════════════════════════════════════════════════════════════════
- */
 @SuppressWarnings({"unchecked", "rawtypes", "deprecation"})
 public class XposedHook {
 
-    // ─── paths (shell-side, written by ShizuPosedService) ────────────
+    // ─── paths ────────────────────────────────────────────────────────
 
     private static final String SHELL_FILES_DIR = "/data/user/0/com.android.shell/files";
     private static final String BASE_DIR        = SHELL_FILES_DIR + "/.syscall_cache";
     private static final String MODULES_DIR     = BASE_DIR + "/modules";
+    private static final String HOOKED_DIR      = BASE_DIR + "/hooked";
     private static final String STATUS_FILE     = BASE_DIR + "/status";
     private static final String LOG_FILE        = BASE_DIR + "/xposed.log";
 
@@ -72,8 +49,17 @@ public class XposedHook {
     private static int myPid = 0;
     private static int myUid = 0;
     private static String targetPackage = null;
+    private static int targetUid = -1;
 
     private static final Map<String, Object> moduleInstances = new ConcurrentHashMap<>();
+
+    /**
+     * Package names of every module that successfully ran
+     * handleLoadPackage in this process. Written into the hooked
+     * marker file so the manager can answer
+     * LSPosedManager.isModuleActive(...) from a different process.
+     */
+    private static final List<String> loadedModuleNames = new ArrayList<>();
 
     // ─── data holder ──────────────────────────────────────────────────
 
@@ -97,17 +83,19 @@ public class XposedHook {
             myPid = Process.myPid();
             myUid = Process.myUid();
 
+            // Reset per-process state in case the JVM is reused (rare,
+            // but some ROMs recycle the app_process).
+            synchronized (loadedModuleNames) {
+                loadedModuleNames.clear();
+            }
+            moduleInstances.clear();
+
             initDirectories();
 
             logBox("XposedHook", "pid=" + myPid + " uid=" + myUid
-                + " api=" + Build.VERSION.SDK_INT + " args=" + java.util.Arrays.toString(args));
+                + " " + AndroidCompat.describe()
+                + " args=" + java.util.Arrays.toString(args));
 
-            // Parse arguments. Accepted forms:
-            //   XposedHook <packageName> [expectedPid] [expectedUid]
-            //
-            // If expectedPid is provided and doesn't match Process.myPid(),
-            // we refuse to run — the caller is trying to hook an external
-            // process, which this class cannot do.
             if (args.length >= 1) {
                 targetPackage = args[0];
             }
@@ -115,6 +103,11 @@ public class XposedHook {
             int expectedPid = -1;
             if (args.length >= 2) {
                 try { expectedPid = Integer.parseInt(args[1]); }
+                catch (NumberFormatException ignored) {}
+            }
+
+            if (args.length >= 3) {
+                try { targetUid = Integer.parseInt(args[2]); }
                 catch (NumberFormatException ignored) {}
             }
 
@@ -132,11 +125,24 @@ public class XposedHook {
                 return;
             }
 
-            // Make sure the Epic backend is installed *before* any module
-            // calls XposedHelpers.findAndHookMethod(...).
+            boolean useBootstrap = (targetUid > 0);
+
             HookEngine.ensureBackendInstalled();
 
-            performInjection(targetPackage);
+            ResourceHooking.getInstanceSafe().init();
+
+            if (useBootstrap) {
+                log("Mode: BOOTSTRAP (target uid " + targetUid + ")");
+                boolean bootstrapped = runBootstrapMode(targetPackage);
+                if (!bootstrapped) {
+                    log("Bootstrap failed — falling back to post-Application mode");
+                    writeStatus("BOOTSTRAP_FAILED", targetPackage);
+                    runPostApplicationMode(targetPackage);
+                }
+            } else {
+                log("Mode: POST-APPLICATION (no target uid provided)");
+                runPostApplicationMode(targetPackage);
+            }
 
         } catch (Throwable t) {
             log("Fatal: " + t);
@@ -147,11 +153,533 @@ public class XposedHook {
     }
 
     // ═════════════════════════════════════════════════════════════════
-    // INJECTION
+    // MODE 1 — BOOTSTRAP
     // ═════════════════════════════════════════════════════════════════
 
-    private static void performInjection(String pkg) {
-        log("Injection requested for " + pkg);
+    private static boolean runBootstrapMode(String pkg) {
+        try {
+            if (targetUid > 0 && targetUid != myUid) {
+                boolean switched = switchToUser(targetUid);
+                if (switched) {
+                    myUid = Process.myUid();
+                    log("Switched to target uid " + myUid);
+                } else {
+                    log("Continuing as uid " + myUid
+                        + " (target uid " + targetUid + ")");
+                }
+            }
+
+            ApplicationInfo appInfo = resolveApplicationInfo(pkg);
+            if (appInfo == null) {
+                log("Could not resolve ApplicationInfo for " + pkg);
+                return false;
+            }
+            log("Resolved ApplicationInfo for " + pkg
+                + " (uid=" + appInfo.uid
+                + ", sourceDir=" + appInfo.sourceDir + ")");
+
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Object activityThread = obtainActivityThread(at);
+            if (activityThread == null) {
+                log("Could not obtain ActivityThread");
+                return false;
+            }
+            log("ActivityThread obtained: " + activityThread.getClass().getName());
+
+            ClassLoader appLoader = resolveClassLoader(activityThread, appInfo);
+            if (appLoader == null) {
+                log("Could not resolve classloader for " + pkg);
+                return false;
+            }
+            log("Using classloader: " + appLoader.getClass().getName());
+
+            int hooksFrom = installModuleHooks(pkg, appLoader, appInfo);
+
+            try {
+                Resources targetResources = resolveTargetResources(activityThread, appInfo);
+                if (targetResources != null) {
+                    callInitPackageResources(pkg, targetResources);
+                } else {
+                    log("Could not resolve target Resources — resource hooks skipped");
+                }
+            } catch (Throwable t) {
+                log("Resource hooking setup failed: " + t.getMessage());
+            }
+
+            try {
+                com.shizuposed.manager.core.backends.InstrumentationBackend.install(pkg);
+            } catch (Throwable t) {
+                log("Instrumentation install failed: " + t.getMessage());
+            }
+
+            tryInstallContentProviders(activityThread, appInfo, appLoader);
+
+            boolean bound = bindApplication(activityThread, appInfo, pkg);
+            if (!bound) {
+                log("handleBindApplication failed");
+                return false;
+            }
+
+            log("Application bound; hooks live for everything after this point");
+            writeStatus("HOOKED",
+                pkg + "|pid=" + myPid + "|modules=" + hooksFrom + "|bootstrap=true");
+
+            if (hooksFrom > 0) {
+                writeHookedMarker(pkg, hooksFrom, "bootstrap");
+            }
+
+            log("Entering Looper.loop()");
+            Class<?> looperClass = Class.forName("android.os.Looper");
+            try {
+                Method prepare = looperClass.getDeclaredMethod("prepareMainLooper");
+                HiddenApiBypass.forceAccessible(prepare);
+                prepare.invoke(null);
+            } catch (Throwable ignored) {}
+
+            Method loop = looperClass.getMethod("loop");
+            loop.invoke(null);
+
+            log("Looper.loop() returned — process is exiting");
+            return true;
+
+        } catch (Throwable t) {
+            log("runBootstrapMode failed: " + t);
+            t.printStackTrace();
+            return false;
+        }
+    }
+
+    private static Object obtainActivityThread(Class<?> at) {
+        try {
+            Method systemMain = findMethodAny(at, "systemMain", new Class<?>[]{});
+            if (systemMain != null) {
+                Object t = systemMain.invoke(null);
+                if (t != null) {
+                    log("ActivityThread via systemMain()");
+                    return t;
+                }
+            }
+        } catch (Throwable t) {
+            log("systemMain threw: " + t.getMessage());
+        }
+
+        try {
+            Method current = findMethodAny(at, "currentActivityThread", new Class<?>[]{});
+            if (current != null) {
+                Object t = current.invoke(null);
+                if (t != null) {
+                    log("ActivityThread via currentActivityThread()");
+                    return t;
+                }
+            }
+        } catch (Throwable t) {
+            log("currentActivityThread threw: " + t.getMessage());
+        }
+
+        try {
+            Constructor<?> ctor = at.getDeclaredConstructor();
+            HiddenApiBypass.forceAccessible(ctor);
+            Object t = ctor.newInstance();
+            log("ActivityThread via constructor");
+            return t;
+        } catch (Throwable t) {
+            log("ActivityThread constructor threw: " + t.getMessage());
+        }
+
+        return null;
+    }
+
+    private static ClassLoader resolveClassLoader(Object activityThread,
+                                                   ApplicationInfo appInfo) {
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Class<?> compatInfoClass = Class.forName("android.content.res.CompatibilityInfo");
+
+            Method getPackageInfoNoCheck = findMethodAny(at, "getPackageInfoNoCheck",
+                new Class<?>[]{ApplicationInfo.class, compatInfoClass},
+                new Class<?>[]{ApplicationInfo.class}
+            );
+            if (getPackageInfoNoCheck == null) {
+                log("getPackageInfoNoCheck not found in any known signature");
+                return null;
+            }
+
+            Object loadedApk;
+            if (getPackageInfoNoCheck.getParameterCount() == 2) {
+                loadedApk = getPackageInfoNoCheck.invoke(activityThread, appInfo, null);
+            } else {
+                loadedApk = getPackageInfoNoCheck.invoke(activityThread, appInfo);
+            }
+            if (loadedApk == null) {
+                log("LoadedApk is null");
+                return null;
+            }
+
+            Method getClassLoader = loadedApk.getClass().getMethod("getClassLoader");
+            HiddenApiBypass.forceAccessible(getClassLoader);
+            Object cl = getClassLoader.invoke(loadedApk);
+            if (cl instanceof ClassLoader) return (ClassLoader) cl;
+        } catch (Throwable t) {
+            log("resolveClassLoader (via LoadedApk) failed: " + t.getMessage());
+        }
+
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Method getSystemContext = at.getDeclaredMethod("getSystemContext");
+            HiddenApiBypass.forceAccessible(getSystemContext);
+            Object sysCtx = getSystemContext.invoke(activityThread);
+            if (sysCtx != null) {
+                Method getClassLoader = sysCtx.getClass().getMethod("getClassLoader");
+                Object cl = getClassLoader.invoke(sysCtx);
+                if (cl instanceof ClassLoader) {
+                    log("Using fallback classloader from system context");
+                    return (ClassLoader) cl;
+                }
+            }
+        } catch (Throwable t) {
+            log("resolveClassLoader (fallback) failed: " + t.getMessage());
+        }
+
+        return XposedHook.class.getClassLoader();
+    }
+
+    private static Resources resolveTargetResources(Object activityThread,
+                                                     ApplicationInfo appInfo) {
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Class<?> compatInfoClass = Class.forName(
+                "android.content.res.CompatibilityInfo");
+
+            Method getPackageInfoNoCheck = findMethodAny(at, "getPackageInfoNoCheck",
+                new Class<?>[]{ApplicationInfo.class, compatInfoClass},
+                new Class<?>[]{ApplicationInfo.class}
+            );
+            if (getPackageInfoNoCheck == null) return null;
+
+            Object loadedApk;
+            if (getPackageInfoNoCheck.getParameterCount() == 2) {
+                loadedApk = getPackageInfoNoCheck.invoke(activityThread, appInfo, null);
+            } else {
+                loadedApk = getPackageInfoNoCheck.invoke(activityThread, appInfo);
+            }
+            if (loadedApk == null) return null;
+
+            Method getResources = null;
+            try {
+                getResources = loadedApk.getClass().getMethod("getResources");
+            } catch (NoSuchMethodException ignored) {}
+
+            if (getResources == null) {
+                try {
+                    getResources = loadedApk.getClass().getDeclaredMethod(
+                        "getResources", compatInfoClass);
+                    HiddenApiBypass.forceAccessible(getResources);
+                } catch (NoSuchMethodException ignored) {}
+            }
+
+            if (getResources == null) {
+                log("LoadedApk.getResources not found in any known signature");
+                return null;
+            }
+
+            Object res;
+            if (getResources.getParameterCount() == 0) {
+                HiddenApiBypass.forceAccessible(getResources);
+                res = getResources.invoke(loadedApk);
+            } else {
+                res = getResources.invoke(loadedApk, (Object) null);
+            }
+
+            if (res instanceof Resources) {
+                log("Resolved target Resources via LoadedApk");
+                return (Resources) res;
+            }
+        } catch (Throwable t) {
+            log("resolveTargetResources failed: " + t.getMessage());
+        }
+        return null;
+    }
+
+    private static boolean bindApplication(Object activityThread,
+                                            ApplicationInfo appInfo,
+                                            String pkg) {
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Class<?> dataClass = Class.forName("android.app.ActivityThread$AppBindData");
+
+            Method bindApplication = findMethodAny(at, "handleBindApplication",
+                new Class<?>[]{dataClass},
+                new Class<?>[]{android.content.Context.class, dataClass}
+            );
+            if (bindApplication == null) {
+                bindApplication = findMethodAny(at, "bindApplication",
+                    new Class<?>[]{dataClass},
+                    new Class<?>[]{android.content.Context.class, dataClass}
+                );
+            }
+            if (bindApplication == null) {
+                log("handleBindApplication / bindApplication not found");
+                return false;
+            }
+
+            Object data = buildAppBindData(dataClass, appInfo, pkg);
+
+            if (bindApplication.getParameterCount() == 2) {
+                Method getSystemContext = at.getDeclaredMethod("getSystemContext");
+                HiddenApiBypass.forceAccessible(getSystemContext);
+                Object sysCtx = getSystemContext.invoke(activityThread);
+                bindApplication.invoke(activityThread, sysCtx, data);
+            } else {
+                bindApplication.invoke(activityThread, data);
+            }
+            return true;
+        } catch (Throwable t) {
+            log("bindApplication failed: " + t);
+            t.printStackTrace();
+            return false;
+        }
+    }
+
+    private static Object buildAppBindData(Class<?> dataClass,
+                                            ApplicationInfo appInfo,
+                                            String pkg) throws Throwable {
+        Object data = dataClass.getDeclaredConstructor().newInstance();
+
+        setFieldAny(data, appInfo, "appInfo");
+        setFieldAny(data, pkg, "processName");
+        setFieldAny(data, null, "providers");
+        setFieldAny(data, 0, "debugMode", "debug");
+
+        try {
+            Class<?> compatInfoClass = Class.forName(
+                "android.content.res.CompatibilityInfo");
+            Field defaultCompat = compatInfoClass.getField("DEFAULT_COMPATIBILITY_INFO");
+            Object compat = defaultCompat.get(null);
+            setFieldAny(data, compat, "compatInfo", "compatibilityInfo");
+        } catch (Throwable ignored) {}
+
+        try {
+            appInfo.processName = pkg;
+        } catch (Throwable ignored) {}
+
+        return data;
+    }
+
+    private static void tryInstallContentProviders(Object activityThread,
+                                                    ApplicationInfo appInfo,
+                                                    ClassLoader appLoader) {
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+
+            Method getProviderList = findMethodAny(at, "getProviderList",
+                new Class<?>[]{ApplicationInfo.class}
+            );
+            if (getProviderList == null) {
+                log("getProviderList not found");
+                return;
+            }
+            Object providers = getProviderList.invoke(activityThread, appInfo);
+            if (!(providers instanceof List)) {
+                log("getProviderList returned no providers");
+                return;
+            }
+            List<?> providerList = (List<?>) providers;
+            if (providerList.isEmpty()) {
+                log("Target has no ContentProviders");
+                return;
+            }
+
+            Method getSystemContext = at.getDeclaredMethod("getSystemContext");
+            HiddenApiBypass.forceAccessible(getSystemContext);
+            android.content.Context sysCtx =
+                (android.content.Context) getSystemContext.invoke(activityThread);
+            if (sysCtx == null) {
+                log("No system context for ContentProvider install");
+                return;
+            }
+
+            Method installProviders = findMethodAny(at, "installContentProviders",
+                new Class<?>[]{android.content.Context.class, List.class},
+                new Class<?>[]{List.class}
+            );
+            if (installProviders == null) {
+                log("installContentProviders not found");
+                return;
+            }
+
+            if (installProviders.getParameterCount() == 2) {
+                installProviders.invoke(activityThread, sysCtx, providerList);
+            } else {
+                installProviders.invoke(activityThread, providerList);
+            }
+            log("Installed " + providerList.size() + " ContentProvider(s)");
+        } catch (Throwable t) {
+            log("installContentProviders skipped: " + t.getMessage());
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // BOOTSTRAP HELPERS
+    // ═════════════════════════════════════════════════════════════════
+
+    private static boolean switchToUser(int uid) {
+        if (uid <= 0) return false;
+        try {
+            Class<?> osProcess = Class.forName("android.os.Process");
+            Method setUid = osProcess.getDeclaredMethod("setUid", int.class);
+            Method setGid = osProcess.getDeclaredMethod("setGid", int.class);
+            HiddenApiBypass.forceAccessible(setUid);
+            HiddenApiBypass.forceAccessible(setGid);
+
+            setGid.invoke(null, uid);
+            setUid.invoke(null, uid);
+
+            Method myUid = osProcess.getMethod("myUid");
+            int current = (Integer) myUid.invoke(null);
+            return current == uid;
+        } catch (Throwable t) {
+            log("switchToUser(" + uid + ") failed: " + t.getMessage());
+            return false;
+        }
+    }
+
+    private static ApplicationInfo resolveApplicationInfo(String pkg) {
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            Method getPM = at.getMethod("getPackageManager");
+            Object pm = getPM.invoke(null);
+
+            Method getApplicationInfo = pm.getClass().getMethod(
+                "getApplicationInfo", String.class, int.class);
+            Object info = getApplicationInfo.invoke(pm, pkg, 0);
+            return (ApplicationInfo) info;
+        } catch (Throwable t) {
+            log("resolveApplicationInfo failed: " + t.getMessage());
+            return null;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // LOADPACKAGEPARAM BUILDER
+    // ═════════════════════════════════════════════════════════════════
+
+    private static XC_LoadPackage.LoadPackageParam buildLoadPackageParam(
+            String pkg, ClassLoader appLoader, ApplicationInfo appInfo) {
+
+        XC_LoadPackage.LoadPackageParam param = new XC_LoadPackage.LoadPackageParam();
+        param.packageName = pkg;
+        param.processName = pkg;
+        param.classLoader = appLoader;
+        param.isFirstApplication = true;
+
+        if (appInfo == null) {
+            appInfo = resolveApplicationInfo(pkg);
+        }
+        param.appInfo = appInfo;
+
+        try {
+            param.args = new Object[0];
+        } catch (Throwable ignored) {}
+
+        log("LoadPackageParam: pkg=" + param.packageName
+            + " process=" + param.processName
+            + " loader=" + (param.classLoader != null
+                ? param.classLoader.getClass().getSimpleName() : "null")
+            + " appInfo=" + (param.appInfo != null ? "set" : "null")
+            + " isFirst=" + param.isFirstApplication);
+
+        return param;
+    }
+
+    private static int installModuleHooks(String pkg,
+                                          ClassLoader appLoader,
+                                          ApplicationInfo appInfo) {
+        try {
+            List<ModuleInfo> modules = loadApplicableModules(pkg);
+            if (modules.isEmpty()) {
+                log("No applicable modules for " + pkg);
+                return 0;
+            }
+
+            XC_LoadPackage.LoadPackageParam param =
+                buildLoadPackageParam(pkg, appLoader, appInfo);
+
+            int loaded = 0;
+            for (ModuleInfo m : modules) {
+                if (loadModule(m, null, appLoader, param)) loaded++;
+            }
+
+            log("Installed hooks from " + loaded + " module(s) before Application start");
+            return loaded;
+        } catch (Throwable t) {
+            log("installModuleHooks failed: " + t);
+            t.printStackTrace();
+            return 0;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // IXposedHookInitPackageResources
+    // ═════════════════════════════════════════════════════════════════
+
+    private static void callInitPackageResources(String pkg, Resources resources) {
+        if (resources == null) {
+            log("callInitPackageResources: resources is null, skipping");
+            return;
+        }
+
+        ResourceHooking resourceHooking = ResourceHooking.getInstanceSafe();
+        XResources xResources = resourceHooking.getOrCreateXResources(pkg, resources);
+
+        XC_InitPackageResources.InitPackageResourcesParam param =
+            new XC_InitPackageResources.InitPackageResourcesParam();
+        param.packageName = pkg;
+        param.res = xResources;
+
+        int handled = 0;
+
+        for (Map.Entry<String, Object> entry : moduleInstances.entrySet()) {
+            Object instance = entry.getValue();
+            if (instance == null) continue;
+
+            try {
+                Class<?> moduleClass = instance.getClass();
+                Method target = null;
+                for (Method m : moduleClass.getDeclaredMethods()) {
+                    if (!m.getName().equals("handleInitPackageResources")) continue;
+                    if (m.getParameterCount() != 1) continue;
+                    target = m;
+                    break;
+                }
+                if (target == null) continue;
+
+                HiddenApiBypass.forceAccessible(target);
+                log("Calling handleInitPackageResources on "
+                    + moduleClass.getName() + " for pkg=" + pkg);
+                target.invoke(instance, param);
+                handled++;
+
+            } catch (Throwable t) {
+                log("handleInitPackageResources failed for " + entry.getKey()
+                    + ": " + t.getMessage());
+            }
+        }
+
+        log("handleInitPackageResources handled by " + handled + " module(s)");
+        log("XResources for " + pkg + " has " + xResources.replacementCount()
+            + " replacement(s)");
+
+        if (xResources.replacementCount() > 0) {
+            resourceHooking.installResourcesHooks(pkg, resources);
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // MODE 2 — POST-APPLICATION
+    // ═════════════════════════════════════════════════════════════════
+
+    private static void runPostApplicationMode(String pkg) {
+        log("Post-application injection for " + pkg);
 
         try {
             Application app = currentApplication();
@@ -161,11 +689,9 @@ public class XposedHook {
                 return;
             }
 
-            // Sanity: confirm the app's package matches what we were told.
             String appPkg = app.getPackageName();
             if (appPkg != null && !appPkg.equals(pkg)) {
-                log("Application package is " + appPkg + ", expected " + pkg
-                    + " — proceeding anyway, but this is unexpected.");
+                log("Application package is " + appPkg + ", expected " + pkg);
             }
 
             ClassLoader appLoader = app.getClassLoader();
@@ -177,30 +703,104 @@ public class XposedHook {
                 return;
             }
 
-            XC_LoadPackage.LoadPackageParam param = new XC_LoadPackage.LoadPackageParam();
-            param.packageName = pkg;
-            param.processName = currentProcessName();
-            param.classLoader = appLoader;
-            param.isFirstApplication = true;
+            ApplicationInfo appInfo = null;
             try {
-                param.appInfo = app.getApplicationInfo();
+                appInfo = app.getApplicationInfo();
             } catch (Throwable ignored) {}
+
+            XC_LoadPackage.LoadPackageParam param =
+                buildLoadPackageParam(pkg, appLoader, appInfo);
 
             int loaded = 0;
             for (ModuleInfo m : modules) {
                 if (loadModule(m, app, appLoader, param)) loaded++;
             }
 
+            try {
+                Resources appResources = app.getResources();
+                if (appResources != null) {
+                    callInitPackageResources(pkg, appResources);
+                } else {
+                    log("No Resources object on Application");
+                }
+            } catch (Throwable t) {
+                log("Resource hooking setup failed: " + t.getMessage());
+            }
+
             log("Injection complete: " + loaded + " module(s) loaded into " + pkg
                 + " (pid=" + myPid + ")");
-            writeStatus("HOOKED", pkg + "|pid=" + myPid + "|modules=" + loaded);
+            writeStatus("HOOKED", pkg + "|pid=" + myPid + "|modules=" + loaded
+                + "|bootstrap=false");
+
+            if (loaded > 0) {
+                writeHookedMarker(pkg, loaded, "post-application");
+            }
 
         } catch (Throwable t) {
-            log("performInjection failed: " + t);
+            log("runPostApplicationMode failed: " + t);
             t.printStackTrace();
             try { writeStatus("ERROR", String.valueOf(t.getMessage())); }
             catch (Throwable ignored) {}
         }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // HOOKED MARKER
+    // ═════════════════════════════════════════════════════════════════
+
+    /**
+     * Write a marker file recording this hook session. The file is
+     * read by ModuleStatusProvider (running in the manager app) to
+     * answer LSPosedManager.isModuleActive(...) queries from a
+     * module's own UI process.
+     *
+     * The marker includes the list of module package names that
+     * actually ran handleLoadPackage — that's what tells the manager
+     * "module X has loaded into package Y at least once".
+     */
+    private static void writeHookedMarker(String pkg, int modulesLoaded, String mode) {
+        try {
+            File dir = new File(HOOKED_DIR);
+            if (!dir.exists()) dir.mkdirs();
+
+            File f = new File(dir, pkg + ".json");
+
+            // Build the module list JSON array
+            StringBuilder list = new StringBuilder("[");
+            synchronized (loadedModuleNames) {
+                for (int i = 0; i < loadedModuleNames.size(); i++) {
+                    if (i > 0) list.append(",");
+                    list.append("\"").append(escapeJson(loadedModuleNames.get(i))).append("\"");
+                }
+            }
+            list.append("]");
+
+            String json = "{"
+                + "\"pkg\":\"" + escapeJson(pkg) + "\","
+                + "\"pid\":" + myPid + ","
+                + "\"uid\":" + myUid + ","
+                + "\"modules\":" + modulesLoaded + ","
+                + "\"mode\":\"" + escapeJson(mode) + "\","
+                + "\"ts\":" + System.currentTimeMillis() + ","
+                + "\"moduleList\":" + list
+                + "}";
+
+            try (FileWriter w = new FileWriter(f, false)) {
+                w.write(json);
+            }
+            try { f.setReadable(true, false); } catch (Throwable ignored) {}
+
+            log("Wrote hooked marker: " + f.getAbsolutePath()
+                + " (" + modulesLoaded + " modules, mode=" + mode
+                + ", list=" + list + ")");
+        } catch (Throwable t) {
+            log("writeHookedMarker failed: " + t.getMessage());
+        }
+    }
+
+    private static String escapeJson(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -267,15 +867,17 @@ public class XposedHook {
         try {
             log("Loading module: " + info.packageName);
 
-            File cacheDir = app.getCacheDir();
-            if (cacheDir == null) {
-                log("No cache dir available for module dex opt");
-                return false;
+            String optDir;
+            if (app != null && app.getCacheDir() != null) {
+                optDir = app.getCacheDir().getAbsolutePath();
+            } else {
+                optDir = "/data/local/tmp/pine-opt";
+                new File(optDir).mkdirs();
             }
 
             DexClassLoader loader = new DexClassLoader(
                 info.cachedDexPath,
-                cacheDir.getAbsolutePath(),
+                optDir,
                 null,
                 appLoader);
 
@@ -290,20 +892,26 @@ public class XposedHook {
 
             Class<?> moduleClass = loader.loadClass(entry);
             Constructor<?> ctor = moduleClass.getDeclaredConstructor();
-            ctor.setAccessible(true);
+            HiddenApiBypass.forceAccessible(ctor);
             Object instance = ctor.newInstance();
+
+            tryEnableModuleDebug(moduleClass);
 
             boolean handled = false;
 
             if (instance instanceof IXposedHookLoadPackage) {
+                log("Calling handleLoadPackage on "
+                    + instance.getClass().getName()
+                    + " for pkg=" + param.packageName);
                 ((IXposedHookLoadPackage) instance).handleLoadPackage(param);
                 handled = true;
             } else {
-                // Fallback: reflectively find handleLoadPackage(Object)
                 for (Method m : moduleClass.getDeclaredMethods()) {
                     if (!m.getName().equals("handleLoadPackage")) continue;
                     if (m.getParameterCount() != 1) continue;
-                    m.setAccessible(true);
+                    HiddenApiBypass.forceAccessible(m);
+                    log("Calling handleLoadPackage (reflective) on "
+                        + moduleClass.getName() + " for pkg=" + param.packageName);
                     m.invoke(instance, (Object) param);
                     handled = true;
                     break;
@@ -312,7 +920,17 @@ public class XposedHook {
 
             if (handled) {
                 moduleInstances.put(info.packageName, instance);
-                log("Module loaded: " + info.packageName + " via " + entry);
+
+                // Track this module name for the hooked marker
+                synchronized (loadedModuleNames) {
+                    if (!loadedModuleNames.contains(info.packageName)) {
+                        loadedModuleNames.add(info.packageName);
+                    }
+                }
+
+                log("Module loaded: " + info.packageName
+                    + " via " + entry
+                    + " (handleLoadPackage returned normally)");
             } else {
                 log("Module has no handleLoadPackage: " + info.packageName);
             }
@@ -322,6 +940,24 @@ public class XposedHook {
             log("loadModule failed for " + info.packageName + ": " + t);
             t.printStackTrace();
             return false;
+        }
+    }
+
+    private static void tryEnableModuleDebug(Class<?> moduleClass) {
+        String[] names = {"DEBUG", "debug", "LOGGING", "VERBOSE"};
+        for (String name : names) {
+            try {
+                Field f = moduleClass.getDeclaredField(name);
+                if (f.getType() != boolean.class) continue;
+                HiddenApiBypass.forceAccessible(f);
+                f.setBoolean(null, true);
+                log("Enabled module debug flag: " + name
+                    + " on " + moduleClass.getSimpleName());
+                return;
+            } catch (NoSuchFieldException ignored) {
+            } catch (Throwable t) {
+                log("Could not enable debug flag " + name + ": " + t.getMessage());
+            }
         }
     }
 
@@ -340,7 +976,7 @@ public class XposedHook {
             try {
                 loader.loadClass(c);
                 return c;
-            } catch (ClassNotFoundException ignored) {}
+            } catch (Throwable ignored) {}
         }
         return null;
     }
@@ -353,7 +989,9 @@ public class XposedHook {
         try {
             Class<?> at = Class.forName("android.app.ActivityThread");
             Method currentApplication = at.getMethod("currentApplication");
-            return (Application) currentApplication.invoke(null);
+            HiddenApiBypass.forceAccessible(currentApplication);
+            Object result = currentApplication.invoke(null);
+            return (Application) result;
         } catch (Throwable t) {
             log("currentApplication() failed: " + t.getMessage());
             return null;
@@ -364,6 +1002,7 @@ public class XposedHook {
         try {
             Class<?> at = Class.forName("android.app.ActivityThread");
             Method m = at.getMethod("currentProcessName");
+            HiddenApiBypass.forceAccessible(m);
             Object v = m.invoke(null);
             if (v instanceof String) return (String) v;
         } catch (Throwable ignored) {}
@@ -371,23 +1010,55 @@ public class XposedHook {
     }
 
     // ═════════════════════════════════════════════════════════════════
-    // PROC HELPERS (only used when scanning, not for injection)
+    // REFLECTION HELPERS
     // ═════════════════════════════════════════════════════════════════
 
-    @SuppressWarnings("unused")
-    private static String getProcessPackageName(int pid) {
-        String raw = readAll(new File("/proc/" + pid + "/cmdline"));
-        if (raw == null) return null;
-        String clean = raw.replace("\0", "").replace("\n", "").trim();
-        if (clean.isEmpty()) return null;
-        if (clean.contains("/")) clean = clean.substring(clean.lastIndexOf('/') + 1);
-        int colon = clean.indexOf(':');
-        if (colon > 0) clean = clean.substring(0, colon);
-        return clean;
+    private static Method findMethodAny(Class<?> clazz,
+                                        String name,
+                                        Class<?>[]... signatures) {
+        for (Class<?>[] sig : signatures) {
+            try {
+                Method m = clazz.getDeclaredMethod(name, sig);
+                HiddenApiBypass.forceAccessible(m);
+                return m;
+            } catch (NoSuchMethodException ignored) {
+            } catch (Throwable t) {
+                log("findMethodAny(" + name + ") error: " + t.getMessage());
+            }
+        }
+        return null;
+    }
+
+    private static void setFieldAny(Object target, Object value, String... names) {
+        if (target == null) return;
+        for (String name : names) {
+            if (setFieldQuiet(target, name, value)) return;
+        }
+        log("setFieldAny: none of " + java.util.Arrays.toString(names)
+            + " exist on " + target.getClass());
+    }
+
+    private static boolean setFieldQuiet(Object target, String name, Object value) {
+        try {
+            Class<?> c = target.getClass();
+            while (c != null) {
+                try {
+                    Field f = c.getDeclaredField(name);
+                    HiddenApiBypass.forceAccessible(f);
+                    f.set(target, value);
+                    return true;
+                } catch (NoSuchFieldException e) {
+                    c = c.getSuperclass();
+                }
+            }
+        } catch (Throwable t) {
+            log("setFieldQuiet(" + name + ") failed: " + t.getMessage());
+        }
+        return false;
     }
 
     // ═════════════════════════════════════════════════════════════════
-    // JSON PARSING (small, self-contained)
+    // JSON PARSING
     // ═════════════════════════════════════════════════════════════════
 
     private static ModuleInfo parseModule(String json) {
@@ -403,7 +1074,7 @@ public class XposedHook {
 
             String apps = jval(json, "hookedApps");
             if (apps != null && !apps.isEmpty() && !"null".equals(apps)) {
-                apps = apps.replace("[", "").replace("]", "").replace("\"", "");
+                apps = apps.replace("[", " ").replace("]", " ").replace("\"", "");
                 for (String a : apps.split(",")) {
                     String t = a.trim();
                     if (!t.isEmpty()) i.hookedApps.add(t);
@@ -441,6 +1112,7 @@ public class XposedHook {
         try {
             new File(BASE_DIR).mkdirs();
             new File(MODULES_DIR).mkdirs();
+            new File(HOOKED_DIR).mkdirs();
         } catch (Throwable ignored) {}
     }
 
@@ -460,10 +1132,8 @@ public class XposedHook {
         String line = "[" + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
             .format(new Date()) + "] [pid " + Process.myPid() + "] " + msg;
 
-        // stdout (goes to logcat in an app_process; harmless in a plain app)
         System.out.println(line);
 
-        // file
         try {
             File f = new File(LOG_FILE);
             File parent = f.getParentFile();
@@ -490,8 +1160,4 @@ public class XposedHook {
             }
         } catch (Throwable ignored) {}
     }
-
-    // silence unused-import warnings
-    @SuppressWarnings("unused")
-    private static final Map<String, String> __unused = new HashMap<>();
 }

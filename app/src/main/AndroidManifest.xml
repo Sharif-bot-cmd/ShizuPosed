@@ -4,40 +4,76 @@
 
     <!-- Permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+        REQUIRED for BootReceiver to fire.
+        Without this, android.intent.action.BOOT_COMPLETED is never delivered.
+    -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- Shizuku Permission -->
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
 
     <!--
+        QUERY_ALL_PACKAGES
+        Required on some OEM ROMs (OPPO, older Xiaomi) that do not honor
+        the intent-based <queries> block for getInstalledApplications().
+        Without this or the <queries> block below, PackageManager returns
+        only a handful of packages on API 30+.
+
+        NOTE: Play Store restricts QUERY_ALL_PACKAGES to launchers,
+        antivirus, and file managers. For a distribution outside Play
+        (XDA / GitHub), this is fine.
+    -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <!--
         Android 11+ package visibility.
-        Allows the ShizuPosed app itself to see and query its own provider
-        (needed on some OEM ROMs), and lets anything that asks about the
-        provider authority resolve it without hitting the visibility wall.
+
+        Two purposes:
+          1. Let this app query its own ModuleStatusProvider without
+             hitting the visibility wall on some ROMs.
+          2. Make every launcher-visible app visible to
+             PackageManager.getInstalledApplications() so the
+             "Select Apps" dialog shows the full list.
     -->
     <queries>
         <provider android:authorities="com.shizuposed.manager.status" />
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
     </queries>
+
+    <!--
+        Custom signature-level permission.
+        Gates access to ModuleStatusProvider so only apps signed with the
+        same key can query module status. Added for API 37 hardening.
+    -->
+    <permission
+        android:name="com.shizuposed.manager.permission.READ_STATUS"
+        android:protectionLevel="signature" />
+
+    <uses-permission android:name="com.shizuposed.manager.permission.READ_STATUS" />
 
     <application
         android:name=".ShizuPosedManagerApp"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
-        android:icon="@drawable/ic_launcher"
+        android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
-        android:roundIcon="@drawable/ic_launcher_round"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.ShizuPosedManager"
-        android:requestLegacyExternalStorage="true"
-        android:usesCleartextTraffic="true"
         android:resizeableActivity="true"
-        android:screenOrientation="portrait"
-        tools:targetApi="31">
+        tools:targetApi="37">
 
         <!-- ✅ Shizuku Provider - ONLY Shizuku -->
         <provider
@@ -53,9 +89,11 @@
             ModuleStatusProvider
             Exposes read-only module enable/disable status to external
             modules so they can show "Module is Active / Inactive" in
-            their own config UIs.
-            The provider shares the app's process, so it sees the same
-            ModuleLoader singleton the rest of the manager uses.
+            their own config UIs. Also answers active-state and scope
+            queries used by LSPosedManager.
+
+            API 37: gated behind signature-level permission so arbitrary
+            apps cannot enumerate module state.
             ═══════════════════════════════════════════════════════
         -->
         <provider
@@ -63,7 +101,8 @@
             android:authorities="com.shizuposed.manager.status"
             android:enabled="true"
             android:exported="true"
-            android:multiprocess="false" />
+            android:multiprocess="false"
+            android:permission="com.shizuposed.manager.permission.READ_STATUS" />
 
         <activity
             android:name=".MainActivity"
@@ -72,6 +111,12 @@
             android:windowSoftInputMode="adjustResize"
             android:launchMode="singleTop"
             android:configChanges="orientation|screenSize|keyboardHidden">
+            <!--
+                API 37: android:screenOrientation="portrait" removed.
+                Deprecated since API 36 for large screens and ignored
+                on tablets/foldables. If phone-only portrait lock is
+                still required, call setRequestedOrientation() at runtime.
+            -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -84,6 +129,11 @@
             Keeping the service in the default process lets ProcessMonitor /
             ShizuPosedManagerApp share singletons, which is required for the
             dex-deploy flow to find the service instance.
+
+            API 37: foregroundServiceType="dataSync" is capped (~6h/24h on
+            many device classes). Verify at runtime and handle
+            ForegroundServiceStartNotAllowedException. Consider WorkManager
+            for long-running background work.
         -->
         <service
             android:name=".service.ShizuPosedService"

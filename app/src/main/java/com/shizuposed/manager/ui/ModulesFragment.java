@@ -35,11 +35,13 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import com.google.android.material.floatingactionbutton.FloatingActionButton;
+import com.google.android.material.snackbar.Snackbar;
 import com.shizuposed.manager.R;
 import com.shizuposed.manager.ShizukuHelper;
 import com.shizuposed.manager.adapter.AppSelectionAdapter;
 import com.shizuposed.manager.adapter.ModuleAdapter;
 import com.shizuposed.manager.core.ModuleLoader;
+import com.shizuposed.manager.core.ModuleScanner;
 import com.shizuposed.manager.model.ModuleInfo;
 import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.utils.Logger;
@@ -51,6 +53,8 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class ModulesFragment extends Fragment {
     private RecyclerView moduleRecyclerView;
@@ -82,6 +86,9 @@ public class ModulesFragment extends Fragment {
     private static final long TOGGLE_DEBOUNCE = 500;
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ExecutorService scannerExecutor = Executors.newSingleThreadExecutor();
+
+    private volatile boolean scanInProgress = false;
 
     private final ActivityResultLauncher<Intent> filePickerLauncher =
         registerForActivityResult(new ActivityResultContracts.StartActivityForResult(),
@@ -114,7 +121,9 @@ public class ModulesFragment extends Fragment {
         initViews(view);
         setupRecyclerView();
         setupListeners();
+
         loadModules();
+        startBackgroundScan();
 
         return view;
     }
@@ -159,6 +168,65 @@ public class ModulesFragment extends Fragment {
         if (confirmDialog != null && confirmDialog.isShowing()) confirmDialog.dismiss();
     }
 
+    // ═════════════════════════════════════════════════════════════════
+    // MODULE AUTO-DETECTION + PURGE
+    // ═════════════════════════════════════════════════════════════════
+
+    /**
+     * Scan installed packages for Xposed modules in the background.
+     * The scan also purges any module whose APK was removed externally
+     * (e.g. via Settings → Apps), so uninstalling a module that way
+     * cleans it out of the Modules tab on the next scan.
+     */
+    private void startBackgroundScan() {
+        if (scanInProgress) return;
+        scanInProgress = true;
+
+        final android.content.Context appCtx = requireContext().getApplicationContext();
+        scannerExecutor.execute(() -> {
+            try {
+                ModuleScanner.ScanResult result =
+                    ModuleScanner.scanInstalledModules(appCtx);
+
+                if (!isAdded()) return;
+                mainHandler.post(() -> {
+                    scanInProgress = false;
+                    loadModules();
+
+                    if (getView() == null) return;
+
+                    int newCount = result.newlyRegistered;
+                    int purged = result.purgedCount;
+
+                    if (purged > 0 && newCount > 0) {
+                        Snackbar.make(getView(),
+                            purged + " removed, " + newCount + " added",
+                            Snackbar.LENGTH_LONG).show();
+                    } else if (purged > 0) {
+                        Snackbar.make(getView(),
+                            purged + " module"
+                                + (purged != 1 ? "s" : "") + " removed",
+                            Snackbar.LENGTH_LONG).show();
+                    } else if (newCount > 0) {
+                        Snackbar.make(getView(),
+                            newCount + " new module"
+                                + (newCount != 1 ? "s" : "") + " detected",
+                            Snackbar.LENGTH_LONG).show();
+                    }
+                });
+            } catch (Throwable t) {
+                scanInProgress = false;
+                if (isAdded()) {
+                    mainHandler.post(() -> logger.w("Module scan failed: " + t.getMessage()));
+                }
+            }
+        });
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // LOAD / FILTER
+    // ═════════════════════════════════════════════════════════════════
+
     private void loadModules() {
         showLoading(true);
         try {
@@ -175,7 +243,6 @@ public class ModulesFragment extends Fragment {
             logger.i("Loaded " + modules.size() + " modules");
         } catch (Exception e) {
             logger.e("Error loading modules: " + e.getMessage());
-            Toast.makeText(requireContext(), "Failed to load modules", Toast.LENGTH_SHORT).show();
         }
         showLoading(false);
     }
@@ -196,8 +263,29 @@ public class ModulesFragment extends Fragment {
         moduleAdapter.updateData(filtered);
     }
 
+    /**
+     * Update the RecyclerView row for a module, matching by package name.
+     */
+    private void updateModuleRow(ModuleInfo updated) {
+        if (updated == null || updated.packageName == null) return;
+
+        for (int i = 0; i < modules.size(); i++) {
+            ModuleInfo existing = modules.get(i);
+            if (existing != null
+                    && updated.packageName.equals(existing.packageName)) {
+                modules.set(i, updated);
+                if (moduleAdapter != null) {
+                    moduleAdapter.notifyItemChanged(i);
+                }
+                return;
+            }
+        }
+
+        loadModules();
+    }
+
     // ═════════════════════════════════════════════════════════════════
-    // SERVICE SYNC + PROVIDER NOTIFY
+    // SERVICE SYNC
     // ═════════════════════════════════════════════════════════════════
 
     public void requestModuleRepush(String reason) {
@@ -215,12 +303,6 @@ public class ModulesFragment extends Fragment {
         }
     }
 
-    /**
-     * Tells the ModuleStatusProvider (and anything else listening) that
-     * module state has changed. External modules that query the provider
-     * will pick up the new state on their next query. Modules that watch
-     * the LSPosed-style broadcasts get an immediate nudge.
-     */
     private void notifyProviderChanged(String packageName, boolean enabled) {
         try {
             if (packageName != null) {
@@ -240,10 +322,6 @@ public class ModulesFragment extends Fragment {
         }
     }
 
-    /**
-     * Fire the LSPosed-style broadcast that some modules watch for.
-     * Delivered only to the module's own package.
-     */
     private void broadcastModuleStateChange(ModuleInfo module) {
         if (module == null || module.packageName == null) return;
         try {
@@ -260,9 +338,6 @@ public class ModulesFragment extends Fragment {
         }
     }
 
-    /**
-     * One-shot helper: both notify the provider and broadcast.
-     */
     private void announceModuleStateChange(ModuleInfo module) {
         if (module == null) return;
         notifyProviderChanged(module.packageName, module.enabled);
@@ -286,11 +361,7 @@ public class ModulesFragment extends Fragment {
             Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show();
             logger.i(msg + ": " + module.packageName);
 
-            int index = modules.indexOf(module);
-            if (index >= 0) {
-                modules.set(index, module);
-                moduleAdapter.notifyItemChanged(index);
-            }
+            updateModuleRow(module);
 
             requestModuleRepush("toggle " + module.packageName + " -> " + enable);
             announceModuleStateChange(module);
@@ -301,7 +372,7 @@ public class ModulesFragment extends Fragment {
     }
 
     // ═════════════════════════════════════════════════════════════════
-    // MODULE DETAIL — LSPosed-style bottom sheet
+    // MODULE DETAIL
     // ═════════════════════════════════════════════════════════════════
 
     private void showModuleDetail(ModuleInfo module) {
@@ -314,7 +385,8 @@ public class ModulesFragment extends Fragment {
         if (updated == null) return;
 
         for (int i = 0; i < modules.size(); i++) {
-            if (modules.get(i).packageName.equals(updated.packageName)) {
+            ModuleInfo existing = modules.get(i);
+            if (existing != null && updated.packageName.equals(existing.packageName)) {
                 modules.set(i, updated);
                 moduleAdapter.notifyItemChanged(i);
                 break;
@@ -326,9 +398,9 @@ public class ModulesFragment extends Fragment {
 
     public void onModuleRemoved(String packageName) {
         if (packageName == null) return;
-
         for (int i = 0; i < modules.size(); i++) {
-            if (modules.get(i).packageName.equals(packageName)) {
+            ModuleInfo existing = modules.get(i);
+            if (existing != null && packageName.equals(existing.packageName)) {
                 modules.remove(i);
                 moduleAdapter.notifyItemRemoved(i);
                 break;
@@ -341,8 +413,6 @@ public class ModulesFragment extends Fragment {
         }
         requestModuleRepush("removed " + packageName);
 
-        // Broadcast a disable so any open module UI updates, and refresh
-        // the provider so external queries get the new state.
         try {
             Intent i = new Intent("de.robv.android.xposed.action.MODULE_DISABLED");
             i.putExtra("module", packageName);
@@ -391,21 +461,21 @@ public class ModulesFragment extends Fragment {
     public void uninstallModule(ModuleInfo module) {
         confirmDialog = new AlertDialog.Builder(requireContext())
             .setTitle("Uninstall Module")
-            .setMessage("Are you sure you want to uninstall " + module.name + "?")
-            .setPositiveButton("Uninstall", (dialog, which) -> {
+            .setMessage("Remove " + (module.name != null ? module.name : module.packageName)
+                + " from ShizuPosed?\n\nThe module APK itself is not touched.")
+            .setPositiveButton("Remove", (dialog, which) -> {
                 try {
                     boolean removed = moduleLoader.uninstallModule(module.packageName);
                     if (removed) {
                         onModuleRemoved(module.packageName);
-                        Toast.makeText(requireContext(), "Module uninstalled", Toast.LENGTH_SHORT).show();
-                        logger.i("Uninstalled module: " + module.packageName);
+                        Toast.makeText(requireContext(), "Removed from ShizuPosed", Toast.LENGTH_SHORT).show();
+                        logger.i("Removed module: " + module.packageName);
                     } else {
-                        Toast.makeText(requireContext(), "Failed to uninstall module", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(requireContext(), "Failed to remove", Toast.LENGTH_SHORT).show();
                     }
                 } catch (Exception e) {
-                    Toast.makeText(requireContext(), "Failed to uninstall: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                    Toast.makeText(requireContext(), "Failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
                     logger.e("Uninstall error: " + e.getMessage());
-                    loadModules();
                 }
             })
             .setNegativeButton("Cancel", null)
@@ -432,38 +502,77 @@ public class ModulesFragment extends Fragment {
         Button btnClearAll = dialogView.findViewById(R.id.btnClearAll);
         Button btnSelectSystem = dialogView.findViewById(R.id.btnSelectSystem);
         Button btnApply = dialogView.findViewById(R.id.btnApply);
+        TextView tvSelectedCount = dialogView.findViewById(R.id.tvSelectedCount);
+        CheckBox cbHideSystem = dialogView.findViewById(R.id.cbHideSystem);
 
-        List<ApplicationInfo> apps = getInstalledApps();
+        List<ApplicationInfo> allApps = getInstalledApps();
+
+        List<ApplicationInfo> userApps = new ArrayList<>();
+        List<ApplicationInfo> systemApps = new ArrayList<>();
+        for (ApplicationInfo app : allApps) {
+            if ((app.flags & ApplicationInfo.FLAG_SYSTEM) != 0) systemApps.add(app);
+            else userApps.add(app);
+        }
+
+        final List<ApplicationInfo> source = new ArrayList<>(userApps);
 
         Set<String> currentSelection = new HashSet<>();
         if (module.hookedApps != null) currentSelection.addAll(module.hookedApps);
 
         AppSelectionAdapter adapter = new AppSelectionAdapter(requireContext());
-        adapter.setApps(apps);
+
+        if (tvSelectedCount != null) {
+            tvSelectedCount.setText(currentSelection.size() + " selected");
+            adapter.setOnSelectionChangedListener(count ->
+                tvSelectedCount.setText(count + " selected"));
+        }
+
         adapter.setSelectedApps(currentSelection);
 
         appRecyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
         appRecyclerView.setAdapter(adapter);
 
-        etSearchApps.addTextChangedListener(new TextWatcher() {
-            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
-            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
-                String query = s.toString().toLowerCase();
-                List<ApplicationInfo> filtered = new ArrayList<>();
-                for (ApplicationInfo app : apps) {
-                    String label = app.loadLabel(packageManager).toString().toLowerCase();
-                    if (label.contains(query) || app.packageName.toLowerCase().contains(query)) {
-                        filtered.add(app);
-                    }
+        final Runnable reapply = () -> {
+            String query = etSearchApps.getText().toString().toLowerCase().trim();
+            List<ApplicationInfo> filtered = new ArrayList<>();
+            for (ApplicationInfo app : source) {
+                if (query.isEmpty()) { filtered.add(app); continue; }
+                String label = app.loadLabel(packageManager).toString().toLowerCase();
+                if (label.contains(query) || app.packageName.toLowerCase().contains(query)) {
+                    filtered.add(app);
                 }
-                adapter.setApps(filtered);
             }
+            adapter.setApps(filtered);
+        };
+
+        if (cbHideSystem != null) {
+            cbHideSystem.setChecked(true);
+            cbHideSystem.setOnCheckedChangeListener((v, checked) -> {
+                source.clear();
+                source.addAll(checked ? userApps : allApps);
+                reapply.run();
+            });
+        } else {
+            source.clear();
+            source.addAll(allApps);
+        }
+
+        etSearchApps.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int i, int c, int a) {}
+            @Override public void onTextChanged(CharSequence s, int i, int b, int c) { reapply.run(); }
             @Override public void afterTextChanged(Editable s) {}
         });
 
+        reapply.run();
+
         btnSelectAll.setOnClickListener(v -> adapter.selectAll());
         btnClearAll.setOnClickListener(v -> adapter.clearAll());
-        btnSelectSystem.setOnClickListener(v -> adapter.selectSystemApps());
+        btnSelectSystem.setOnClickListener(v -> {
+            if (cbHideSystem != null && cbHideSystem.isChecked()) {
+                cbHideSystem.setChecked(false);
+            }
+            adapter.selectSystemApps();
+        });
 
         btnApply.setVisibility(View.GONE);
 
@@ -471,15 +580,11 @@ public class ModulesFragment extends Fragment {
             .setTitle("Select Apps for " + module.name)
             .setView(dialogView)
             .setPositiveButton("Apply", (d, w) -> {
-                Set<String> selected = new HashSet<>(adapter.getSelectedApps());
+                Set<String> selected = adapter.getSelectedApps();
                 module.hookedApps = selected;
                 moduleLoader.saveModule(module);
 
-                int index = modules.indexOf(module);
-                if (index >= 0) {
-                    modules.set(index, module);
-                    moduleAdapter.notifyItemChanged(index);
-                }
+                updateModuleRow(module);
 
                 int count = selected.size();
                 String msg = count + " app" + (count != 1 ? "s" : "") + " selected";
@@ -497,9 +602,60 @@ public class ModulesFragment extends Fragment {
         selectAppsDialog.show();
     }
 
+    /**
+     * Enumerate every hookable app.
+     */
     private List<ApplicationInfo> getInstalledApps() {
         try {
-            return packageManager.getInstalledApplications(PackageManager.GET_META_DATA);
+            try { moduleLoader.loadModules(); } catch (Throwable ignored) {}
+
+            List<ApplicationInfo> all = packageManager.getInstalledApplications(
+                PackageManager.GET_META_DATA | PackageManager.MATCH_DISABLED_COMPONENTS
+            );
+            if (all == null) return new ArrayList<>();
+
+            String self = requireContext().getPackageName();
+
+            Set<String> modulePackages = new HashSet<>();
+            try {
+                for (ModuleInfo m : moduleLoader.getCachedModules()) {
+                    if (m != null && m.packageName != null) {
+                        modulePackages.add(m.packageName);
+                    }
+                }
+            } catch (Throwable t) {
+                logger.w("Could not read module list: " + t.getMessage());
+            }
+
+            List<ApplicationInfo> filtered = new ArrayList<>(all.size());
+            int skippedSelf = 0;
+            int skippedModules = 0;
+            for (ApplicationInfo app : all) {
+                if (app == null || app.packageName == null) continue;
+
+                if (self.equals(app.packageName)) {
+                    skippedSelf++;
+                    continue;
+                }
+                if (modulePackages.contains(app.packageName)) {
+                    skippedModules++;
+                    continue;
+                }
+                filtered.add(app);
+            }
+
+            try {
+                filtered.sort((a, b) -> {
+                    String la = a.loadLabel(packageManager).toString();
+                    String lb = b.loadLabel(packageManager).toString();
+                    return la.compareToIgnoreCase(lb);
+                });
+            } catch (Throwable ignored) {}
+
+            logger.d("Listed " + filtered.size() + " hookable apps (skipped "
+                + skippedSelf + " self, " + skippedModules + " module packages)");
+
+            return filtered;
         } catch (Exception e) {
             logger.e("Failed to get installed apps: " + e.getMessage());
             return new ArrayList<>();
@@ -560,7 +716,7 @@ public class ModulesFragment extends Fragment {
             openFilePicker();
         });
 
-        builder.setTitle("Add Module")
+        builder.setTitle("Add Module (manual)")
             .setView(view)
             .setPositiveButton("Add", (dialog, which) -> addModuleFromDialog())
             .setNegativeButton("Cancel", null)
@@ -718,10 +874,7 @@ public class ModulesFragment extends Fragment {
     }
 
     private void addModuleFromDialog() {
-        if (etPackage == null || etModuleName == null) {
-            Toast.makeText(requireContext(), "Dialog not ready", Toast.LENGTH_SHORT).show();
-            return;
-        }
+        if (etPackage == null || etModuleName == null) return;
 
         String packageName = etPackage.getText().toString().trim();
         String moduleName = etModuleName.getText().toString().trim();
@@ -755,7 +908,7 @@ public class ModulesFragment extends Fragment {
                 if (cacheFile.exists()) cacheFile.delete();
             }
 
-            Toast.makeText(requireContext(), "Module added successfully", Toast.LENGTH_SHORT).show();
+            Toast.makeText(requireContext(), "Module added", Toast.LENGTH_SHORT).show();
             logger.i("Added module: " + module.packageName);
 
             if (addModuleDialog != null && addModuleDialog.isShowing()) {
@@ -784,6 +937,7 @@ public class ModulesFragment extends Fragment {
     public void onResume() {
         super.onResume();
         loadModules();
+        startBackgroundScan();
     }
 
     @Override
@@ -794,6 +948,7 @@ public class ModulesFragment extends Fragment {
         selectAppsDialog = null;
         confirmDialog = null;
         isFilePickerActive = false;
+        try { scannerExecutor.shutdownNow(); } catch (Throwable ignored) {}
     }
 
     @Override

@@ -41,10 +41,34 @@ public class ShizukuHelper {
     private final AtomicBoolean permissionRequestInFlight = new AtomicBoolean(false);
     private final AtomicBoolean listenersRegistered = new AtomicBoolean(false);
     private final AtomicBoolean inAutoStart = new AtomicBoolean(false);
-
-    // ✅ Show the "Please grant permission" toast at most once per session.
     private final AtomicBoolean grantToastShown = new AtomicBoolean(false);
 
+    // ─────────────────────────────────────────────────────────────
+    // app_process binary discovery
+    //
+    // Different ROMs and different Android versions ship app_process
+    // under one of three names. We probe each once and cache the one
+    // that actually executes from the shell uid.
+    //
+    //   • app_process64 — 64-bit builds (most modern devices)
+    //   • app_process   — universal symlink; usually present but on
+    //                     some hardened ROMs it's blocked while the
+    //                     64-bit binary is not, and vice versa
+    //   • app_process32 — 32-bit builds (older devices, some emulators)
+    //
+    // Cache the winner so the probe runs at most once per process.
+    // ─────────────────────────────────────────────────────────────
+    private static final String[] APP_PROCESS_CANDIDATES = {
+        "app_process64",
+        "app_process",
+        "app_process32",
+    };
+
+    private volatile String cachedAppProcessBinary = null;
+
+    // ─────────────────────────────────────────────────────────────
+    // Permission listeners
+    // ─────────────────────────────────────────────────────────────
     public interface PermissionListener {
         void onPermissionGranted();
         void onPermissionDenied();
@@ -80,6 +104,9 @@ public class ShizukuHelper {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────
+    // Shizuku binder listeners
+    // ─────────────────────────────────────────────────────────────
     private final Shizuku.OnBinderReceivedListener binderListener =
         new Shizuku.OnBinderReceivedListener() {
         @Override
@@ -99,7 +126,10 @@ public class ShizukuHelper {
             isAvailable = false;
             isAuthorized = false;
             permissionRequestInFlight.set(false);
-            grantToastShown.set(false);   // allow the toast again next session
+            grantToastShown.set(false);
+            // Don't cache the app_process result past binder death —
+            // a new Shizuku session might have a different environment.
+            cachedAppProcessBinary = null;
             logger.w("Shizuku binder dead");
         }
     };
@@ -114,7 +144,7 @@ public class ShizukuHelper {
 
             if (grantResult == PackageManager.PERMISSION_GRANTED) {
                 isAuthorized = true;
-                grantToastShown.set(true);   // no need to nudge anymore
+                grantToastShown.set(true);
                 logger.i("✅ Shizuku permission GRANTED!");
                 notifyPermissionGranted();
                 if (context instanceof ShizuPosedManagerApp) {
@@ -333,7 +363,6 @@ public class ShizukuHelper {
             Shizuku.requestPermission(SHIZUKU_CODE);
             logger.i("Shizuku permission requested");
 
-            // ✅ Toast only once per session
             if (grantToastShown.compareAndSet(false, true)) {
                 new Handler(Looper.getMainLooper()).post(() ->
                     Toast.makeText(context,
@@ -353,6 +382,102 @@ public class ShizukuHelper {
     public int getVersion() { return shizukuVersion; }
     public boolean isSui() { return isSui; }
 
+    // ═════════════════════════════════════════════════════════════
+    // app_process DISCOVERY
+    //
+    // Probes each candidate in order and caches the first one that
+    // executes from the shell uid. Returns null if none work.
+    //
+    // "Executes" is verified by running `<binary> 2>&1 | head -1` and
+    // checking the output for signs of permission denial. The actual
+    // exit code is unreliable because app_process exits with a usage
+    // message and a non-zero code when invoked with no arguments — we
+    // only care whether the kernel permitted the exec.
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Return the working app_process binary name, or null if none of
+     * the candidates can be executed by shell on this ROM.
+     *
+     * The result is cached for the current Shizuku session. Call
+     * invalidateAppProcessCache() after binder death if you want a
+     * fresh probe.
+     */
+    public String getAppProcessBinary() {
+        String cached = cachedAppProcessBinary;
+        if (cached != null) return cached;
+
+        if (!isAvailable || !isAuthorized) {
+            logger.d("Cannot probe app_process: Shizuku not ready");
+            return null;
+        }
+
+        for (String candidate : APP_PROCESS_CANDIDATES) {
+            if (probeAppProcess(candidate)) {
+                cachedAppProcessBinary = candidate;
+                logger.i("app_process binary selected: " + candidate);
+                return candidate;
+            }
+        }
+
+        logger.e("No usable app_process binary on this ROM");
+        return null;
+    }
+
+    /** Force a fresh probe on the next getAppProcessBinary() call. */
+    public void invalidateAppProcessCache() {
+        cachedAppProcessBinary = null;
+    }
+
+    /**
+     * Probe a single candidate. Returns true if the shell uid can
+     * execute it.
+     */
+    private boolean probeAppProcess(String name) {
+        try {
+            // `command -v` checks PATH; if that succeeds, the binary is
+            // at least present. Then try to execute it with a harmless
+            // argument set and check for permission denial.
+            String cmd =
+                "command -v " + name + " >/dev/null 2>&1 && " +
+                name + " 2>&1 | head -1";
+
+            ShellUtils.CommandResult r = executeCommand(cmd);
+            String out = r == null ? null : r.getStdoutString();
+            String err = r == null ? null : r.getStderrString();
+
+            // The command exits non-zero if `command -v` fails, in which
+            // case out is empty. If it runs, we look at the output text.
+            boolean found = (out != null && !out.isEmpty())
+                || (err != null && err.contains(name));
+
+            if (!found) {
+                logger.d("Probe " + name + ": not found or not executable");
+                return false;
+            }
+
+            String probe = (out == null ? "" : out) + " " + (err == null ? "" : err);
+            if (probe.contains("Permission denied")) {
+                logger.d("Probe " + name + ": permission denied");
+                return false;
+            }
+            if (probe.contains("not found")) {
+                logger.d("Probe " + name + ": not found");
+                return false;
+            }
+
+            logger.d("Probe " + name + ": OK");
+            return true;
+
+        } catch (Throwable t) {
+            logger.d("Probe " + name + " threw: " + t.getMessage());
+            return false;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // executeCommand() — runs as shell uid via AIDL
+    // ═════════════════════════════════════════════════════════════
     public ShellUtils.CommandResult executeCommand(String command) {
         ShellUtils.CommandResult result = new ShellUtils.CommandResult();
 
@@ -465,16 +590,28 @@ public class ShizukuHelper {
         }
     }
 
+    /**
+     * Launch XposedHook.dex for a target package. Chooses the working
+     * app_process binary automatically.
+     */
     public boolean launchXposedHook(String packageName, int pid, int uid, String dexPath) {
         if (!isAuthorized()) {
             logger.w("Cannot launch: Shizuku not authorized");
             return false;
         }
+
+        String binary = getAppProcessBinary();
+        if (binary == null) {
+            logger.e("Cannot launch: no usable app_process binary");
+            return false;
+        }
+
         try {
             String cmd = String.format(
-                "app_process -Xverify:none -Xallowinmemorycompilation " +
+                "%s -Xverify:none -Xallowinmemorycompilation " +
                 "-Xcompiler-option --target-api=%d " +
                 "-cp %s /system/bin XposedHook %s %d %d &",
+                binary,
                 Build.VERSION.SDK_INT, dexPath, packageName, pid, uid);
             return executeCommand(cmd).isSuccess();
         } catch (Exception e) {
@@ -498,6 +635,7 @@ public class ShizukuHelper {
         } catch (Exception ignored) {}
         listenersRegistered.set(false);
         permissionListeners.clear();
+        cachedAppProcessBinary = null;
     }
 
     public enum ShizukuStatus { ACTIVE, NOT_ACTIVE, NOT_INSTALLED }

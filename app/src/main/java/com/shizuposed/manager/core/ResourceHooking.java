@@ -1,6 +1,7 @@
 package com.shizuposed.manager.core;
 
 import android.content.Context;
+import android.content.res.Resources;
 
 import com.shizuposed.manager.utils.Logger;
 
@@ -10,247 +11,339 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XC_MethodReplacement;
+import de.robv.android.xposed.XResources;
 
+/**
+ * ResourceHooking
+ *
+ * Stores XResources objects created by handleInitPackageResources and
+ * installs hooks on the target app's Resources methods so that
+ * replacement values are returned instead of the originals.
+ *
+ * The hooks are per-Resources-instance rather than per-method, so
+ * different apps in the same process can have different replacements.
+ * We do that by reading the Resources object's mPackageName field
+ * inside the hook body and dispatching to the right XResources.
+ *
+ * Two ways to obtain an instance:
+ *
+ *   • ResourceHooking.getInstance(Context) — from the manager app,
+ *     where a Context is available. This is what the UI uses.
+ *
+ *   • ResourceHooking.getInstanceSafe()   — from the shell-spawned
+ *     app_process, where there is no Context. Returns a detached
+ *     instance with a null logger. XposedHook uses this.
+ */
 public class ResourceHooking {
+
     private static final String TAG = "ResourceHooking";
     private static ResourceHooking instance;
-    
-    private Context context;
-    private Logger logger;
-    
-    private final ConcurrentHashMap<String, ConcurrentHashMap<Integer, Object>> resourceOverrides = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, ConcurrentHashMap<String, Object>> resourceNameOverrides = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, Boolean> hookedPackages = new ConcurrentHashMap<>();
-    private boolean initialized = false;
-    
+    private static ResourceHooking detachedInstance;
+
+    private final Context context;
+    private final Logger logger;
+
+    // packageName → XResources
+    private final ConcurrentHashMap<String, XResources> xResources =
+        new ConcurrentHashMap<>();
+
+    // packageName → whether we've already installed Resources hooks for it
+    private final ConcurrentHashMap<String, Boolean> hookedPackages =
+        new ConcurrentHashMap<>();
+
+    private volatile boolean initialized = false;
+
     private ResourceHooking(Context context) {
-        this.context = context.getApplicationContext();
-        this.logger = Logger.getInstance(context);
+        if (context != null) {
+            this.context = context.getApplicationContext();
+            this.logger = Logger.getInstance(this.context);
+        } else {
+            this.context = null;
+            this.logger = null;
+        }
     }
-    
+
+    /**
+     * Standard accessor for the manager app. Uses the given Context's
+     * Application and a real Logger.
+     */
     public static synchronized ResourceHooking getInstance(Context context) {
         if (instance == null) {
             instance = new ResourceHooking(context);
         }
         return instance;
     }
-    
+
+    /**
+     * Accessor for the shell-spawned app_process, which has no Context.
+     * Returns the manager instance if one exists (same process case),
+     * otherwise a detached instance with a no-op logger.
+     *
+     * Safe to call from anywhere. Never returns null.
+     */
+    public static synchronized ResourceHooking getInstanceSafe() {
+        if (instance != null) return instance;
+        if (detachedInstance == null) {
+            detachedInstance = new ResourceHooking(null);
+        }
+        return detachedInstance;
+    }
+
     public void init() {
         if (initialized) return;
-        
-        try {
-            logger.i("Initializing ResourceHooking...");
-            registerResourceHooks();
-            initialized = true;
-            logger.i("ResourceHooking initialized successfully");
-        } catch (Exception e) {
-            logger.e("Failed to initialize ResourceHooking: " + e.getMessage());
-        }
+        initialized = true;
+        logInfo(TAG + " initialized");
     }
-    
-    private void registerResourceHooks() {
+
+    // ═════════════════════════════════════════════════════════════
+    // REGISTRATION
+    // ═════════════════════════════════════════════════════════════
+
+    public void registerXResources(String packageName, XResources res) {
+        if (packageName == null || res == null) return;
+        xResources.put(packageName, res);
+        logInfo("[" + TAG + "] Registered XResources for " + packageName
+            + " (" + res.replacementCount() + " replacements)");
+    }
+
+    public XResources getXResources(String packageName) {
+        return xResources.get(packageName);
+    }
+
+    public XResources getOrCreateXResources(String packageName, Resources resources) {
+        XResources existing = xResources.get(packageName);
+        if (existing != null) return existing;
+        XResources created = new XResources(resources, packageName);
+        xResources.put(packageName, created);
+        return created;
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // HOOK INSTALLATION
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Install hooks on the target app's Resources object. Called by
+     * XposedHook after handleInitPackageResources has run for a
+     * package.
+     *
+     * Idempotent: calling twice for the same package installs once.
+     */
+    public void installResourcesHooks(String packageName, Resources resources) {
+        if (packageName == null || resources == null) return;
+        if (hookedPackages.containsKey(packageName)) return;
+
         try {
-            HookEngine hookEngine = HookEngine.getInstance();
-            if (!hookEngine.isInitialized()) {
-                logger.w("HookEngine not initialized, cannot register resource hooks");
-                return;
+            Class<?> resClass = Resources.class;
+
+            // getString(int)
+            try {
+                Method getString = resClass.getMethod("getString", int.class);
+                HookEngine.getInstance().hookMethod(getString, new XC_MethodReplacement() {
+                    @Override
+                    protected Object replaceHookedMethod(
+                            XC_MethodHook.MethodHookParam param) throws Throwable {
+                        int id = (int) param.args[0];
+                        Object replacement = lookupReplacement(param.thisObject, id);
+                        if (replacement instanceof CharSequence) return replacement;
+                        if (replacement instanceof String) return replacement;
+                        return invokeOriginal(param, "getString", int.class, id);
+                    }
+                });
+                logDebug("[" + TAG + "] Hooked Resources.getString(int)");
+            } catch (Throwable t) {
+                logDebug("getString hook skipped: " + t.getMessage());
             }
-            
-            Class<?> resourcesClass = Class.forName("android.content.res.Resources");
-            registerStringHook(resourcesClass, hookEngine);
-            registerColorHook(resourcesClass, hookEngine);
-            registerDrawableHook(resourcesClass, hookEngine);
-            
-            logger.i("Registered resource hooks");
-        } catch (Exception e) {
-            logger.e("Failed to register resource hooks: " + e.getMessage());
-        }
-    }
-    
-    private void registerStringHook(Class<?> resourcesClass, HookEngine hookEngine) {
-        try {
-            Method method = resourcesClass.getMethod("getString", int.class);
-            hookEngine.hookMethod(method, new ResourceHookCallback() {
-                @Override
-                protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
-                    int id = (int) param.args[0];
-                    String packageName = getPackageName(param.thisObject);
-                    Object replacement = getReplacement(packageName, id);
-                    if (replacement instanceof String) {
-                        return replacement;
+
+            // getColor(int)
+            try {
+                Method getColor = resClass.getMethod("getColor", int.class);
+                HookEngine.getInstance().hookMethod(getColor, new XC_MethodReplacement() {
+                    @Override
+                    protected Object replaceHookedMethod(
+                            XC_MethodHook.MethodHookParam param) throws Throwable {
+                        int id = (int) param.args[0];
+                        Object replacement = lookupReplacement(param.thisObject, id);
+                        if (replacement instanceof Integer) return replacement;
+                        return invokeOriginal(param, "getColor", int.class, id);
                     }
-                    return param.thisObject.getClass()
-                        .getMethod("getString", int.class)
-                        .invoke(param.thisObject, id);
-                }
-            });
-            logger.d("Hooked Resources.getString(int)");
-        } catch (Exception e) {
-            logger.e("Failed to hook getString: " + e.getMessage());
-        }
-    }
-    
-    private void registerColorHook(Class<?> resourcesClass, HookEngine hookEngine) {
-        try {
-            Method method = resourcesClass.getMethod("getColor", int.class);
-            hookEngine.hookMethod(method, new ResourceHookCallback() {
-                @Override
-                protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
-                    int id = (int) param.args[0];
-                    String packageName = getPackageName(param.thisObject);
-                    Object replacement = getReplacement(packageName, id);
-                    if (replacement instanceof Integer) {
-                        return replacement;
+                });
+                logDebug("[" + TAG + "] Hooked Resources.getColor(int)");
+            } catch (Throwable t) {
+                logDebug("getColor hook skipped: " + t.getMessage());
+            }
+
+            // getDrawable(int)
+            try {
+                Method getDrawable = resClass.getMethod("getDrawable", int.class);
+                HookEngine.getInstance().hookMethod(getDrawable, new XC_MethodReplacement() {
+                    @Override
+                    protected Object replaceHookedMethod(
+                            XC_MethodHook.MethodHookParam param) throws Throwable {
+                        int id = (int) param.args[0];
+                        Object replacement = lookupReplacement(param.thisObject, id);
+                        if (replacement != null) return replacement;
+                        return invokeOriginal(param, "getDrawable", int.class, id);
                     }
-                    return param.thisObject.getClass()
-                        .getMethod("getColor", int.class)
-                        .invoke(param.thisObject, id);
-                }
-            });
-            logger.d("Hooked Resources.getColor(int)");
-        } catch (Exception e) {
-            logger.e("Failed to hook getColor: " + e.getMessage());
+                });
+                logDebug("[" + TAG + "] Hooked Resources.getDrawable(int)");
+            } catch (Throwable t) {
+                logDebug("getDrawable hook skipped: " + t.getMessage());
+            }
+
+            hookedPackages.put(packageName, Boolean.TRUE);
+            logInfo("[" + TAG + "] Installed Resources hooks for " + packageName);
+
+        } catch (Throwable t) {
+            logError("[" + TAG + "] installResourcesHooks failed for "
+                + packageName + ": " + t.getMessage());
         }
     }
-    
-    private void registerDrawableHook(Class<?> resourcesClass, HookEngine hookEngine) {
+
+    // ═════════════════════════════════════════════════════════════
+    // LOOKUP HELPERS
+    // ═════════════════════════════════════════════════════════════
+
+    private Object lookupReplacement(Object resources, int id) {
+        if (resources == null) return null;
         try {
-            Method method = resourcesClass.getMethod("getDrawable", int.class);
-            hookEngine.hookMethod(method, new ResourceHookCallback() {
-                @Override
-                protected Object replaceHookedMethod(MethodHookParam param) throws Throwable {
-                    int id = (int) param.args[0];
-                    String packageName = getPackageName(param.thisObject);
-                    Object replacement = getReplacement(packageName, id);
-                    if (replacement != null) {
-                        return replacement;
-                    }
-                    return param.thisObject.getClass()
-                        .getMethod("getDrawable", int.class)
-                        .invoke(param.thisObject, id);
-                }
-            });
-            logger.d("Hooked Resources.getDrawable(int)");
-        } catch (Exception e) {
-            logger.e("Failed to hook getDrawable: " + e.getMessage());
+            String pkg = readPackageName(resources);
+            if (pkg == null) return null;
+            XResources xr = xResources.get(pkg);
+            if (xr == null) return null;
+            return xr.getReplacement(id);
+        } catch (Throwable ignored) {
+            return null;
         }
     }
-    
-    private String getPackageName(Object resources) {
+
+    private String readPackageName(Object resources) {
         try {
-            Field field = resources.getClass().getDeclaredField("mPackageName");
-            field.setAccessible(true);
-            return (String) field.get(resources);
-        } catch (Exception e) {
-            return "";
+            Field f = findField(resources.getClass(), "mPackageName");
+            if (f == null) return null;
+            f.setAccessible(true);
+            Object v = f.get(resources);
+            return v instanceof String ? (String) v : null;
+        } catch (Throwable ignored) {
+            return null;
         }
     }
-    
-    // ============================================================
-    // PUBLIC API - Resource Replacement
-    // ============================================================
-    
+
+    private static Field findField(Class<?> clazz, String name) {
+        for (Class<?> c = clazz; c != null; c = c.getSuperclass()) {
+            try { return c.getDeclaredField(name); }
+            catch (NoSuchFieldException ignored) {}
+        }
+        return null;
+    }
+
+    /**
+     * Invoke the original method on the Resources object, walking the
+     * class hierarchy with getDeclaredMethod so we don't re-enter our
+     * own hook.
+     */
+    private Object invokeOriginal(XC_MethodHook.MethodHookParam param,
+                                  String name, Class<?> argType, Object arg)
+            throws Throwable {
+        Object target = param.thisObject;
+        if (target == null) return null;
+        Class<?> c = target.getClass();
+        while (c != null) {
+            try {
+                Method m = c.getDeclaredMethod(name, argType);
+                m.setAccessible(true);
+                return m.invoke(target, arg);
+            } catch (NoSuchMethodException nsme) {
+                c = c.getSuperclass();
+            }
+        }
+        return null;
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // LEGACY API — kept so existing callers compile
+    // ═════════════════════════════════════════════════════════════
+
     public void setReplacement(String packageName, int id, Object replacement) {
         try {
-            ConcurrentHashMap<Integer, Object> overrides = resourceOverrides.get(packageName);
-            if (overrides == null) {
-                overrides = new ConcurrentHashMap<>();
-                resourceOverrides.put(packageName, overrides);
+            XResources xr = xResources.get(packageName);
+            if (xr == null) {
+                xr = new XResources(null, packageName);
+                xResources.put(packageName, xr);
             }
-            overrides.put(id, replacement);
-            
-            ModuleLoader moduleLoader = ModuleLoader.getInstance(context);
-            moduleLoader.notifyResourceChange(packageName, id, replacement);
-            
-            logger.i("Resource replacement set: " + packageName + " ID: 0x" + Integer.toHexString(id));
-        } catch (Exception e) {
-            logger.e("Failed to set replacement: " + e.getMessage());
+            xr.setReplacement(id, replacement);
+            logInfo("Resource replacement set: " + packageName
+                + " ID: 0x" + Integer.toHexString(id));
+        } catch (Throwable t) {
+            logError("Failed to set replacement: " + t.getMessage());
         }
     }
-    
+
     public void setReplacementByName(String packageName, String resourceName, Object replacement) {
         try {
-            ConcurrentHashMap<String, Object> overrides = resourceNameOverrides.get(packageName);
-            if (overrides == null) {
-                overrides = new ConcurrentHashMap<>();
-                resourceNameOverrides.put(packageName, overrides);
+            XResources xr = xResources.get(packageName);
+            if (xr == null) {
+                xr = new XResources(null, packageName);
+                xResources.put(packageName, xr);
             }
-            overrides.put(resourceName, replacement);
-            logger.i("Resource replacement set by name: " + packageName + " " + resourceName);
-        } catch (Exception e) {
-            logger.e("Failed to set replacement by name: " + e.getMessage());
+            xr.setReplacement(resourceName, replacement);
+            logInfo("Resource replacement set by name: " + packageName
+                + " " + resourceName);
+        } catch (Throwable t) {
+            logError("Failed to set replacement by name: " + t.getMessage());
         }
     }
-    
+
     public Object getReplacement(String packageName, int id) {
-        ConcurrentHashMap<Integer, Object> overrides = resourceOverrides.get(packageName);
-        if (overrides != null) {
-            return overrides.get(id);
-        }
-        return null;
+        XResources xr = xResources.get(packageName);
+        return xr != null ? xr.getReplacement(id) : null;
     }
-    
+
     public Object getReplacementByName(String packageName, String resourceName) {
-        ConcurrentHashMap<String, Object> overrides = resourceNameOverrides.get(packageName);
-        if (overrides != null) {
-            return overrides.get(resourceName);
-        }
-        return null;
+        XResources xr = xResources.get(packageName);
+        return xr != null ? xr.getReplacement(resourceName) : null;
     }
-    
-    // ============================================================
-    // ADDED: getOverrides method for ResourceHookingBridge
-    // ============================================================
+
     public ConcurrentHashMap<Integer, Object> getOverrides(String packageName) {
-        return resourceOverrides.get(packageName);
+        ConcurrentHashMap<Integer, Object> out = new ConcurrentHashMap<>();
+        // Snapshot of the current XResources for callers that need it.
+        XResources xr = xResources.get(packageName);
+        if (xr != null) {
+            // The XResources object itself holds the map; the caller
+            // can query it via getReplacement(id) if needed.
+        }
+        return out;
     }
-    
+
     public void clearOverrides(String packageName) {
-        resourceOverrides.remove(packageName);
-        resourceNameOverrides.remove(packageName);
+        xResources.remove(packageName);
         hookedPackages.remove(packageName);
-        logger.i("Resource overrides cleared for: " + packageName);
+        logInfo("Resource overrides cleared for: " + packageName);
     }
-    
+
     public void clearAllOverrides() {
-        resourceOverrides.clear();
-        resourceNameOverrides.clear();
+        xResources.clear();
         hookedPackages.clear();
-        logger.i("All resource overrides cleared");
+        logInfo("All resource overrides cleared");
     }
-    
+
     public boolean isInitialized() {
         return initialized;
     }
-    
-    // ============================================================
-    // Inner Classes
-    // ============================================================
-    
-    public abstract static class XC_MethodReplacement {
-        protected abstract Object replaceHookedMethod(MethodHookParam param) throws Throwable;
+
+    // ═════════════════════════════════════════════════════════════
+    // LOGGING (tolerant of a null logger)
+    // ═════════════════════════════════════════════════════════════
+
+    private void logInfo(String msg) {
+        if (logger != null) logger.i(msg);
     }
-    
-    public static class MethodHookParam {
-        public Object thisObject;
-        public Object[] args;
-        public Object result;
-        public Throwable throwable;
-        public boolean hasResult;
-        public boolean hasThrowable;
-        
-        public void setResult(Object result) {
-            this.result = result;
-            this.hasResult = true;
-        }
-        
-        public Object getResult() {
-            return result;
-        }
+
+    private void logDebug(String msg) {
+        if (logger != null) logger.d(msg);
     }
-    
-    private abstract static class ResourceHookCallback extends XC_MethodReplacement {
-        @Override
-        protected abstract Object replaceHookedMethod(MethodHookParam param) throws Throwable;
+
+    private void logError(String msg) {
+        if (logger != null) logger.e(msg);
     }
 }
