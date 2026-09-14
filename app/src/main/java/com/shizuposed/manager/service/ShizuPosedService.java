@@ -4,6 +4,7 @@ import android.app.Notification;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.ApplicationInfo;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -26,34 +27,49 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+/**
+ * Foreground service that owns the ShizuPosed lifecycle.
+ *
+ * Responsibilities:
+ *   - Stay foreground so Android doesn't kill us mid-hook.
+ *   - Stage XposedHook.dex locally, then deploy it to the shell-writable
+ *     directory via Shizuku.
+ *   - Push module descriptors to the same directory.
+ *   - Launch target apps under app_process so the hook framework runs
+ *     in-process.
+ *
+ * Threading:
+ *   All non-foreground work happens on a single background HandlerThread.
+ *   The main thread only ever calls startForeground() and dispatches
+ *   Intents to the worker. This is what keeps us under the 5-second
+ *   foreground timer.
+ *
+ * Shizuku state:
+ *   ShizukuHelper owns the binder listeners. This service only reads
+ *   isAvailable() / isAuthorized() and reacts to onShizukuAuthorized()
+ *   calls from the Application.
+ */
 public class ShizuPosedService extends Service {
     private static final String CHANNEL_ID = "shizuposed_service";
     private static final String CHANNEL_NAME = "ShizuPosed Service";
     private static final int NOTIFICATION_ID = 1001;
 
-    // ═════════════════════════════════════════════════════════════
-    // Public actions (used by ModulesFragment, ShizuPosedManagerApp,
-    // and anyone else who wants to talk to the service via Intent).
-    // ═════════════════════════════════════════════════════════════
     public static final String ACTION_REPUSH_MODULES =
         "com.shizuposed.manager.ACTION_REPUSH_MODULES";
     public static final String ACTION_LAUNCH_APP =
         "com.shizuposed.manager.ACTION_LAUNCH_APP";
     public static final String EXTRA_LAUNCH_PACKAGE = "package";
 
-    // Shell's writable paths — everything that the shell-spawned
-    // app_process needs to read lives under here.
-    private static final String SHELL_FILES_DIR = "/data/user/0/com.android.shell/files";
-    private static final String SHELL_DEX_PATH  = SHELL_FILES_DIR + "/XposedHook.dex";
-    private static final String SHELL_CACHE_DIR = SHELL_FILES_DIR + "/.syscall_cache";
+    private static final String SHELL_FILES_DIR   = "/data/user/0/com.android.shell/files";
+    private static final String SHELL_DEX_PATH    = SHELL_FILES_DIR + "/XposedHook.dex";
+    private static final String SHELL_CACHE_DIR   = SHELL_FILES_DIR + "/.syscall_cache";
     private static final String SHELL_MODULES_DIR = SHELL_CACHE_DIR + "/modules";
+    private static final String SHELL_HOOKED_DIR  = SHELL_CACHE_DIR + "/hooked";
 
-    // Local staging (external app storage so shell can read what we write)
     private String localStagingDexPath;
     private String localStagingModulesDir;
-
-    // Final path used by app_process (lives in shell's dir)
     private String xposedHookDexPath;
 
     private static volatile boolean isServiceRunning = false;
@@ -65,81 +81,163 @@ public class ShizuPosedService extends Service {
     private ModuleLoader moduleLoader;
     private ShizukuHelper shizukuHelper;
     private final Gson gson = new Gson();
-    private boolean isRunning = false;
-    private boolean xposedHookStarted = false;
-    private boolean dexDeployed = false;
+
+    private final AtomicBoolean isRunning = new AtomicBoolean(false);
+    private final AtomicBoolean xposedHookStarted = new AtomicBoolean(false);
+    private final AtomicBoolean dexDeployed = new AtomicBoolean(false);
 
     // ═════════════════════════════════════════════════════════════
-    // Lifecycle
+    // LIFECYCLE
     // ═════════════════════════════════════════════════════════════
 
     @Override
     public void onCreate() {
         super.onCreate();
-
         isServiceRunning = true;
+
+        // 1. Notification channel before startForeground on O+.
+        createNotificationChannel();
+
+        // 2. Foreground IMMEDIATELY. Nothing slow before this.
+        startForeground(NOTIFICATION_ID, buildNotification("Service starting"));
+
+        // 3. Slow init off the main thread.
         logger = Logger.getInstance(this);
         logger.i("🚀 ShizuPosedService creating...");
 
-        File externalDir = getExternalFilesDir(null);
-        if (externalDir == null) {
-            logger.w("⚠️ External app dir not available, falling back to internal");
-            externalDir = getFilesDir();
-        }
-        if (!externalDir.exists()) externalDir.mkdirs();
-
-        localStagingDexPath = new File(externalDir, "XposedHook.dex").getAbsolutePath();
-        localStagingModulesDir = new File(externalDir, "modules").getAbsolutePath();
-        new File(localStagingModulesDir).mkdirs();
-
-        xposedHookDexPath = SHELL_DEX_PATH;
-
-        logger.i("Local staging dex:  " + localStagingDexPath);
-        logger.i("Local staging mods: " + localStagingModulesDir);
-        logger.i("Target shell dex:   " + xposedHookDexPath);
-
-        createNotificationChannel();
-
-        workerThread = new HandlerThread("ShizuPosedWorker", Process.THREAD_PRIORITY_BACKGROUND);
+        workerThread = new HandlerThread("ShizuPosedWorker",
+                Process.THREAD_PRIORITY_BACKGROUND);
         workerThread.start();
         workerHandler = new Handler(workerThread.getLooper());
 
-        initComponents();
-        startForegroundService();
-        startService();
+        workerHandler.post(() -> {
+            try {
+                File externalDir = getExternalFilesDir(null);
+                if (externalDir == null) {
+                    logger.w("⚠️ External app dir unavailable, falling back to internal");
+                    externalDir = getFilesDir();
+                }
+                if (!externalDir.exists()) externalDir.mkdirs();
 
-        logger.i("✅ ShizuPosedService created");
+                localStagingDexPath =
+                    new File(externalDir, "XposedHook.dex").getAbsolutePath();
+                localStagingModulesDir =
+                    new File(externalDir, "modules").getAbsolutePath();
+                new File(localStagingModulesDir).mkdirs();
+
+                xposedHookDexPath = SHELL_DEX_PATH;
+
+                logger.i("Local staging dex:  " + localStagingDexPath);
+                logger.i("Local staging mods: " + localStagingModulesDir);
+                logger.i("Target shell dex:   " + xposedHookDexPath);
+
+                initComponents();
+                startServiceInternal();
+
+                logger.i("✅ ShizuPosedService created");
+            } catch (Throwable t) {
+                logger.e("❌ onCreate worker failed: " + t.getMessage());
+            }
+        });
     }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        isServiceRunning = true;
+
+        // Re-assert foreground on every entry. This is safe because
+        // we already called startForeground in onCreate — this is a
+        // cheap re-post, not a new 5-second timer.
+        startForeground(NOTIFICATION_ID, buildNotification("Service running"));
+
+        if (workerHandler == null) {
+            // Very early re-entry; onCreate's worker will handle it.
+            return START_STICKY;
+        }
+
+        if (intent != null) {
+            String action = intent.getAction();
+
+            if (ShizuPosedManagerApp.ACTION_SHIZUKU_AUTHORIZED.equals(action)) {
+                logger.i("📨 ACTION_SHIZUKU_AUTHORIZED received");
+                onShizukuAuthorized();
+
+            } else if (ACTION_LAUNCH_APP.equals(action)) {
+                String pkg = intent.getStringExtra(EXTRA_LAUNCH_PACKAGE);
+                if (pkg != null) {
+                    final String target = pkg;
+                    logger.i("📨 ACTION_LAUNCH_APP received for " + target);
+                    workerHandler.post(() -> launchAppUnderShizuPosed(target));
+                }
+
+            } else if (ACTION_REPUSH_MODULES.equals(action)) {
+                logger.i("📨 ACTION_REPUSH_MODULES received");
+                workerHandler.post(() -> {
+                    if (ensureDexReady()) {
+                        pushModulesToShellDir(moduleLoader.loadModules());
+                    }
+                });
+            }
+        }
+
+        return START_STICKY;
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+
+    @Override
+    public void onDestroy() {
+        logger.i("ShizuPosedService destroying...");
+        isRunning.set(false);
+        isServiceRunning = false;
+        if (processMonitor != null) processMonitor.stopMonitoring();
+        if (workerThread != null) workerThread.quitSafely();
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+        } catch (Throwable ignored) {}
+        super.onDestroy();
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // NOTIFICATION
+    // ═════════════════════════════════════════════════════════════
 
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             android.app.NotificationChannel channel = new android.app.NotificationChannel(
                 CHANNEL_ID, CHANNEL_NAME,
-                android.app.NotificationManager.IMPORTANCE_LOW
-            );
+                android.app.NotificationManager.IMPORTANCE_LOW);
             channel.setDescription("ShizuPosed Manager service");
             channel.setShowBadge(false);
-
             android.app.NotificationManager manager =
                 getSystemService(android.app.NotificationManager.class);
             if (manager != null) manager.createNotificationChannel(channel);
         }
     }
 
-    private void startForegroundService() {
-        Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
+    private Notification buildNotification(String text) {
+        return new NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("ShizuPosed Manager")
-            .setContentText("Service is running")
+            .setContentText(text)
             .setSmallIcon(R.drawable.ic_launcher)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
             .setAutoCancel(false)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build();
-
-        startForeground(NOTIFICATION_ID, notification);
-        logger.i("Started foreground service");
     }
+
+    private void updateNotification(String status) {
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        if (manager != null) manager.notify(NOTIFICATION_ID, buildNotification(status));
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // COMPONENT INIT
+    // ═════════════════════════════════════════════════════════════
 
     private void initComponents() {
         shizukuHelper = ShizukuHelper.getInstance(this);
@@ -156,7 +254,6 @@ public class ShizuPosedService extends Service {
     private boolean stageDexLocally() {
         try {
             File staged = new File(localStagingDexPath);
-
             if (staged.exists() && staged.length() > 0) {
                 logger.i("✅ XposedHook.dex already staged locally");
                 staged.setReadable(true, false);
@@ -178,7 +275,7 @@ public class ShizuPosedService extends Service {
                     total += length;
                 }
                 fos.flush();
-                logger.i("✅ XposedHook.dex staged locally! Size: " + total + " bytes");
+                logger.i("✅ XposedHook.dex staged! Size: " + total + " bytes");
                 staged.setReadable(true, false);
                 return true;
             }
@@ -223,12 +320,15 @@ public class ShizuPosedService extends Service {
                 return false;
             }
 
-            // Ensure module directory exists on shell side
+            shizukuHelper.executeCommand("mkdir -p " + SHELL_CACHE_DIR);
             shizukuHelper.executeCommand("mkdir -p " + SHELL_MODULES_DIR);
-            shizukuHelper.executeCommand("chmod 755 " + SHELL_CACHE_DIR + " " + SHELL_MODULES_DIR);
+            shizukuHelper.executeCommand("mkdir -p " + SHELL_HOOKED_DIR);
+            shizukuHelper.executeCommand("chmod 755 " + SHELL_CACHE_DIR
+                + " " + SHELL_MODULES_DIR
+                + " " + SHELL_HOOKED_DIR);
 
             logger.i("✅ XposedHook.dex deployed to: " + SHELL_DEX_PATH);
-            dexDeployed = true;
+            dexDeployed.set(true);
             return true;
 
         } catch (Exception e) {
@@ -238,7 +338,7 @@ public class ShizuPosedService extends Service {
     }
 
     public boolean ensureDexReady() {
-        if (dexDeployed) return true;
+        if (dexDeployed.get()) return true;
         if (!shizukuHelper.isAuthorized()) {
             logger.w("⚠️ ensureDexReady called but Shizuku not authorized yet");
             return false;
@@ -250,10 +350,6 @@ public class ShizuPosedService extends Service {
     // MODULE PUSH
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Copy each enabled module's descriptor JSON and cached dex file into
-     * shell's module dir, so the shell-uid XposedHook can find them.
-     */
     private boolean pushModulesToShellDir(List<ModuleInfo> modules) {
         if (!shizukuHelper.isAuthorized()) return false;
 
@@ -265,7 +361,6 @@ public class ShizuPosedService extends Service {
             for (ModuleInfo module : modules) {
                 if (module == null || !module.enabled) continue;
 
-                // 1. Write JSON locally
                 String json = gson.toJson(module);
                 File localJson = new File(localStagingModulesDir, module.packageName + ".json");
                 try (FileOutputStream fos = new FileOutputStream(localJson)) {
@@ -274,7 +369,6 @@ public class ShizuPosedService extends Service {
                 }
                 localJson.setReadable(true, false);
 
-                // 2. Copy JSON into shell dir
                 String dstJson = SHELL_MODULES_DIR + "/" + module.packageName + ".json";
                 String copyJson = "sh -c 'cat \"" + localJson.getAbsolutePath()
                     + "\" > \"" + dstJson + "\"'";
@@ -285,7 +379,6 @@ public class ShizuPosedService extends Service {
                     continue;
                 }
 
-                // 3. Copy cached dex if present
                 if (module.cachedDexPath != null) {
                     File localDex = new File(module.cachedDexPath);
                     if (localDex.exists()) {
@@ -296,8 +389,6 @@ public class ShizuPosedService extends Service {
                         if (r2.isSuccess()) {
                             shizukuHelper.executeCommand("chmod 644 " + dstDex);
 
-                            // Rewrite cachedDexPath in the pushed JSON so XposedHook
-                            // loads the dex from the shell-side path.
                             String patchedJson = json.replace(
                                 localDex.getAbsolutePath(), dstDex);
                             File patchedLocal =
@@ -330,10 +421,8 @@ public class ShizuPosedService extends Service {
     // SERVICE STARTUP
     // ═════════════════════════════════════════════════════════════
 
-    private void startService() {
-        if (isRunning) return;
-        isRunning = true;
-        isServiceRunning = true;
+    private void startServiceInternal() {
+        if (!isRunning.compareAndSet(false, true)) return;
 
         workerHandler.post(() -> {
             try {
@@ -357,43 +446,47 @@ public class ShizuPosedService extends Service {
                 updateNotification("Service running");
             } catch (Exception e) {
                 logger.e("❌ Failed to start service: " + e.getMessage());
-                isRunning = false;
-                isServiceRunning = false;
+                isRunning.set(false);
                 updateNotification("Service error: " + e.getMessage());
             }
         });
     }
 
-    /**
-     * Prepares the payload (dex + modules) for later launch. Does NOT spawn
-     * a monitor process — hooking happens inside the target app process,
-     * launched via launchAppUnderShizuPosed().
-     */
-    private void startXposedHook() {
-        if (xposedHookStarted) return;
+    private void prepareXposedHook() {
+        if (!xposedHookStarted.compareAndSet(false, true)) return;
 
         if (!shizukuHelper.isAuthorized()) {
             logger.w("⚠️ Shizuku not authorized, cannot prepare XposedHook");
+            xposedHookStarted.set(false);
             return;
         }
-        if (!dexDeployed && !ensureDexReady()) {
+        if (!ensureDexReady()) {
             logger.e("❌ Cannot prepare XposedHook without deployed dex");
+            xposedHookStarted.set(false);
             return;
         }
+        // Push once. launchAppUnderShizuPosed will push again if the
+        // module set has changed since the last push, but it will not
+        // double-push on every launch.
         if (!pushModulesToShellDir(moduleLoader.loadModules())) {
             logger.w("⚠️ No modules pushed to shell dir (nothing will hook)");
         }
 
-        xposedHookStarted = true;
         logger.i("✅ XposedHook ready (launcher will run on demand)");
         updateNotification("Ready");
     }
 
+    /**
+     * Called by the Application when Shizuku authorization is granted.
+     * Safe to call multiple times; ensures dex + module push happen
+     * exactly once per authorization lifecycle.
+     */
     public void onShizukuAuthorized() {
         logger.i("📢 onShizukuAuthorized() — deploying now");
+        if (workerHandler == null) return;
         workerHandler.post(() -> {
             if (ensureDexReady()) {
-                startXposedHook();
+                prepareXposedHook();
             }
         });
     }
@@ -402,13 +495,6 @@ public class ShizuPosedService extends Service {
     // LAUNCH UNDER SHIZUPOSED
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Launch a target app inside a shell-spawned app_process so that
-     * XposedHook runs in the SAME pid as the target.
-     *
-     * @return true if the process was spawned. Does NOT guarantee hooking;
-     *         verify via the status file under SHELL_CACHE_DIR.
-     */
     public boolean launchAppUnderShizuPosed(String packageName) {
         if (!shizukuHelper.isAuthorized()) {
             logger.w("❌ Shizuku not authorized, cannot launch " + packageName);
@@ -418,33 +504,56 @@ public class ShizuPosedService extends Service {
             logger.e("❌ Cannot launch " + packageName + ": dex not deployed");
             return false;
         }
-        if (!pushModulesToShellDir(moduleLoader.loadModules())) {
-            logger.w("⚠️ No applicable modules for " + packageName);
+
+        // Push once per launch. If the module set is unchanged since the
+        // last push, pushModulesToShellDir will still copy files (cheap,
+        // a few hundred bytes each) and return true. That's simpler than
+        // tracking a "dirty" flag, and the copy is sub-millisecond per
+        // module.
+        pushModulesToShellDir(moduleLoader.loadModules());
+
+        String binary = shizukuHelper.getAppProcessBinary();
+        if (binary == null) {
+            logger.e("❌ No usable app_process binary on this ROM. "
+                    + "Hooking is not possible on this device.");
+            updateNotification("app_process unavailable");
+            return false;
         }
 
         try {
+            int targetUid = -1;
+            try {
+                ApplicationInfo ai =
+                    getPackageManager().getApplicationInfo(packageName, 0);
+                targetUid = ai.uid;
+            } catch (Throwable ignored) {}
+
             String cmd = String.format(
-                "CLASSPATH=%s app_process " +
+                "CLASSPATH=%s %s " +
                 "-Xverify:none -Xallowinmemorycompilation " +
                 "-Xcompiler-option --target-api=%d " +
                 "-Djava.class.path=%s " +
-                "/system/bin com.shizuposed.manager.core.XposedHook %s &",
+                "/system/bin com.shizuposed.manager.core.XposedHook %s 0 %d &",
                 SHELL_DEX_PATH,
+                binary,
                 Build.VERSION.SDK_INT,
                 SHELL_DEX_PATH,
-                packageName
+                packageName,
+                targetUid
             );
 
-            logger.i("🚀 Launching " + packageName + " under ShizuPosed");
+            logger.i("🚀 Launching " + packageName + " under ShizuPosed"
+                + " (binary=" + binary + ", uid=" + targetUid + ")");
             logger.i("Executing: " + cmd);
 
             ShellUtils.CommandResult result = shizukuHelper.executeCommand(cmd);
             if (!result.isSuccess()) {
-                logger.e("❌ app_process launch failed: " + result.getStderrString());
+                logger.e("❌ " + binary + " launch failed: "
+                    + result.getStderrString());
                 return false;
             }
 
-            logger.i("✅ app_process spawned for " + packageName);
+            logger.i("✅ " + binary + " spawned for " + packageName);
             return true;
 
         } catch (Exception e) {
@@ -454,89 +563,26 @@ public class ShizuPosedService extends Service {
     }
 
     /**
-     * Legacy injection entry point. In the post-Application timing model,
-     * hooking a *running* process is not possible without native injection.
-     * Retained so callers compile; reports honestly.
+     * Not supported without root. Kept as a stub so callers get a clear
+     * "no" instead of a crash, and the log explains why.
      */
-    public boolean injectProcess(String packageName, int pid, int uid, List<ModuleInfo> modules) {
-        logger.i("📥 injectProcess(" + packageName + ", pid=" + pid + ", uid=" + uid + ")");
-
-        if (!isRunning || !shizukuHelper.isAuthorized()) return false;
-        if (!dexDeployed && !ensureDexReady()) return false;
-
+    public boolean injectProcess(String packageName, int pid, int uid,
+                                 List<ModuleInfo> modules) {
+        logger.i("📥 injectProcess(" + packageName + ", pid=" + pid
+                + ", uid=" + uid + ")");
+        if (!isRunning.get() || !shizukuHelper.isAuthorized()) return false;
+        if (!ensureDexReady()) return false;
         logger.w("Cannot hook externally-launched process " + packageName
             + " — use launchAppUnderShizuPosed() to launch it under ShizuPosed");
         return false;
     }
 
     // ═════════════════════════════════════════════════════════════
-    // NOTIFICATION + LIFECYCLE
+    // ACCESSORS
     // ═════════════════════════════════════════════════════════════
 
-    private void updateNotification(String status) {
-        Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("ShizuPosed Manager")
-            .setContentText(status)
-            .setSmallIcon(R.drawable.ic_launcher)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setOngoing(true)
-            .setAutoCancel(false)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .build();
-
-        NotificationManager manager = getSystemService(NotificationManager.class);
-        if (manager != null) manager.notify(NOTIFICATION_ID, notification);
-    }
-
-    public boolean isRunning() { return isRunning; }
-    public boolean isXposedHookStarted() { return xposedHookStarted; }
-    public boolean isDexDeployed() { return dexDeployed; }
+    public boolean isRunning() { return isRunning.get(); }
+    public boolean isXposedHookStarted() { return xposedHookStarted.get(); }
+    public boolean isDexDeployed() { return dexDeployed.get(); }
     public static boolean isServiceRunning() { return isServiceRunning; }
-
-    @Override
-    public int onStartCommand(Intent intent, int flags, int startId) {
-        isServiceRunning = true;
-
-        if (intent != null) {
-            String action = intent.getAction();
-
-            if (ShizuPosedManagerApp.ACTION_SHIZUKU_AUTHORIZED.equals(action)) {
-                logger.i("📨 ACTION_SHIZUKU_AUTHORIZED received");
-                onShizukuAuthorized();
-
-            } else if (ACTION_LAUNCH_APP.equals(action)) {
-                String pkg = intent.getStringExtra(EXTRA_LAUNCH_PACKAGE);
-                if (pkg != null) {
-                    final String target = pkg;
-                    logger.i("📨 ACTION_LAUNCH_APP received for " + target);
-                    workerHandler.post(() -> launchAppUnderShizuPosed(target));
-                }
-
-            } else if (ACTION_REPUSH_MODULES.equals(action)) {
-                logger.i("📨 ACTION_REPUSH_MODULES received");
-                workerHandler.post(() -> {
-                    if (ensureDexReady()) {
-                        pushModulesToShellDir(moduleLoader.loadModules());
-                    }
-                });
-            }
-        }
-
-        return START_STICKY;
-    }
-
-    @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
-
-    @Override
-    public void onDestroy() {
-        logger.i("ShizuPosedService destroying...");
-        isRunning = false;
-        isServiceRunning = false;
-        if (processMonitor != null) processMonitor.stopMonitoring();
-        if (workerThread != null) workerThread.quitSafely();
-        super.onDestroy();
-    }
 }

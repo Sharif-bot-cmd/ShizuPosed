@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!--
+        Android head silhouette.
+        The 108x108 viewport is the adaptive-icon canvas; only the
+        central 72x72 region (18..90 on each axis) survives the
+        launcher mask. The drawing below stays well inside that.
+
+        Head dome: upper half of a circle, radius 22, center (54, 62).
+        Eyes: two small filled circles.
+        Antennae: two short diagonal strokes from the top of the dome.
+    -->
+
+    <!-- Head dome (upper half circle) -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M32,62 a22,22 0 0,1 44,0 z" />
+
+    <!-- Left antenna -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M36,45 L31,36 L35,34 L40,43 z" />
+
+    <!-- Right antenna -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M72,45 L77,36 L73,34 L68,43 z" />
+
+    <!-- Left eye -->
+    <path
+        android:fillColor="#1A1A2E"
+        android:pathData="M47,55 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+
+    <!-- Right eye -->
+    <path
+        android:fillColor="#1A1A2E"
+        android:pathData="M61,55 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+
+</vector>

@@ -34,14 +34,8 @@ public class ShizuPosedManagerApp extends Application {
 
     private ShizuPosedService shizuPosedService;
 
-    // Prevents firing the "service is authorized" notification more than once per grant
     private final AtomicBoolean notifiedAuthorized = new AtomicBoolean(false);
-
-    // Ensures our own Shizuku listeners are registered at most once
     private final AtomicBoolean listenersRegistered = new AtomicBoolean(false);
-
-    // Re-entrancy guard for autoStartService (posted callbacks could
-    // otherwise loop through binderReceived -> checkPermission -> autoStart)
     private final AtomicBoolean inAutoStart = new AtomicBoolean(false);
 
     // ─── Shizuku listeners ─────────────────────────────────────
@@ -51,8 +45,8 @@ public class ShizuPosedManagerApp extends Application {
         public void onBinderReceived() {
             isShizukuAvailable = true;
             logger.i("Shizuku binder received");
-            // Post so we never run on a binder callback stack
-            new Handler(Looper.getMainLooper()).post(ShizuPosedManagerApp.this::checkShizukuPermission);
+            new Handler(Looper.getMainLooper()).post(
+                ShizuPosedManagerApp.this::checkShizukuPermission);
         }
     };
 
@@ -104,28 +98,16 @@ public class ShizuPosedManagerApp extends Application {
         createDirectories();
         setupNotificationChannel();
 
-        // Defer all Shizuku-related setup so nothing can fire a binder
-        // callback on this thread before onCreate finishes.
+        // Defer Shizuku setup so nothing binder-related runs on this stack.
         new Handler(Looper.getMainLooper()).post(this::deferredShizukuSetup);
 
         logger.i("ShizuPosed Manager initialized");
     }
 
-    /**
-     * Runs on the main looper AFTER onCreate has returned. From here we:
-     *   • Register our own Shizuku listeners
-     *   • Register a PermissionListener on ShizukuHelper
-     *   • Kick off an initial permission check
-     *
-     * Because this runs on the main looper, getInstance() calls always
-     * return the fully constructed singleton.
-     */
     private void deferredShizukuSetup() {
         try {
-            // 1. Register our own Shizuku listeners
             registerShizukuListeners();
 
-            // 2. Register a permission listener on the helper
             try {
                 ShizukuHelper.getInstance(this).addPermissionListener(
                     new ShizukuHelper.PermissionListener() {
@@ -149,7 +131,6 @@ public class ShizuPosedManagerApp extends Application {
                 logger.e("Failed to register ShizukuHelper permission listener: " + t.getMessage());
             }
 
-            // 3. Read current state and possibly request permission
             checkShizukuPermission();
 
         } catch (Throwable t) {
@@ -187,6 +168,10 @@ public class ShizuPosedManagerApp extends Application {
 
     /**
      * Tells the service that Shizuku is authorized, once per grant.
+     *
+     * Prefers a direct call so we do NOT need to fire startForegroundService()
+     * again (which would re-arm the 5-second foreground timer on an already
+     * running service and cause ForegroundServiceDidNotStartInTimeException).
      */
     private void notifyServiceShizukuAuthorized() {
         if (!notifiedAuthorized.compareAndSet(false, true)) {
@@ -212,7 +197,12 @@ public class ShizuPosedManagerApp extends Application {
             return;
         }
 
-        logger.i("Sending ACTION_SHIZUKU_AUTHORIZED intent to ShizuPosedService");
+        // Fallback: send the action intent.
+        boolean alreadyRunning = false;
+        try { alreadyRunning = ShizuPosedService.isServiceRunning(); } catch (Throwable ignored) {}
+
+        logger.i("Sending ACTION_SHIZUKU_AUTHORIZED intent to ShizuPosedService "
+            + "(running=" + alreadyRunning + ")");
         Intent i = new Intent(this, ShizuPosedService.class);
         i.setAction(ACTION_SHIZUKU_AUTHORIZED);
         try {
@@ -231,7 +221,7 @@ public class ShizuPosedManagerApp extends Application {
 
     private boolean isShizukuManagerInstalled() {
         try {
-            getPackageManager().getPackageInfo("moe.shizuku.manager", 0);
+            getPackageManager().getPackageInfo("moe.shizuku.privileged.api", 0);
             return true;
         } catch (PackageManager.NameNotFoundException e) { return false; }
     }
@@ -239,7 +229,7 @@ public class ShizuPosedManagerApp extends Application {
     private void checkShizukuPermission() {
         if (!isShizukuManagerInstalled()) {
             logger.w("Shizuku Manager not installed");
-            logger.i("Please install Shizuku from: https://github.com/RikkaApps/Shizuku");
+            logger.i("Please install Shizuku from: https://github.com/thedjchi/Shizuku");
             return;
         }
         logger.i("Shizuku Manager installed (moe.shizuku.manager)");
@@ -304,33 +294,42 @@ public class ShizuPosedManagerApp extends Application {
             logger.d("Service already auto-started");
             return;
         }
-
-        // Guard against re-entry on the same thread
-        if (!inAutoStart.compareAndSet(false, true)) {
-            return;
-        }
+        if (!inAutoStart.compareAndSet(false, true)) return;
         try {
-            // ✅ Trust ONLY the local flag. Do not call getInstance() here —
-            // this method may be reached through a chain that would loop.
             if (!isShizukuAuthorized) {
                 logger.d("Cannot auto-start: not authorized yet");
                 return;
             }
 
-            logger.i("🚀 Auto-starting ShizuPosedService...");
-            Intent serviceIntent = new Intent(this, ShizuPosedService.class);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(serviceIntent);
-            } else {
-                startService(serviceIntent);
-            }
-            serviceAutoStarted = true;
-            logger.i("✅ Service auto-started successfully");
+            boolean alreadyRunning = false;
+            try { alreadyRunning = ShizuPosedService.isServiceRunning(); } catch (Throwable ignored) {}
 
-            if (mainActivity != null) mainActivity.onServiceAutoStarted();
-        } catch (Exception e) {
-            logger.e("Failed to auto-start service: " + e.getMessage());
-            serviceAutoStarted = false;
+            Intent serviceIntent = new Intent(this, ShizuPosedService.class);
+            if (alreadyRunning) {
+                // Do NOT fire a bare startForegroundService() on a running
+                // service — that re-arms the 5-second foreground timer.
+                logger.i("Service already running — sending ACTION_SHIZUKU_AUTHORIZED only");
+                serviceIntent.setAction(ACTION_SHIZUKU_AUTHORIZED);
+            } else {
+                logger.i("🚀 Auto-starting ShizuPosedService...");
+            }
+
+            // Set the flag BEFORE the call so a re-entrant call from another
+            // thread can't race us into a second startForegroundService().
+            serviceAutoStarted = true;
+
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(serviceIntent);
+                } else {
+                    startService(serviceIntent);
+                }
+                logger.i("✅ Service auto-start dispatched");
+                if (mainActivity != null) mainActivity.onServiceAutoStarted();
+            } catch (Exception e) {
+                serviceAutoStarted = false;
+                logger.e("Failed to auto-start service: " + e.getMessage());
+            }
         } finally {
             inAutoStart.set(false);
         }
@@ -355,11 +354,6 @@ public class ShizuPosedManagerApp extends Application {
 
     public boolean isShizukuAvailable() { return isShizukuAvailable; }
 
-    /**
-     * Returns true if we OR the helper thinks we're authorized.
-     * This is safe to call from anywhere on the main thread now that
-     * deferredShizukuSetup has run.
-     */
     public boolean isShizukuAuthorized() {
         if (isShizukuAuthorized) return true;
         try {

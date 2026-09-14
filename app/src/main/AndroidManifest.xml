@@ -4,42 +4,68 @@
 
     <!-- Permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!--
+        FGS type changed from dataSync to specialUse.
+        Android 15 forbids dataSync FGS from BOOT_COMPLETED. specialUse is
+        the correct type for a privileged hooking/service-manager that does
+        not fit one of the narrow categories (dataSync, mediaPlayback, etc.).
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Required for BootReceiver to fire. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- WorkManager needs this on some ROMs for expedited work, harmless otherwise. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- Shizuku Permission -->
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
 
     <!--
-        Android 11+ package visibility.
-        Allows the ShizuPosed app itself to see and query its own provider
-        (needed on some OEM ROMs), and lets anything that asks about the
-        provider authority resolve it without hitting the visibility wall.
+        QUERY_ALL_PACKAGES
+        Required on some OEM ROMs (OPPO, older Xiaomi) that do not honor
+        the intent-based <queries> block for getInstalledApplications().
     -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
     <queries>
         <provider android:authorities="com.shizuposed.manager.status" />
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
     </queries>
+
+    <!--
+        Custom signature-level permission.
+        Gates access to ModuleStatusProvider so only apps signed with the
+        same key can query module status.
+    -->
+    <permission
+        android:name="com.shizuposed.manager.permission.READ_STATUS"
+        android:protectionLevel="signature" />
+
+    <uses-permission android:name="com.shizuposed.manager.permission.READ_STATUS" />
 
     <application
         android:name=".ShizuPosedManagerApp"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
-        android:icon="@drawable/ic_launcher"
+        android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
-        android:roundIcon="@drawable/ic_launcher_round"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.ShizuPosedManager"
-        android:requestLegacyExternalStorage="true"
-        android:usesCleartextTraffic="true"
         android:resizeableActivity="true"
-        android:screenOrientation="portrait"
-        tools:targetApi="31">
+        tools:targetApi="37">
 
-        <!-- ✅ Shizuku Provider - ONLY Shizuku -->
+        <!-- Shizuku Provider -->
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
             android:authorities="${applicationId}.shizuku"
@@ -48,22 +74,14 @@
             android:multiprocess="false"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
-        <!--
-            ═══════════════════════════════════════════════════════
-            ModuleStatusProvider
-            Exposes read-only module enable/disable status to external
-            modules so they can show "Module is Active / Inactive" in
-            their own config UIs.
-            The provider shares the app's process, so it sees the same
-            ModuleLoader singleton the rest of the manager uses.
-            ═══════════════════════════════════════════════════════
-        -->
+        <!-- ModuleStatusProvider -->
         <provider
             android:name=".status.ModuleStatusProvider"
             android:authorities="com.shizuposed.manager.status"
             android:enabled="true"
             android:exported="true"
-            android:multiprocess="false" />
+            android:multiprocess="false"
+            android:permission="com.shizuposed.manager.permission.READ_STATUS" />
 
         <activity
             android:name=".MainActivity"
@@ -80,25 +98,47 @@
 
         <!--
             ShizuPosedService
-            NOTE: android:process=":shizuposed" REMOVED.
-            Keeping the service in the default process lets ProcessMonitor /
-            ShizuPosedManagerApp share singletons, which is required for the
-            dex-deploy flow to find the service instance.
+
+            foregroundServiceType changed:
+              dataSync  →  specialUse
+
+            Android 15 forbids starting a dataSync FGS from BOOT_COMPLETED
+            (this was the crash: "FGS type dataSync not allowed to start
+            from BOOT_COMPLETED"). specialUse is permitted at boot subject
+            to the general background-start rules, and it is the correct
+            semantic type for this service.
+
+            The <property> tag is REQUIRED for specialUse on Android 14+.
         -->
         <service
             android:name=".service.ShizuPosedService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Privileged Shizuku-backed hooking and module deployment service" />
+        </service>
 
-        <!-- ✅ Boot Receiver -->
+        <!--
+            Boot Receiver.
+
+            Kept android:enabled="false" — the receiver only does work if
+            you explicitly enable it at runtime (via PackageManager) and
+            the user has opted in to auto-start.
+
+            It no longer calls startForegroundService() directly. Instead
+            it enqueues a WorkManager job that retries until the platform
+            allows the FGS start (which on Android 15 is often only after
+            the app has been foregrounded at least once).
+        -->
         <receiver
             android:name=".receiver.BootReceiver"
             android:enabled="false"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
-                <action android:name="android.intent.action.REBOOT" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
 

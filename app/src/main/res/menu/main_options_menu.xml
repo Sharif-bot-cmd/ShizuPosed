@@ -3,26 +3,32 @@
     xmlns:app="http://schemas.android.com/apk/res-auto">
 
     <item
-        android:id="@+id/action_refresh"
-        android:icon="@android:drawable/ic_menu_revert"
-        android:title="Refresh"
-        app:showAsAction="ifRoom" />
+        android:id="@+id/action_grant_shizuku"
+        android:title="Grant Shizuku Permission"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_start_service"
+        android:title="Start Service"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_stop_service"
+        android:title="Stop Service"
+        app:showAsAction="never" />
 
     <item
         android:id="@+id/action_status"
-        android:icon="@android:drawable/ic_menu_info_details"
         android:title="Status"
-        app:showAsAction="ifRoom" />
+        app:showAsAction="never" />
 
     <item
-        android:id="@+id/action_grant_shizuku"
-        android:icon="@android:drawable/ic_menu_manage"
-        android:title="Grant Shizuku"
-        app:showAsAction="ifRoom" />
+        android:id="@+id/action_refresh"
+        android:title="Refresh"
+        app:showAsAction="never" />
 
     <item
         android:id="@+id/action_restart"
-        android:icon="@android:drawable/ic_menu_revert"
         android:title="Restart Service"
         app:showAsAction="never" />
 

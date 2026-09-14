@@ -21,39 +21,62 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+/**
+ * Adapter for the "Select Apps" dialog.
+ *
+ * `selectedApps` is the single source of truth for the user's selection.
+ * The displayed list (`apps`) can be replaced at any time by the search
+ * filter, but the selection survives because it is keyed by package
+ * name — not by position, and not by whether the app is currently
+ * visible in the filtered list.
+ *
+ * The checkbox's onCheckedChangeListener is always detached before the
+ * programmatic setChecked(...) call, and reattached afterwards. This
+ * prevents a recycled ViewHolder from firing its stale callback against
+ * the wrong package name, which was the cause of the "checkbox state
+ * disappears after search" symptom.
+ */
 public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapter.AppViewHolder> {
+
+    public interface OnSelectionChangedListener {
+        void onSelectionChanged(int selectedCount);
+    }
+
     private List<ApplicationInfo> apps;
-    private Set<String> selectedApps;
-    private Context context;
-    private PackageManager packageManager;
+    private final Set<String> selectedApps;
+    private final Context context;
+    private final PackageManager packageManager;
+    private OnSelectionChangedListener selectionChangedListener;
 
     public AppSelectionAdapter(Context context) {
         this.context = context;
         this.packageManager = context.getPackageManager();
         this.apps = new ArrayList<>();
-        // ✅ Always use a new HashSet to avoid sharing references
         this.selectedApps = new HashSet<>();
     }
 
+    public void setOnSelectionChangedListener(OnSelectionChangedListener l) {
+        this.selectionChangedListener = l;
+    }
+
+    /** Replace the displayed list. Does NOT touch the selection. */
     public void setApps(List<ApplicationInfo> apps) {
         this.apps = apps != null ? apps : new ArrayList<>();
         notifyDataSetChanged();
     }
 
-    /**
-     * ✅ FIX: Copy the set instead of using the same reference
-     */
+    /** Seed the selection. Copies the incoming set. */
     public void setSelectedApps(Set<String> selectedApps) {
-        // ✅ Create a NEW HashSet with the contents
-        this.selectedApps = new HashSet<>();
+        this.selectedApps.clear();
         if (selectedApps != null) {
             this.selectedApps.addAll(selectedApps);
         }
         notifyDataSetChanged();
+        notifySelectionChanged();
     }
 
+    /** Returns a COPY of the current selection. */
     public Set<String> getSelectedApps() {
-        // ✅ Return a COPY of the set
         return new HashSet<>(selectedApps);
     }
 
@@ -62,11 +85,17 @@ public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapte
             selectedApps.add(app.packageName);
         }
         notifyDataSetChanged();
+        notifySelectionChanged();
     }
 
     public void clearAll() {
-        selectedApps.clear();
+        // Only clear the visible ones? Or everything? Clear everything
+        // currently displayed — the user expects "clear the list I see".
+        for (ApplicationInfo app : apps) {
+            selectedApps.remove(app.packageName);
+        }
         notifyDataSetChanged();
+        notifySelectionChanged();
     }
 
     public void selectSystemApps() {
@@ -76,6 +105,7 @@ public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapte
             }
         }
         notifyDataSetChanged();
+        notifySelectionChanged();
     }
 
     @NonNull
@@ -89,46 +119,52 @@ public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapte
     @Override
     public void onBindViewHolder(@NonNull AppViewHolder holder, int position) {
         ApplicationInfo app = apps.get(position);
-        
+        final String pkg = app.packageName;
+
         holder.tvAppName.setText(app.loadLabel(packageManager));
-        holder.tvPackageName.setText(app.packageName);
-        
-        Drawable icon = app.loadIcon(packageManager);
-        if (icon != null) {
-            holder.ivIcon.setImageDrawable(icon);
-        } else {
+        holder.tvPackageName.setText(pkg);
+
+        try {
+            Drawable icon = app.loadIcon(packageManager);
+            if (icon != null) {
+                holder.ivIcon.setImageDrawable(icon);
+            } else {
+                holder.ivIcon.setImageResource(R.drawable.ic_module);
+            }
+        } catch (Throwable t) {
             holder.ivIcon.setImageResource(R.drawable.ic_module);
         }
-        
-        // ✅ Check if this app is in the selected set
-        boolean isChecked = selectedApps.contains(app.packageName);
-        holder.cbSelected.setChecked(isChecked);
-        
-        // ✅ Remove any previous listener to avoid duplicate events
+
+        // ── Critical ordering ─────────────────────────────────────
+        // 1. Detach the old listener first.
         holder.cbSelected.setOnCheckedChangeListener(null);
-        
-        holder.cbSelected.setOnCheckedChangeListener((buttonView, isChecked1) -> {
-            if (isChecked1) {
-                selectedApps.add(app.packageName);
+
+        // 2. Set the checked state from the source of truth.
+        holder.cbSelected.setChecked(selectedApps.contains(pkg));
+
+        // 3. Attach a NEW listener that closes over THIS app's package.
+        holder.cbSelected.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (isChecked) {
+                selectedApps.add(pkg);
             } else {
-                selectedApps.remove(app.packageName);
+                selectedApps.remove(pkg);
             }
+            notifySelectionChanged();
         });
-        
-        holder.itemView.setOnClickListener(v -> {
-            boolean newState = !selectedApps.contains(app.packageName);
-            if (newState) {
-                selectedApps.add(app.packageName);
-            } else {
-                selectedApps.remove(app.packageName);
-            }
-            holder.cbSelected.setChecked(newState);
-        });
+
+        // 4. Row click toggles the checkbox (which fires the listener above).
+        holder.itemView.setOnClickListener(v -> holder.cbSelected.toggle());
     }
 
     @Override
     public int getItemCount() {
         return apps.size();
+    }
+
+    private void notifySelectionChanged() {
+        if (selectionChangedListener != null) {
+            selectionChangedListener.onSelectionChanged(selectedApps.size());
+        }
     }
 
     static class AppViewHolder extends RecyclerView.ViewHolder {

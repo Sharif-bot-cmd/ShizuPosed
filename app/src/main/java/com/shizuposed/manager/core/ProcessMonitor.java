@@ -8,12 +8,15 @@ import com.shizuposed.manager.model.HookedProcess;
 import com.shizuposed.manager.model.ModuleInfo;
 import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.utils.Logger;
+import com.shizuposed.manager.utils.ShellUtils;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -21,6 +24,18 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+/**
+ * ProcessMonitor
+ *
+ * Keeps a live map of running app processes. Reads /proc directly when
+ * possible; falls back to reading through Shizuku (shell uid) when the
+ * direct read is blocked by SELinux.
+ *
+ * Also polls the shell-side hooked-marker directory written by
+ * XposedHook after it successfully installs hooks. Markers cause the
+ * matching process entry to be promoted from "Pending" to "Hooked" on
+ * the Home tab.
+ */
 public class ProcessMonitor {
     private static ProcessMonitor instance;
 
@@ -31,9 +46,14 @@ public class ProcessMonitor {
     private final ConcurrentHashMap<Integer, HookedProcess> hookedProcesses = new ConcurrentHashMap<>();
     private final AtomicBoolean isRunning = new AtomicBoolean(false);
 
-    // Periodic rescanner — keeps the hooked-processes map fresh
     private ScheduledExecutorService scheduler;
     private ScheduledFuture<?> scanTask;
+
+    private volatile Boolean shellScanAvailable = null;
+
+    // Shell-side paths (mirror what XposedHook uses)
+    private static final String SHELL_FILES_DIR = "/data/user/0/com.android.shell/files";
+    private static final String HOOKED_DIR      = SHELL_FILES_DIR + "/.syscall_cache/hooked";
 
     private ProcessMonitor(Context context) {
         this.context = context.getApplicationContext();
@@ -89,12 +109,8 @@ public class ProcessMonitor {
         }
         logger.i("ProcessMonitor started - monitoring for new apps");
 
-        // Initial scan
         scanExistingProcesses();
 
-        // Periodic rescan every 5 seconds so the UI reflects reality.
-        // Each scan is cheap (reads /proc); running it off the main
-        // thread keeps the UI responsive.
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "ProcessMonitor-scan");
             t.setDaemon(true);
@@ -128,30 +144,218 @@ public class ProcessMonitor {
         if (!isRunning.get()) return;
 
         try {
-            // We don't clear the map here. Anything no longer present in
-            // /proc gets removed at the end via pruneDeadProcesses().
-            // That way, adding a process while another scan is running
-            // doesn't wipe live entries.
+            Map<Integer, ProcInfo> found = scanProcTree();
 
+            int newlyAdded = 0;
+            for (Map.Entry<Integer, ProcInfo> e : found.entrySet()) {
+                int pid = e.getKey();
+                ProcInfo info = e.getValue();
+
+                if (isSystemProcess(info.packageName)) continue;
+                if (info.uid < 10000) continue;
+                if (pid == android.os.Process.myPid()) continue;
+
+                if (hookedProcesses.containsKey(pid)) continue;
+
+                HookedProcess process = new HookedProcess();
+                process.setProcessName(info.packageName);
+                process.setPid(pid);
+                process.setUid(info.uid);
+                process.setHooked(false);
+                process.setHookedAt(System.currentTimeMillis());
+
+                hookedProcesses.put(pid, process);
+                newlyAdded++;
+
+                logger.v("Found app: " + info.packageName
+                    + " (pid=" + pid + ", uid=" + info.uid + ")");
+
+                if (injectionService != null) {
+                    try {
+                        List<ModuleInfo> modules =
+                            ModuleLoader.getInstance(context).getEnabledModules();
+                        if (!modules.isEmpty()) {
+                            injectionService.injectProcess(
+                                info.packageName, pid, info.uid, modules);
+                        }
+                    } catch (Throwable t) {
+                        logger.w("injectProcess failed for "
+                            + info.packageName + ": " + t.getMessage());
+                    }
+                }
+            }
+
+            // ✅ Poll the shell-side marker directory and promote any
+            // entries the spawned XposedHook reported as successfully
+            // hooked. Runs once per scan, alongside the /proc sweep.
+            pollHookedMarkers();
+
+            // Prune tracked pids that no longer exist in /proc
+            List<Integer> toRemove = new ArrayList<>();
+            for (Integer pid : hookedProcesses.keySet()) {
+                if (!found.containsKey(pid)) toRemove.add(pid);
+            }
+            for (Integer pid : toRemove) {
+                HookedProcess removed = hookedProcesses.remove(pid);
+                if (removed != null) {
+                    logger.v("Process exited: " + removed.getProcessName()
+                        + " (pid=" + pid + ")");
+                }
+            }
+
+            logger.i("Scanned " + found.size() + " processes ("
+                + newlyAdded + " new, " + hookedProcesses.size() + " tracked)");
+
+        } catch (Exception e) {
+            logger.e("Scan error: " + e.getMessage());
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // HOOKED MARKER POLLING
+    //
+    // XposedHook (running inside the shell-spawned app_process) writes
+    // <HOOKED_DIR>/<pkg>.json after installing hooks. We read those
+    // markers over Shizuku and promote matching entries from "Pending"
+    // to "Hooked".
+    // ═════════════════════════════════════════════════════════════
+
+    private void pollHookedMarkers() {
+        try {
+            ShizukuHelper sh = ShizukuHelper.getInstance(context);
+            if (!sh.isAvailable() || !sh.isAuthorized()) return;
+
+            ShellUtils.CommandResult ls = sh.executeCommand("ls " + HOOKED_DIR + " 2>/dev/null; true");
+            if (ls.stdout == null) return;
+            if (!ls.isSuccess() || ls.stdout == null) return;
+
+            for (String line : ls.stdout) {
+                if (line == null) continue;
+                String name = line.trim();
+                if (name.isEmpty() || !name.endsWith(".json")) continue;
+
+                String pkg = name.substring(0, name.length() - 5);
+
+                // Already promoted? Skip re-reading.
+                boolean alreadyHooked = false;
+                for (HookedProcess p : hookedProcesses.values()) {
+                    if (pkg.equals(p.getProcessName()) && p.isHooked()) {
+                        alreadyHooked = true;
+                        break;
+                    }
+                }
+                if (alreadyHooked) continue;
+
+                // Read the marker file
+                ShellUtils.CommandResult cat = sh.executeCommand(
+                    "cat " + HOOKED_DIR + "/" + name);
+                if (!cat.isSuccess() || cat.stdout == null) continue;
+
+                StringBuilder body = new StringBuilder();
+                for (String l : cat.stdout) {
+                    if (l != null) body.append(l);
+                }
+
+                int pid     = extractInt(body.toString(), "pid");
+                int uid     = extractInt(body.toString(), "uid");
+                int modules = extractInt(body.toString(), "modules");
+
+                // Prefer the entry that matches this pid; otherwise
+                // match by package name. The spawned app_process runs
+                // in a different pid than the target in the current
+                // timing model, so pid matching is best-effort.
+                HookedProcess target = null;
+                if (pid > 0) target = hookedProcesses.get(pid);
+                if (target == null) {
+                    for (HookedProcess p : hookedProcesses.values()) {
+                        if (pkg.equals(p.getProcessName())) {
+                            target = p;
+                            break;
+                        }
+                    }
+                }
+
+                if (target == null) {
+                    target = new HookedProcess();
+                    target.setProcessName(pkg);
+                    target.setPid(pid > 0 ? pid : -1);
+                    target.setUid(uid);
+                }
+
+                target.setHooked(true);
+                target.setHookedAt(System.currentTimeMillis());
+
+                if (target.getPid() > 0) {
+                    hookedProcesses.put(target.getPid(), target);
+                }
+
+                logger.i("Hook confirmed by target: " + pkg
+                    + " (pid=" + pid + ", modules=" + modules + ")");
+            }
+        } catch (Throwable t) {
+            logger.d("pollHookedMarkers: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Parse an integer value out of a tiny JSON object by key.
+     * Returns -1 if the key isn't found or the value isn't numeric.
+     */
+    private int extractInt(String json, String key) {
+        if (json == null || key == null) return -1;
+        try {
+            String needle = "\"" + key + "\":";
+            int s = json.indexOf(needle);
+            if (s < 0) return -1;
+            s += needle.length();
+            int e = s;
+            while (e < json.length()
+                    && (Character.isDigit(json.charAt(e)) || json.charAt(e) == '-')) {
+                e++;
+            }
+            if (e == s) return -1;
+            return Integer.parseInt(json.substring(s, e));
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // PROC READERS
+    // ═════════════════════════════════════════════════════════════
+
+    private static final class ProcInfo {
+        String packageName;
+        int uid;
+    }
+
+    private Map<Integer, ProcInfo> scanProcTree() {
+        Map<Integer, ProcInfo> direct = scanProcDirect();
+        if (direct.size() >= 10) return direct;
+
+        Map<Integer, ProcInfo> shell = scanProcViaShell();
+        if (shell.size() > direct.size()) {
+            logger.d("Using shell scan (" + shell.size()
+                + " processes) — direct /proc read yielded " + direct.size());
+            return shell;
+        }
+        return direct;
+    }
+
+    private Map<Integer, ProcInfo> scanProcDirect() {
+        Map<Integer, ProcInfo> out = new HashMap<>();
+        try {
             File procDir = new File("/proc");
             File[] pidDirs = procDir.listFiles();
-            if (pidDirs == null) return;
-
-            int found = 0;
-            int newlyAdded = 0;
+            if (pidDirs == null) return out;
 
             for (File dir : pidDirs) {
                 if (!dir.isDirectory()) continue;
 
                 int pid;
-                try {
-                    pid = Integer.parseInt(dir.getName());
-                } catch (NumberFormatException e) {
-                    continue;
-                }
+                try { pid = Integer.parseInt(dir.getName()); }
+                catch (NumberFormatException e) { continue; }
                 if (pid < 100) continue;
-
-                // Skip our own pid
                 if (pid == android.os.Process.myPid()) continue;
 
                 File cmdline = new File("/proc/" + pid + "/cmdline");
@@ -160,123 +364,88 @@ public class ProcessMonitor {
                 String raw = readFile(cmdline);
                 if (raw == null || raw.isEmpty()) continue;
 
-                String packageName = parsePackageName(raw);
-                if (packageName == null || packageName.isEmpty()) continue;
+                String pkg = parsePackageName(raw);
+                if (pkg == null || pkg.isEmpty()) continue;
 
-                if (isSystemProcess(packageName)) continue;
-
-                int uid = getProcessUid(pid);
+                int uid = getProcessUidDirect(pid);
                 if (uid < 0) continue;
 
-                // Only track user apps
-                if (uid < 10000) continue;
+                ProcInfo info = new ProcInfo();
+                info.packageName = pkg;
+                info.uid = uid;
+                out.put(pid, info);
+            }
+        } catch (Throwable t) {
+            logger.d("scanProcDirect error: " + t.getMessage());
+        }
+        return out;
+    }
 
-                found++;
+    private Map<Integer, ProcInfo> scanProcViaShell() {
+        Map<Integer, ProcInfo> out = new HashMap<>();
+        try {
+            ShizukuHelper sh = ShizukuHelper.getInstance(context);
+            if (!sh.isAvailable() || !sh.isAuthorized()) {
+                shellScanAvailable = Boolean.FALSE;
+                return out;
+            }
 
-                // Only add to the map if we haven't already recorded it.
-                if (hookedProcesses.containsKey(pid)) continue;
+            String script =
+                "for d in /proc/[0-9]*; do " +
+                "  pid=${d##*/}; " +
+                "  uid=$(grep '^Uid:' $d/status 2>/dev/null | awk '{print $2}'); " +
+                "  cmd=$(tr '\\0' ' ' < $d/cmdline 2>/dev/null); " +
+                "  if [ -n \"$uid\" ] && [ -n \"$cmd\" ]; then " +
+                "    echo \"$pid|$uid|$cmd\"; " +
+                "  fi; " +
+                "done";
 
-                HookedProcess process = new HookedProcess();
-                process.setProcessName(packageName);
-                process.setPid(pid);
-                process.setUid(uid);
-                process.setHooked(false);            // not hooked until the service says so
-                process.setHookedAt(System.currentTimeMillis());
+            ShellUtils.CommandResult r = sh.executeCommand(script);
+            if (!r.isSuccess() || r.stdout == null) {
+                logger.d("Shell scan returned no output");
+                shellScanAvailable = Boolean.FALSE;
+                return out;
+            }
 
-                hookedProcesses.put(pid, process);
-                newlyAdded++;
+            shellScanAvailable = Boolean.TRUE;
 
-                logger.v("Found app: " + packageName + " (pid=" + pid + ", uid=" + uid + ")");
+            for (String line : r.stdout) {
+                if (line == null) continue;
+                line = line.trim();
+                if (line.isEmpty()) continue;
 
-                // Ask the service to inject. In the current timing model
-                // this returns false for externally launched pids — that's
-                // expected; the process stays in the map as "not hooked".
-                if (injectionService != null) {
-                    try {
-                        List<ModuleInfo> modules =
-                            ModuleLoader.getInstance(context).getEnabledModules();
-                        if (!modules.isEmpty()) {
-                            injectionService.injectProcess(packageName, pid, uid, modules);
-                        }
-                    } catch (Throwable t) {
-                        logger.w("injectProcess failed for " + packageName + ": " + t.getMessage());
-                    }
+                int p1 = line.indexOf('|');
+                if (p1 <= 0) continue;
+                int p2 = line.indexOf('|', p1 + 1);
+                if (p2 <= 0) continue;
+
+                int pid;
+                int uid;
+                try {
+                    pid = Integer.parseInt(line.substring(0, p1));
+                    uid = Integer.parseInt(line.substring(p1 + 1, p2));
+                } catch (NumberFormatException e) {
+                    continue;
                 }
+                if (pid < 100) continue;
+                if (pid == android.os.Process.myPid()) continue;
+
+                String cmdline = line.substring(p2 + 1);
+                String pkg = parsePackageName(cmdline);
+                if (pkg == null || pkg.isEmpty()) continue;
+
+                ProcInfo info = new ProcInfo();
+                info.packageName = pkg;
+                info.uid = uid;
+                out.put(pid, info);
             }
-
-            pruneDeadProcesses();
-
-            logger.i("Scanned " + found + " app processes (" + newlyAdded
-                + " new, " + hookedProcesses.size() + " tracked)");
-        } catch (Exception e) {
-            logger.e("Scan error: " + e.getMessage());
+        } catch (Throwable t) {
+            logger.d("scanProcViaShell error: " + t.getMessage());
         }
+        return out;
     }
 
-    /**
-     * Remove entries whose pid no longer exists or whose /proc/<pid>
-     * directory is gone.
-     */
-    private void pruneDeadProcesses() {
-        List<Integer> toRemove = new ArrayList<>();
-        for (Integer pid : hookedProcesses.keySet()) {
-            File proc = new File("/proc/" + pid);
-            if (!proc.exists()) {
-                toRemove.add(pid);
-            }
-        }
-        for (Integer pid : toRemove) {
-            HookedProcess removed = hookedProcesses.remove(pid);
-            if (removed != null) {
-                logger.v("Process exited: " + removed.getProcessName()
-                    + " (pid=" + pid + ")");
-            }
-        }
-    }
-
-    // ═════════════════════════════════════════════════════════════
-    // HELPERS
-    // ═════════════════════════════════════════════════════════════
-
-    /**
-     * Read the entire file. Earlier versions used readLine() and only
-     * saw the first line, which made getProcessUid() always return -1.
-     */
-    private String readFile(File file) {
-        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                sb.append(line).append('\n');
-            }
-            return sb.toString();
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    /**
-     * Strip NULs, path prefixes and ":suffix" from a /proc/<pid>/cmdline
-     * content string.
-     *
-     *   "/system/bin/app_process\0"           → "app_process"
-     *   "com.example.app\0"                   → "com.example.app"
-     *   "com.example.app:remote\0"            → "com.example.app"
-     *   "/data/app/.../com.example.app\0"     → "com.example.app"
-     */
-    private String parsePackageName(String raw) {
-        if (raw == null) return null;
-        String clean = raw.replace("\0", "").trim();
-        if (clean.isEmpty()) return null;
-        if (clean.contains("/")) {
-            clean = clean.substring(clean.lastIndexOf('/') + 1);
-        }
-        int colon = clean.indexOf(':');
-        if (colon > 0) clean = clean.substring(0, colon);
-        return clean;
-    }
-
-    private int getProcessUid(int pid) {
+    private int getProcessUidDirect(int pid) {
         try {
             File status = new File("/proc/" + pid + "/status");
             if (!status.exists()) return -1;
@@ -298,6 +467,36 @@ public class ProcessMonitor {
         }
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // HELPERS
+    // ═════════════════════════════════════════════════════════════
+
+    private String readFile(File file) {
+        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line).append('\n');
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String parsePackageName(String raw) {
+        if (raw == null) return null;
+        String clean = raw.replace("\0", "").trim();
+        if (clean.isEmpty()) return null;
+        if (clean.contains("/")) {
+            clean = clean.substring(clean.lastIndexOf('/') + 1);
+        }
+        int colon = clean.indexOf(':');
+        if (colon > 0) clean = clean.substring(0, colon);
+        clean = clean.split("\\s+")[0];
+        return clean;
+    }
+
     private boolean isSystemProcess(String packageName) {
         if (packageName == null) return true;
         String[] systemProcesses = {
@@ -306,15 +505,12 @@ public class ProcessMonitor {
             "netd", "installd", "lmkd", "logd", "keystore",
             "sh", "su", "app_process", "adbd", "ueventd",
             "healthd", "watchdogd", "logcat", "debuggerd",
-            "android.hardware", "android.system",
-            "com.android.systemui", "com.android.phone",
-            "com.android.bluetooth", "com.android.nfc"
+            "android.hardware", "android.system"
         };
         for (String proc : systemProcesses) {
             if (packageName.equals(proc)) return true;
             if (packageName.startsWith(proc + ":")) return true;
         }
-        // Any process starting with "android." is a system component
         return packageName.startsWith("android.");
     }
 
@@ -326,11 +522,6 @@ public class ProcessMonitor {
         return new ArrayList<>(hookedProcesses.values());
     }
 
-    /**
-     * Real count of processes the service has actually hooked. Filters
-     * out entries that were merely *discovered* — a process is only
-     * counted when HookedProcess.isHooked() is true.
-     */
     public int getHookedProcessCount() {
         int count = 0;
         for (HookedProcess p : hookedProcesses.values()) {
@@ -339,19 +530,28 @@ public class ProcessMonitor {
         return count;
     }
 
-    /**
-     * Total tracked processes (discovered, whether hooked or not).
-     * Home tab uses this for "Total Apps" if you prefer it over the
-     * PackageManager count.
-     */
     public int getTrackedProcessCount() {
         return hookedProcesses.size();
     }
 
     /**
-     * Called by the service when it successfully installs hooks in a
-     * target process. Promotes the entry from "discovered" to "hooked".
+     * True if any enabled module lists `packageName` in its hookedApps.
+     * Used by HomeFragment to distinguish "running and waiting for
+     * launch" from "running but out of scope".
      */
+    public boolean isPackageInScope(String packageName) {
+        if (packageName == null) return false;
+        try {
+            List<ModuleInfo> enabled = ModuleLoader.getInstance(context).getEnabledModules();
+            for (ModuleInfo m : enabled) {
+                if (m.hookedApps != null && m.hookedApps.contains(packageName)) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
     public void addHookedProcess(HookedProcess process) {
         if (process == null || process.getPid() <= 0) return;
         process.setHooked(true);
@@ -372,5 +572,9 @@ public class ProcessMonitor {
 
     public void clearHookedProcesses() {
         hookedProcesses.clear();
+    }
+
+    public boolean isUsingShellScan() {
+        return Boolean.TRUE.equals(shellScanAvailable);
     }
 }

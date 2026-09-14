@@ -1,12 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <data-extraction-rules>
     <cloud-backup>
-        <include domain="file" path=".syscall_cache/modules/" />
-        <include domain="file" path=".syscall_cache/config/" />
+        <!-- Include parent so excludes below are valid -->
+        <include domain="file" path=".syscall_cache/" />
         <exclude domain="file" path=".syscall_cache/logs/" />
         <exclude domain="file" path=".syscall_cache/cache/" />
+
+        <include domain="sharedpref" path="." />
         <exclude domain="sharedpref" path="debug_prefs.xml" />
     </cloud-backup>
+
     <device-transfer>
         <include domain="file" path=".syscall_cache/" />
         <include domain="sharedpref" path="." />

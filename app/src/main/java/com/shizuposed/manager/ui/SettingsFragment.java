@@ -5,6 +5,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -23,7 +24,6 @@ import androidx.fragment.app.Fragment;
 import com.shizuposed.manager.R;
 import com.shizuposed.manager.ShizukuHelper;
 import com.shizuposed.manager.ShizuPosedManagerApp;
-import com.shizuposed.manager.core.ProcessMonitor;
 import com.shizuposed.manager.receiver.BootReceiver;
 import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.utils.Logger;
@@ -35,8 +35,8 @@ import java.util.concurrent.Executors;
 public class SettingsFragment extends Fragment {
     private Switch swAutoStart, swDebugMode, swLogToFile;
     private EditText etScanInterval, etHookDelay;
-    private Button btnRestartService, btnClearCache, btnExportConfig;
-    private TextView tvVersion, tvShizukuStatus, tvServiceStatus, tvHookedCount;
+    private Button btnClearCache, btnExportConfig;
+    private TextView tvVersion, tvShizukuStatus, tvServiceStatus;
     private Logger logger;
     private ExecutorService executor = Executors.newSingleThreadExecutor();
     private ShizukuHelper shizukuHelper;
@@ -52,10 +52,15 @@ public class SettingsFragment extends Fragment {
             saveSetting("auto_start", isChecked);
             if (isChecked) {
                 enableBootReceiver();
-                Toast.makeText(requireContext(), "Auto-start enabled", Toast.LENGTH_SHORT).show();
+                tryStartServiceNowIfForeground();
+                Toast.makeText(requireContext(),
+                    "Auto-start enabled — service will start after boot",
+                    Toast.LENGTH_SHORT).show();
             } else {
                 disableBootReceiver();
-                Toast.makeText(requireContext(), "Auto-start disabled", Toast.LENGTH_SHORT).show();
+                Toast.makeText(requireContext(),
+                    "Auto-start disabled",
+                    Toast.LENGTH_SHORT).show();
             }
         };
 
@@ -101,19 +106,16 @@ public class SettingsFragment extends Fragment {
         swLogToFile = view.findViewById(R.id.swLogToFile);
         etScanInterval = view.findViewById(R.id.etScanInterval);
         etHookDelay = view.findViewById(R.id.etHookDelay);
-        btnRestartService = view.findViewById(R.id.btnRestartService);
         btnClearCache = view.findViewById(R.id.btnClearCache);
         btnExportConfig = view.findViewById(R.id.btnExportConfig);
         tvVersion = view.findViewById(R.id.tvVersion);
         tvShizukuStatus = view.findViewById(R.id.tvShizukuStatus);
         tvServiceStatus = view.findViewById(R.id.tvServiceStatus);
-        tvHookedCount = view.findViewById(R.id.tvHookedCount);
 
-        tvVersion.setText("Post v2.0");
+        tvVersion.setText("v3.3");
     }
 
     private void setupListeners() {
-        btnRestartService.setOnClickListener(v -> restartService());
         btnClearCache.setOnClickListener(v -> clearCacheSafe());
         btnExportConfig.setOnClickListener(v -> exportConfig());
 
@@ -121,6 +123,10 @@ public class SettingsFragment extends Fragment {
         swDebugMode.setOnCheckedChangeListener(debugModeListener);
         swLogToFile.setOnCheckedChangeListener(logToFileListener);
     }
+
+    // ─────────────────────────────────────────────────────────────
+    // Boot receiver enable/disable
+    // ─────────────────────────────────────────────────────────────
 
     private void enableBootReceiver() {
         try {
@@ -132,6 +138,7 @@ public class SettingsFragment extends Fragment {
                 PackageManager.DONT_KILL_APP
             );
             prefs.edit().putBoolean("boot_receiver_enabled", true).apply();
+            logger.i("BootReceiver enabled");
         } catch (Exception e) {
             logger.e("Failed to enable boot receiver: " + e.getMessage());
         }
@@ -147,17 +154,46 @@ public class SettingsFragment extends Fragment {
                 PackageManager.DONT_KILL_APP
             );
             prefs.edit().putBoolean("boot_receiver_enabled", false).apply();
+            logger.i("BootReceiver disabled");
         } catch (Exception e) {
             logger.e("Failed to disable boot receiver: " + e.getMessage());
         }
     }
 
     /**
+     * If the user enables auto_start while the app is in the foreground,
+     * try to start the service right away. This is the one context where
+     * an FGS start is always allowed on Android 12+.
+     *
+     * Wrapped so a ForegroundServiceStartNotAllowedException (or any
+     * SecurityException on odd OEM ROMs) doesn't crash the app.
+     */
+    private void tryStartServiceNowIfForeground() {
+        if (!isAdded() || getContext() == null) return;
+        try {
+            Intent svc = new Intent(requireContext(), ShizuPosedService.class);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                requireContext().startForegroundService(svc);
+            } else {
+                requireContext().startService(svc);
+            }
+            logger.i("Service start requested from Settings toggle");
+        } catch (Throwable t) {
+            logger.w("Foreground start refused (will retry at boot): "
+                + t.getClass().getSimpleName() + ": " + t.getMessage());
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Settings load/save
+    // ─────────────────────────────────────────────────────────────
+
+    /**
      * Populate the switches from prefs WITHOUT firing their listeners.
-     * This is what stops "Logging to file enabled" from showing up
-     * every time the fragment becomes visible.
      */
     private void loadSettings() {
+        if (prefs == null) return;
+
         swAutoStart.setOnCheckedChangeListener(null);
         swDebugMode.setOnCheckedChangeListener(null);
         swLogToFile.setOnCheckedChangeListener(null);
@@ -178,12 +214,18 @@ public class SettingsFragment extends Fragment {
     }
 
     private void saveSetting(String key, boolean value) {
+        if (prefs == null) return;
         prefs.edit().putBoolean(key, value).apply();
     }
 
     private void saveSetting(String key, String value) {
+        if (prefs == null) return;
         prefs.edit().putString(key, value).apply();
     }
+
+    // ─────────────────────────────────────────────────────────────
+    // Status display
+    // ─────────────────────────────────────────────────────────────
 
     private void updateRealStatus() {
         if (!isAdded() || getContext() == null || getActivity() == null) return;
@@ -229,21 +271,12 @@ public class SettingsFragment extends Fragment {
                 tvServiceStatus.setText("❌ Stopped");
                 tvServiceStatus.setTextColor(requireContext().getColor(android.R.color.holo_red_light));
             }
-
-            int hookedCount = getHookedProcessCount();
-            tvHookedCount.setText(String.valueOf(hookedCount));
         });
     }
 
-    private int getHookedProcessCount() {
-        try {
-            ProcessMonitor pm = ProcessMonitor.getInstance(requireContext());
-            return pm != null ? pm.getHookedProcessCount() : 0;
-        } catch (Exception e) {
-            logger.e("getHookedProcessCount error: " + e.getMessage());
-            return 0;
-        }
-    }
+    // ─────────────────────────────────────────────────────────────
+    // Cache / export
+    // ─────────────────────────────────────────────────────────────
 
     private void clearCacheSafe() {
         new android.app.AlertDialog.Builder(requireContext())
@@ -316,23 +349,6 @@ public class SettingsFragment extends Fragment {
         return count;
     }
 
-    private void restartService() {
-        try {
-            Intent serviceIntent = new Intent(requireContext(), ShizuPosedService.class);
-            requireContext().stopService(serviceIntent);
-            requireContext().startForegroundService(serviceIntent);
-
-            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
-                this::updateRealStatus, 800);
-
-            Toast.makeText(requireContext(), "Service restarted", Toast.LENGTH_SHORT).show();
-            logger.i("Service restarted manually");
-        } catch (Exception e) {
-            Toast.makeText(requireContext(), "Failed to restart service", Toast.LENGTH_SHORT).show();
-            logger.e("Restart error: " + e.getMessage());
-        }
-    }
-
     private void exportConfig() {
         try {
             StringBuilder config = new StringBuilder();
@@ -345,7 +361,8 @@ public class SettingsFragment extends Fragment {
             config.append("log_to_file=").append(prefs.getBoolean("log_to_file", true)).append("\n");
             config.append("scan_interval=").append(prefs.getString("scan_interval", "1")).append("\n");
             config.append("hook_delay=").append(prefs.getString("hook_delay", "5")).append("\n");
-            config.append("boot_receiver_enabled=").append(prefs.getBoolean("boot_receiver_enabled", false)).append("\n");
+            config.append("boot_receiver_enabled=")
+                  .append(prefs.getBoolean("boot_receiver_enabled", false)).append("\n");
 
             String fileName = "shizuposed_config_"
                 + new java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.getDefault())
@@ -365,7 +382,6 @@ public class SettingsFragment extends Fragment {
     @Override
     public void onResume() {
         super.onResume();
-        // Re-sync switches without firing their listeners
         loadSettings();
         updateRealStatus();
     }

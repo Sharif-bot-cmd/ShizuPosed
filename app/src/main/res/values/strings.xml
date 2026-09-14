@@ -1,39 +1,39 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">ShizuPosed Manager</string>
+    <string name="app_name">ShizuPosed</string>
 
-    <!-- ═══════════════════════════════════════════════════════════
-         Navigation
-         ═══════════════════════════════════════════════════════════ -->
+    <!-- Navigation -->
     <string name="nav_home">Home</string>
     <string name="nav_modules">Modules</string>
+    <string name="nav_repo">Repo</string>
     <string name="nav_logs">Logs</string>
     <string name="nav_settings">Settings</string>
 
-    <!-- ═══════════════════════════════════════════════════════════
-         Home
-         ═══════════════════════════════════════════════════════════ -->
+    <!-- Home -->
     <string name="status">Status</string>
-    <string name="hooked_processes">Hooked Processes</string>
+    <string name="scoped_apps">Scoped Apps</string>
+    <string name="active_modules">Active Modules</string>
+    <string name="framework_version_label">Framework API</string>
+    <string name="framework_version_value">93 (LSPosed-compatible)</string>
+    <string name="tracked_processes">Tracked Processes</string>
     <string name="total_apps">Total Apps</string>
     <string name="refresh">Refresh</string>
     <string name="start_service">Start Service</string>
     <string name="service_running">Running</string>
     <string name="service_stopped">Stopped</string>
     <string name="status_no_shizuku">No Shizuku Permission</string>
-    <string name="status_running">Running ✅</string>
-    <string name="status_stopped">Stopped ⚠️</string>
+    <string name="status_running">Running [OK]</string>
+    <string name="status_stopped">Stopped [!]</string>
     <string name="refreshed">Refreshed</string>
-    <string name="service_starting">Service starting…</string>
+    <string name="service_starting">Service starting...</string>
     <string name="service_start_failed">Failed to start service</string>
     <string name="no_hooked_processes">No hooked processes</string>
 
-    <!-- ═══════════════════════════════════════════════════════════
-         Modules
-         ═══════════════════════════════════════════════════════════ -->
+    <!-- Modules -->
     <string name="modules">Modules</string>
-    <string name="search_modules">Search modules…</string>
+    <string name="search_modules">Search modules...</string>
     <string name="add_module">Add Module</string>
+    <string name="add_module_manual">Add Module (manual)</string>
     <string name="no_modules">No modules installed</string>
     <string name="module_details">Module Details</string>
     <string name="uninstall_module">Uninstall Module</string>
@@ -47,11 +47,24 @@
     <string name="module_add_failed">Failed to add module</string>
     <string name="modules_load_failed">Failed to load modules</string>
 
+    <!-- Repo tab -->
+    <string name="repo_title">Repository</string>
+    <string name="repo_not_implemented_title">Not yet implemented</string>
+    <string name="repo_not_implemented_message">The ShizuPosed module repository is not yet available.&#10;&#10;When it ships, this tab will let you browse, install, and update Xposed modules directly from the manager, similar to the LSPosed Repo tab.&#10;&#10;For now, install modules via the Modules tab or enable the ones you already have on your device.</string>
+    <string name="repo_coming_soon">Coming in a future release</string>
+
+    <!-- Auto-detect -->
+    <string name="modules_detected_one">1 new module detected</string>
+    <string name="modules_detected_many">%1$d new modules detected</string>
+    <string name="module_scan_failed">Module scan failed</string>
+    <string name="module_no_ui">Module has no UI</string>
+    <string name="module_open_failed">Failed to open module</string>
+
     <!-- Module details dialog -->
-    <string name="module_detail_launch_button">Launch App under ShizuPosed…</string>
+    <string name="module_detail_launch_button">Launch App under ShizuPosed...</string>
     <string name="module_detail_launch_picker_title">Launch under ShizuPosed</string>
-    <string name="module_detail_launch_no_apps">No apps selected for this module — pick some first</string>
-    <string name="module_detail_launch_started">Launching %1$s under ShizuPosed…</string>
+    <string name="module_detail_launch_no_apps">No apps selected for this module - pick some first</string>
+    <string name="module_detail_launch_started">Launching %1$s under ShizuPosed...</string>
     <string name="module_detail_launch_failed">Failed to launch: %1$s</string>
     <string name="module_detail_shizuku_unavailable">Shizuku not available or not authorized</string>
     <string name="module_detail_label_version">Version:</string>
@@ -59,21 +72,19 @@
     <string name="module_detail_label_status">Status:</string>
     <string name="module_detail_label_description">Description:</string>
     <string name="module_detail_label_hooked_apps">Hooked Apps:</string>
-    <string name="module_detail_status_enabled">✅ Enabled</string>
-    <string name="module_detail_status_disabled">❌ Disabled</string>
+    <string name="module_detail_status_enabled">[OK] Enabled</string>
+    <string name="module_detail_status_disabled">[X] Disabled</string>
     <string name="module_detail_entry_auto">Auto-detect</string>
     <string name="module_detail_description_missing">No description available</string>
     <string name="module_detail_hooked_apps_all_suffix"> (All Apps)</string>
 
-    <!-- ═══════════════════════════════════════════════════════════
-         Add Module dialog
-         ═══════════════════════════════════════════════════════════ -->
+    <!-- Add Module dialog -->
     <string name="add_module_title">Add Module</string>
     <string name="add_module_hint_package">Package name (com.example.module)</string>
     <string name="add_module_hint_name">Module name</string>
     <string name="add_module_hint_entry">Entry point (e.g. com.example.MainHook)</string>
     <string name="add_module_auto_detect">Auto-detect entry point</string>
-    <string name="add_module_browse">Browse APK…</string>
+    <string name="add_module_browse">Browse APK...</string>
     <string name="add_module_no_file">No file selected</string>
     <string name="add_module_file_selected">Selected: %1$s</string>
     <string name="add_module_package_required">Package name is required</string>
@@ -84,11 +95,9 @@
     <string name="add_module_no_file_selected">No file selected</string>
     <string name="add_module_action">Add</string>
 
-    <!-- ═══════════════════════════════════════════════════════════
-         Select Apps dialog
-         ═══════════════════════════════════════════════════════════ -->
+    <!-- Select Apps dialog -->
     <string name="select_apps_title">Select Apps for %1$s</string>
-    <string name="select_apps_search_hint">Search apps…</string>
+    <string name="select_apps_search_hint">Search apps...</string>
     <string name="select_apps_select_all">Select All</string>
     <string name="select_apps_clear_all">Clear All</string>
     <string name="select_apps_select_system">Select System</string>
@@ -97,11 +106,9 @@
     <string name="select_apps_count_one">1 app selected</string>
     <string name="select_apps_count_many">%1$d apps selected</string>
 
-    <!-- ═══════════════════════════════════════════════════════════
-         Logs
-         ═══════════════════════════════════════════════════════════ -->
+    <!-- Logs -->
     <string name="logs">Logs</string>
-    <string name="search_logs">Search logs…</string>
+    <string name="search_logs">Search logs...</string>
     <string name="clear_logs">Clear Logs</string>
     <string name="export_logs">Export Logs</string>
     <string name="no_logs">No logs available</string>
@@ -112,9 +119,7 @@
     <string name="logs_exported_to">Logs exported to %1$s</string>
     <string name="no_matching_logs">No matching logs</string>
 
-    <!-- ═══════════════════════════════════════════════════════════
-         Settings
-         ═══════════════════════════════════════════════════════════ -->
+    <!-- Settings -->
     <string name="settings">Settings</string>
     <string name="auto_start">Auto Start</string>
     <string name="auto_start_desc">Start service on boot</string>
@@ -136,28 +141,26 @@
     <string name="shizuku_status">Shizuku</string>
     <string name="service_status">Service</string>
     <string name="hooked_count">Hooked</string>
-    <string name="settings_version">Post v1.8</string>
+    <string name="settings_version">Post v2.2</string>
     <string name="service_restarted">Service restarted</string>
     <string name="service_restart_failed">Failed to restart service</string>
-    <string name="clearing_cache">Clearing cache…</string>
+    <string name="clearing_cache">Clearing cache...</string>
     <string name="cache_cleared">Cache cleared (%1$d files removed)</string>
     <string name="cache_clear_failed">Error clearing cache: %1$s</string>
     <string name="config_exported">Config exported: %1$s</string>
     <string name="config_export_failed">Failed to export config</string>
 
     <!-- Settings status labels -->
-    <string name="settings_shizuku_sui_active">✅ Sui Active (Root)</string>
-    <string name="settings_shizuku_authorized">✅ Authorized (v%1$d)</string>
-    <string name="settings_shizuku_available_unauthorized">⚠️ Available - Not Authorized</string>
-    <string name="settings_shizuku_not_installed">❌ Not Installed</string>
-    <string name="settings_shizuku_not_running">⚠️ Installed - Not Running</string>
-    <string name="settings_shizuku_not_available">❌ Not Available</string>
-    <string name="settings_service_running">✅ Running</string>
-    <string name="settings_service_stopped">❌ Stopped</string>
+    <string name="settings_shizuku_sui_active">[OK] Sui Active (Root)</string>
+    <string name="settings_shizuku_authorized">[OK] Authorized (v%1$d)</string>
+    <string name="settings_shizuku_available_unauthorized">[!] Available - Not Authorized</string>
+    <string name="settings_shizuku_not_installed">[X] Not Installed</string>
+    <string name="settings_shizuku_not_running">[!] Installed - Not Running</string>
+    <string name="settings_shizuku_not_available">[X] Not Available</string>
+    <string name="settings_service_running">[OK] Running</string>
+    <string name="settings_service_stopped">[X] Stopped</string>
 
-    <!-- ═══════════════════════════════════════════════════════════
-         Shizuku permission flow
-         ═══════════════════════════════════════════════════════════ -->
+    <!-- Shizuku permission flow -->
     <string name="shizuku_available">Available</string>
     <string name="shizuku_unavailable">Unavailable</string>
     <string name="shizuku_authorized">Authorized</string>
@@ -166,9 +169,7 @@
     <string name="shizuku_permission_required">Shizuku permission required for privileged operations</string>
     <string name="shizuku_grant_toast">Please grant permission in Shizuku app</string>
 
-    <!-- ═══════════════════════════════════════════════════════════
-         Generic actions / results
-         ═══════════════════════════════════════════════════════════ -->
+    <!-- Generic -->
     <string name="error">Error</string>
     <string name="success">Success</string>
     <string name="failed">Failed</string>
@@ -181,13 +182,8 @@
     <string name="uninstall">Uninstall</string>
     <string name="clear">Clear</string>
 
-    <!-- ═══════════════════════════════════════════════════════════
-         Deprecated (chips removed from Modules and Logs layouts).
-         Kept here so existing translations don't fail lint.
-         Remove once you're sure nothing references them.
-         ═══════════════════════════════════════════════════════════ -->
+    <!-- Deprecated -->
     <string name="filter_all" translatable="false">All</string>
     <string name="filter_enabled" translatable="false">Enabled</string>
     <string name="filter_disabled" translatable="false">Disabled</string>
-
 </resources>
