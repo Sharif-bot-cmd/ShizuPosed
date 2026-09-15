@@ -4,7 +4,7 @@
 
 ShizuPosed runs Xposed-API modules in apps that are launched through it, without root, without bootloader unlock, and without modifying the system partition. It uses Shizuku to invoke `app_process` as the shell UID, bootstraps a Java runtime inside the target's process, installs method hooks through a multi-backend dispatcher, and exposes the standard `de.robv.android.xposed.*` API so modules written for LSPosed and classic Xposed keep working.
 
-Version 3.7.
+Version 3.8.
 
 ---
 
