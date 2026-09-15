@@ -9,10 +9,15 @@ import android.os.Process;
 import com.shizuposed.manager.core.compat.AndroidCompat;
 import com.shizuposed.manager.core.compat.HiddenApiBypass;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -25,6 +30,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 import dalvik.system.DexClassLoader;
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -53,12 +60,6 @@ public class XposedHook {
 
     private static final Map<String, Object> moduleInstances = new ConcurrentHashMap<>();
 
-    /**
-     * Package names of every module that successfully ran
-     * handleLoadPackage in this process. Written into the hooked
-     * marker file so the manager can answer
-     * LSPosedManager.isModuleActive(...) from a different process.
-     */
     private static final List<String> loadedModuleNames = new ArrayList<>();
 
     // ─── data holder ──────────────────────────────────────────────────
@@ -83,8 +84,6 @@ public class XposedHook {
             myPid = Process.myPid();
             myUid = Process.myUid();
 
-            // Reset per-process state in case the JVM is reused (rare,
-            // but some ROMs recycle the app_process).
             synchronized (loadedModuleNames) {
                 loadedModuleNames.clear();
             }
@@ -754,9 +753,9 @@ public class XposedHook {
      * answer LSPosedManager.isModuleActive(...) queries from a
      * module's own UI process.
      *
-     * The marker includes the list of module package names that
-     * actually ran handleLoadPackage — that's what tells the manager
-     * "module X has loaded into package Y at least once".
+     * Uses org.json so the writer and the reader agree on the
+     * schema, and so that module package names containing characters
+     * that need escaping are handled correctly.
      */
     private static void writeHookedMarker(String pkg, int modulesLoaded, String mode) {
         try {
@@ -765,25 +764,23 @@ public class XposedHook {
 
             File f = new File(dir, pkg + ".json");
 
-            // Build the module list JSON array
-            StringBuilder list = new StringBuilder("[");
+            JSONArray list = new JSONArray();
             synchronized (loadedModuleNames) {
-                for (int i = 0; i < loadedModuleNames.size(); i++) {
-                    if (i > 0) list.append(",");
-                    list.append("\"").append(escapeJson(loadedModuleNames.get(i))).append("\"");
+                for (String name : loadedModuleNames) {
+                    if (name != null) list.put(name);
                 }
             }
-            list.append("]");
 
-            String json = "{"
-                + "\"pkg\":\"" + escapeJson(pkg) + "\","
-                + "\"pid\":" + myPid + ","
-                + "\"uid\":" + myUid + ","
-                + "\"modules\":" + modulesLoaded + ","
-                + "\"mode\":\"" + escapeJson(mode) + "\","
-                + "\"ts\":" + System.currentTimeMillis() + ","
-                + "\"moduleList\":" + list
-                + "}";
+            JSONObject obj = new JSONObject();
+            obj.put("pkg", pkg);
+            obj.put("pid", myPid);
+            obj.put("uid", myUid);
+            obj.put("modules", modulesLoaded);
+            obj.put("mode", mode == null ? "" : mode);
+            obj.put("ts", System.currentTimeMillis());
+            obj.put("moduleList", list);
+
+            String json = obj.toString();
 
             try (FileWriter w = new FileWriter(f, false)) {
                 w.write(json);
@@ -796,11 +793,6 @@ public class XposedHook {
         } catch (Throwable t) {
             log("writeHookedMarker failed: " + t.getMessage());
         }
-    }
-
-    private static String escapeJson(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -871,7 +863,7 @@ public class XposedHook {
             if (app != null && app.getCacheDir() != null) {
                 optDir = app.getCacheDir().getAbsolutePath();
             } else {
-                optDir = "/data/local/tmp/pine-opt";
+                optDir = BASE_DIR + "/dexopt/" + info.packageName;
                 new File(optDir).mkdirs();
             }
 
@@ -882,6 +874,9 @@ public class XposedHook {
                 appLoader);
 
             String entry = info.xposedInit;
+            if (entry == null || entry.isEmpty()) {
+                entry = readXposedInitFromZip(info.cachedDexPath);
+            }
             if (entry == null || entry.isEmpty()) {
                 entry = guessEntryPoint(loader, info.packageName);
             }
@@ -921,7 +916,6 @@ public class XposedHook {
             if (handled) {
                 moduleInstances.put(info.packageName, instance);
 
-                // Track this module name for the hooked marker
                 synchronized (loadedModuleNames) {
                     if (!loadedModuleNames.contains(info.packageName)) {
                         loadedModuleNames.add(info.packageName);
@@ -941,6 +935,32 @@ public class XposedHook {
             t.printStackTrace();
             return false;
         }
+    }
+
+    /**
+     * Read assets/xposed_init from the module's cached APK. This is
+     * the standard Xposed entry-point declaration. Handles modules
+     * whose entry class is not one of the eight conventionally-named
+     * candidates in guessEntryPoint().
+     */
+    private static String readXposedInitFromZip(String dexPath) {
+        if (dexPath == null) return null;
+        File f = new File(dexPath);
+        if (!f.exists()) return null;
+        try (ZipFile zip = new ZipFile(f)) {
+            ZipEntry entry = zip.getEntry("assets/xposed_init");
+            if (entry == null) return null;
+            try (InputStream is = zip.getInputStream(entry);
+                 BufferedReader r = new BufferedReader(new InputStreamReader(is))) {
+                String line = r.readLine();
+                if (line != null && !line.isEmpty()) {
+                    return line.trim();
+                }
+            }
+        } catch (Throwable t) {
+            log("readXposedInitFromZip(" + dexPath + ") failed: " + t.getMessage());
+        }
+        return null;
     }
 
     private static void tryEnableModuleDebug(Class<?> moduleClass) {
@@ -1063,45 +1083,30 @@ public class XposedHook {
 
     private static ModuleInfo parseModule(String json) {
         try {
+            JSONObject o = new JSONObject(json);
             ModuleInfo i = new ModuleInfo();
-            i.packageName   = jval(json, "packageName");
-            i.name          = jval(json, "name");
-            i.xposedInit    = jval(json, "xposedInit");
-            i.cachedDexPath = jval(json, "cachedDexPath");
-            i.enabled       = "true".equals(jval(json, "enabled"));
-            i.hookAllApps   = "true".equals(jval(json, "hookAllApps"));
-            i.hookSystemApps= "true".equals(jval(json, "hookSystemApps"));
+            i.packageName    = o.optString("packageName", null);
+            i.name           = o.optString("name", null);
+            i.xposedInit     = o.optString("xposedInit", null);
+            i.cachedDexPath  = o.optString("cachedDexPath", null);
+            i.enabled        = o.optBoolean("enabled", false);
+            i.hookAllApps    = o.optBoolean("hookAllApps", false);
+            i.hookSystemApps = o.optBoolean("hookSystemApps", false);
 
-            String apps = jval(json, "hookedApps");
-            if (apps != null && !apps.isEmpty() && !"null".equals(apps)) {
-                apps = apps.replace("[", " ").replace("]", " ").replace("\"", "");
-                for (String a : apps.split(",")) {
-                    String t = a.trim();
-                    if (!t.isEmpty()) i.hookedApps.add(t);
+            JSONArray apps = o.optJSONArray("hookedApps");
+            if (apps != null) {
+                for (int k = 0; k < apps.length(); k++) {
+                    String a = apps.optString(k, null);
+                    if (a != null && !a.isEmpty()) i.hookedApps.add(a);
                 }
             }
+
+            if (i.packageName == null || i.packageName.isEmpty()) return null;
             return i;
         } catch (Throwable t) {
+            log("parseModule failed: " + t.getMessage());
             return null;
         }
-    }
-
-    private static String jval(String json, String key) {
-        String needle = "\"" + key + "\":";
-        int s = json.indexOf(needle);
-        if (s < 0) return "";
-        s += needle.length();
-        while (s < json.length() && Character.isWhitespace(json.charAt(s))) s++;
-        if (s >= json.length()) return "";
-        char first = json.charAt(s);
-        if (first == '"') {
-            int e = json.indexOf('"', s + 1);
-            return e < 0 ? "" : json.substring(s + 1, e);
-        }
-        int e = json.indexOf(',', s);
-        if (e < 0) e = json.indexOf('}', s);
-        if (e < 0) return "";
-        return json.substring(s, e).trim();
     }
 
     // ═════════════════════════════════════════════════════════════════

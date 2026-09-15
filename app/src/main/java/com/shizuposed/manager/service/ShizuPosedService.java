@@ -32,24 +32,30 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Foreground service that owns the ShizuPosed lifecycle.
  *
- * Responsibilities:
- *   - Stay foreground so Android doesn't kill us mid-hook.
- *   - Stage XposedHook.dex locally, then deploy it to the shell-writable
- *     directory via Shizuku.
- *   - Push module descriptors to the same directory.
- *   - Launch target apps under app_process so the hook framework runs
- *     in-process.
+ * FGS CONTRACT
+ * ------------
+ * Android requires that any service started via
+ * Context.startForegroundService() calls Service.startForeground()
+ * within 5 seconds, on the main thread, or the process is killed
+ * with ForegroundServiceDidNotStartInTimeException.
  *
- * Threading:
- *   All non-foreground work happens on a single background HandlerThread.
- *   The main thread only ever calls startForeground() and dispatches
- *   Intents to the worker. This is what keeps us under the 5-second
- *   foreground timer.
+ * This service therefore calls startForeground() as the very first
+ * statement in onCreate(), before any logging, authorization check,
+ * binder lookup, or file I/O. Everything else — including the
+ * authorization gate and stopSelf() — happens after the FGS
+ * contract is satisfied.
  *
- * Shizuku state:
- *   ShizukuHelper owns the binder listeners. This service only reads
- *   isAvailable() / isAuthorized() and reacts to onShizukuAuthorized()
- *   calls from the Application.
+ * AUTHORIZATION CONTRACT
+ * ----------------------
+ * The service refuses to do work without an authorized
+ * Shizuku/Sui, but it does NOT refuse to be a foreground service.
+ * If Shizuku is not authorized at start, the service stops itself
+ * gracefully after having briefly satisfied the FGS contract.
+ *
+ * onShizukuAuthorized() is idempotent per grant lifecycle: three
+ * different callers (the ACTION intent, setShizuPosedService, and
+ * ProcessMonitor) all fire it during startup, but only the first
+ * one does the work.
  */
 public class ShizuPosedService extends Service {
     private static final String CHANNEL_ID = "shizuposed_service";
@@ -67,6 +73,12 @@ public class ShizuPosedService extends Service {
     private static final String SHELL_CACHE_DIR   = SHELL_FILES_DIR + "/.syscall_cache";
     private static final String SHELL_MODULES_DIR = SHELL_CACHE_DIR + "/modules";
     private static final String SHELL_HOOKED_DIR  = SHELL_CACHE_DIR + "/hooked";
+
+    /**
+     * When true, the service refuses to do work without an authorized
+     * Shizuku. The FGS notification is still posted first.
+     */
+    private static final boolean REQUIRE_AUTHORIZATION = true;
 
     private String localStagingDexPath;
     private String localStagingModulesDir;
@@ -86,6 +98,30 @@ public class ShizuPosedService extends Service {
     private final AtomicBoolean xposedHookStarted = new AtomicBoolean(false);
     private final AtomicBoolean dexDeployed = new AtomicBoolean(false);
 
+    /** Re-entry guard so three callers to onShizukuAuthorized() collapse
+     *  to one dispatch per grant lifecycle. Reset on binder death via
+     *  the Application, and here on service destroy. */
+    private final AtomicBoolean onAuthorizedDispatched = new AtomicBoolean(false);
+
+    /** Set to true once startForeground() has succeeded at least once. */
+    private final AtomicBoolean foregroundStarted = new AtomicBoolean(false);
+
+    // ═════════════════════════════════════════════════════════════
+    // AUTHORIZATION GATE
+    // ═════════════════════════════════════════════════════════════
+
+    private boolean isAuthorizedNow() {
+        try {
+            ShizukuHelper helper = ShizukuHelper.getInstance(this);
+            return helper.isAvailable() && helper.isAuthorized();
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.e("isAuthorizedNow failed: " + t.getMessage());
+            }
+            return false;
+        }
+    }
+
     // ═════════════════════════════════════════════════════════════
     // LIFECYCLE
     // ═════════════════════════════════════════════════════════════
@@ -95,14 +131,51 @@ public class ShizuPosedService extends Service {
         super.onCreate();
         isServiceRunning = true;
 
-        // 1. Notification channel before startForeground on O+.
+        // ═══════════════════════════════════════════════════════════
+        // STEP 1 — FGS CONTRACT
+        //
+        // The notification channel MUST exist before startForeground()
+        // is called. createNotificationChannel() is fast (a binder
+        // call to the NotificationManagerService) and is safe to do
+        // first. After that, startForeground() runs immediately so
+        // the 5-second window is satisfied before any slow work.
+        // ═══════════════════════════════════════════════════════════
+
         createNotificationChannel();
 
-        // 2. Foreground IMMEDIATELY. Nothing slow before this.
-        startForeground(NOTIFICATION_ID, buildNotification("Service starting"));
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification("Service starting"));
+            foregroundStarted.set(true);
+        } catch (Throwable t) {
+            // If startForeground itself throws, there is nothing
+            // useful left to do — the process will be killed by the
+            // platform. Log via logcat directly since Logger may not
+            // be ready yet.
+            android.util.Log.e("ShizuPosedService",
+                "startForeground failed in onCreate", t);
+            isServiceRunning = false;
+            stopSelf();
+            return;
+        }
 
-        // 3. Slow init off the main thread.
+        // ═══════════════════════════════════════════════════════════
+        // STEP 2 — Everything else, now that the FGS contract is met.
+        // ═══════════════════════════════════════════════════════════
+
         logger = Logger.getInstance(this);
+
+        // ── Authorization gate ─────────────────────────────────────
+        // If Shizuku is not authorized, stop gracefully. The FGS
+        // notification is already posted, so the platform is happy;
+        // stopping now just tears the service down cleanly.
+        if (REQUIRE_AUTHORIZATION && !isAuthorizedNow()) {
+            logger.w("⛔ ShizuPosedService.onCreate: Shizuku not authorized — "
+                    + "stopping self (FGS contract already satisfied).");
+            isServiceRunning = false;
+            stopSelf();
+            return;
+        }
+
         logger.i("🚀 ShizuPosedService creating...");
 
         workerThread = new HandlerThread("ShizuPosedWorker",
@@ -143,15 +216,47 @@ public class ShizuPosedService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // ═══════════════════════════════════════════════════════════
+        // FGS CONTRACT — re-assert on every start.
+        //
+        // onCreate() already called startForeground() on the first
+        // start, but on subsequent startForegroundService() calls
+        // (e.g. from ACTION_SHIZUKU_AUTHORIZED) Android re-checks the
+        // 5-second window. Calling startForeground() again is a cheap
+        // no-op when already foregrounded and satisfies the contract
+        // when the service was restarted.
+        // ═══════════════════════════════════════════════════════════
+
+        try {
+            startForeground(NOTIFICATION_ID, buildNotification("Service running"));
+            foregroundStarted.set(true);
+        } catch (Throwable t) {
+            android.util.Log.e("ShizuPosedService",
+                "startForeground failed in onStartCommand", t);
+            // Fall through — the platform will kill us if it must,
+            // but we try to keep the process alive so the caller
+            // (Application) isn't taken down with us.
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // AUTHORIZATION GATE — after the FGS contract, not before.
+        // ═══════════════════════════════════════════════════════════
+
+        if (REQUIRE_AUTHORIZATION && !isAuthorizedNow()) {
+            if (logger != null) {
+                logger.w("⛔ onStartCommand: not authorized — stopping self");
+            }
+            isServiceRunning = false;
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+
         isServiceRunning = true;
 
-        // Re-assert foreground on every entry. This is safe because
-        // we already called startForeground in onCreate — this is a
-        // cheap re-post, not a new 5-second timer.
-        startForeground(NOTIFICATION_ID, buildNotification("Service running"));
-
         if (workerHandler == null) {
-            // Very early re-entry; onCreate's worker will handle it.
+            // onCreate's worker thread setup is still in progress or
+            // failed. Returning START_STICKY lets the system re-deliver
+            // the intent later if it wants to.
             return START_STICKY;
         }
 
@@ -190,14 +295,29 @@ public class ShizuPosedService extends Service {
 
     @Override
     public void onDestroy() {
-        logger.i("ShizuPosedService destroying...");
+        if (logger != null) logger.i("ShizuPosedService destroying...");
         isRunning.set(false);
         isServiceRunning = false;
         if (processMonitor != null) processMonitor.stopMonitoring();
         if (workerThread != null) workerThread.quitSafely();
+
+        // Only remove the notification if we actually posted one.
+        // Calling stopForeground() on a service that never called
+        // startForeground() is harmless but logs a warning on some
+        // ROMs, so guard it.
+        if (foregroundStarted.getAndSet(false)) {
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE);
+            } catch (Throwable ignored) {}
+        }
+
+        onAuthorizedDispatched.set(false);
+
         try {
-            stopForeground(STOP_FOREGROUND_REMOVE);
+            ShizuPosedManagerApp app = ShizuPosedManagerApp.getInstance();
+            if (app != null) app.onServiceDestroyed();
         } catch (Throwable ignored) {}
+
         super.onDestroy();
     }
 
@@ -231,6 +351,11 @@ public class ShizuPosedService extends Service {
     }
 
     private void updateNotification(String status) {
+        // Only try to update if we're actually in the foreground.
+        // On some ROMs, notify() on a NOTIFICATION_ID that was never
+        // posted as foreground is dropped silently anyway, but the
+        // guard avoids the call.
+        if (!foregroundStarted.get()) return;
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (manager != null) manager.notify(NOTIFICATION_ID, buildNotification(status));
     }
@@ -465,9 +590,6 @@ public class ShizuPosedService extends Service {
             xposedHookStarted.set(false);
             return;
         }
-        // Push once. launchAppUnderShizuPosed will push again if the
-        // module set has changed since the last push, but it will not
-        // double-push on every launch.
         if (!pushModulesToShellDir(moduleLoader.loadModules())) {
             logger.w("⚠️ No modules pushed to shell dir (nothing will hook)");
         }
@@ -477,18 +599,38 @@ public class ShizuPosedService extends Service {
     }
 
     /**
-     * Called by the Application when Shizuku authorization is granted.
-     * Safe to call multiple times; ensures dex + module push happen
-     * exactly once per authorization lifecycle.
+     * Called by the Application when Shizuku authorization is granted,
+     * and by the ACTION_SHIZUKU_AUTHORIZED intent, and by
+     * setShizuPosedService. Idempotent per grant lifecycle: only the
+     * first caller does the work. Reset by onDestroy and by the
+     * Application on binder death.
      */
     public void onShizukuAuthorized() {
+        if (!onAuthorizedDispatched.compareAndSet(false, true)) {
+            if (logger != null) logger.d("onShizukuAuthorized() already dispatched — skipping");
+            return;
+        }
         logger.i("📢 onShizukuAuthorized() — deploying now");
-        if (workerHandler == null) return;
+        if (workerHandler == null) {
+            onAuthorizedDispatched.set(false);
+            return;
+        }
         workerHandler.post(() -> {
-            if (ensureDexReady()) {
-                prepareXposedHook();
+            try {
+                if (ensureDexReady()) {
+                    prepareXposedHook();
+                }
+            } catch (Throwable t) {
+                logger.e("onShizukuAuthorized worker failed: " + t.getMessage());
+                onAuthorizedDispatched.set(false);
             }
         });
+    }
+
+    /** Called by the Application on binder death so the next grant can
+     *  re-trigger a full deploy. */
+    public void resetAuthorizedDispatch() {
+        onAuthorizedDispatched.set(false);
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -505,11 +647,6 @@ public class ShizuPosedService extends Service {
             return false;
         }
 
-        // Push once per launch. If the module set is unchanged since the
-        // last push, pushModulesToShellDir will still copy files (cheap,
-        // a few hundred bytes each) and return true. That's simpler than
-        // tracking a "dirty" flag, and the copy is sub-millisecond per
-        // module.
         pushModulesToShellDir(moduleLoader.loadModules());
 
         String binary = shizukuHelper.getAppProcessBinary();
@@ -562,10 +699,6 @@ public class ShizuPosedService extends Service {
         }
     }
 
-    /**
-     * Not supported without root. Kept as a stub so callers get a clear
-     * "no" instead of a crash, and the log explains why.
-     */
     public boolean injectProcess(String packageName, int pid, int uid,
                                  List<ModuleInfo> modules) {
         logger.i("📥 injectProcess(" + packageName + ", pid=" + pid

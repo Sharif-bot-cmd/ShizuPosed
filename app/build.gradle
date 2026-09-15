@@ -22,7 +22,7 @@ android {
         minSdk 29
         targetSdk 37
         versionCode 17
-        versionName "3.3"
+        versionName "R-3.8"
 
         ndk {
             // Only arm64 is supported by libshizuposed.so. Shipping other
