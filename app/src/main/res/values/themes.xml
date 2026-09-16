@@ -37,8 +37,8 @@
          Reference this from your Toolbar/theme overlay usage as
          @style/ThemeOverlay.ShizuPosedManager.ActionBar -->
     <style name="ThemeOverlay.ShizuPosedManager.ActionBar" parent="ThemeOverlay.Material3.ActionBar">
-        <item name="android:textColorPrimary">@color/md_theme_light_onPrimary</item>
-        <item name="actionMenuTextColor">@color/md_theme_light_onPrimary</item>
+        <item name="android:textColorPrimary">@color/md_theme_light_onPrimaryContainer</item>
+        <item name="actionMenuTextColor">@color/md_theme_light_onPrimaryContainer</item>
     </style>
 
     <!-- Activity animation -->
