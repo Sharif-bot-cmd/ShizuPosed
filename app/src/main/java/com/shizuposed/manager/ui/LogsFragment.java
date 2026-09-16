@@ -31,8 +31,8 @@ public class LogsFragment extends Fragment {
     private RecyclerView logRecyclerView;
     private ProgressBar progressIndicator;
     private EditText etSearchLogs;
-    private Button btnRefresh;
-    private FloatingActionButton fabClearLogs, fabExportLogs;
+    private Button btnRefresh, btnClearLogs;
+    private FloatingActionButton fabExportLogs;
     private TextView tvEmptyState;
 
     private Logger logger;
@@ -74,7 +74,7 @@ public class LogsFragment extends Fragment {
         progressIndicator = null;
         etSearchLogs = null;
         btnRefresh = null;
-        fabClearLogs = null;
+        btnClearLogs = null;
         fabExportLogs = null;
         tvEmptyState = null;
     }
@@ -84,7 +84,7 @@ public class LogsFragment extends Fragment {
         progressIndicator = view.findViewById(R.id.progressIndicator);
         etSearchLogs = view.findViewById(R.id.etSearchLogs);
         btnRefresh = view.findViewById(R.id.btnRefresh);
-        fabClearLogs = view.findViewById(R.id.fabClearLogs);
+        btnClearLogs = view.findViewById(R.id.btnClearLogs);
         fabExportLogs = view.findViewById(R.id.fabExportLogs);
         tvEmptyState = view.findViewById(R.id.tvEmptyState);
     }
@@ -98,7 +98,7 @@ public class LogsFragment extends Fragment {
 
     private void setupListeners() {
         if (btnRefresh != null) btnRefresh.setOnClickListener(v -> loadLogs());
-        if (fabClearLogs != null) fabClearLogs.setOnClickListener(v -> clearLogs());
+        if (btnClearLogs != null) btnClearLogs.setOnClickListener(v -> clearLogs());
         if (fabExportLogs != null) fabExportLogs.setOnClickListener(v -> exportLogs());
         if (etSearchLogs != null) {
             etSearchLogs.setOnEditorActionListener((v, actionId, event) -> {

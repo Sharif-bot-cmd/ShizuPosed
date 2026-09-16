@@ -19,16 +19,35 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
-    <!-- Refresh button (full width) -->
-    <Button
-        android:id="@+id/btnRefresh"
+    <!-- Log actions -->
+    <LinearLayout
+        android:id="@+id/logActions"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"
-        android:text="Refresh"
+        android:orientation="horizontal"
         app:layout_constraintTop_toBottomOf="@id/etSearchLogs"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent" />
+        app:layout_constraintEnd_toEndOf="parent">
+
+        <Button
+            android:id="@+id/btnRefresh"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Refresh"
+            style="@style/Widget.Material3.Button.OutlinedButton" />
+
+        <Button
+            android:id="@+id/btnClearLogs"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:text="Clear logs"
+            android:textColor="?attr/colorError"
+            style="@style/Widget.Material3.Button.TextButton" />
+    </LinearLayout>
 
     <!-- Progress indicator -->
     <ProgressBar
@@ -37,7 +56,7 @@
         android:layout_height="4dp"
         android:visibility="gone"
         android:progressTint="?attr/colorPrimary"
-        app:layout_constraintTop_toBottomOf="@id/btnRefresh"
+        app:layout_constraintTop_toBottomOf="@id/logActions"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
@@ -66,19 +85,7 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
-    <!-- FABs -->
-    <com.google.android.material.floatingactionbutton.FloatingActionButton
-        android:id="@+id/fabClearLogs"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_margin="8dp"
-        android:src="@android:drawable/ic_menu_delete"
-        app:backgroundTint="?attr/colorError"
-        app:tint="?attr/colorOnPrimary"
-        app:fabSize="mini"
-        app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintEnd_toEndOf="parent" />
-
+    <!-- Share action -->
     <com.google.android.material.floatingactionbutton.FloatingActionButton
         android:id="@+id/fabExportLogs"
         android:layout_width="wrap_content"
