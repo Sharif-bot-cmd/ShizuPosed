@@ -62,12 +62,6 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
             holder.ivIcon.setImageResource(R.drawable.ic_module);
         }
 
-        holder.indicatorStatus.setBackgroundResource(
-            module.enabled
-                ? R.drawable.status_indicator_enabled
-                : R.drawable.status_indicator_disabled
-        );
-
         holder.tvName.setText(module.name != null ? module.name : module.packageName);
         holder.tvPackage.setText(module.packageName);
 
@@ -119,7 +113,6 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
     }
 
     static class ModuleViewHolder extends RecyclerView.ViewHolder {
-        View indicatorStatus;
         ImageView ivIcon;
         TextView tvName, tvPackage, tvVersion, tvEntry, tvHookedApps;
         Switch swEnabled;
@@ -127,7 +120,6 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
 
         ModuleViewHolder(@NonNull View itemView) {
             super(itemView);
-            indicatorStatus = itemView.findViewById(R.id.indicatorStatus);
             ivIcon = itemView.findViewById(R.id.ivIcon);
             tvName = itemView.findViewById(R.id.tvName);
             tvPackage = itemView.findViewById(R.id.tvPackage);

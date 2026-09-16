@@ -15,20 +15,12 @@
         android:orientation="vertical"
         android:padding="12dp">
 
-        <!-- Top row: Indicator, Icon, Name, Switch -->
+        <!-- Top row: Icon, Name, Switch -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
             android:gravity="center_vertical">
-
-            <!-- Status Indicator -->
-            <View
-                android:id="@+id/indicatorStatus"
-                android:layout_width="10dp"
-                android:layout_height="10dp"
-                android:background="@drawable/status_indicator_disabled"
-                android:layout_marginEnd="12dp" />
 
             <!-- App Icon -->
             <ImageView
