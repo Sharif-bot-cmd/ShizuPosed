@@ -332,17 +332,17 @@ public class HomeFragment extends Fragment {
 
         if (!shizukuAuthorized) {
             tvStatus.setText("No Shizuku Permission");
-            setStatusCardColors(com.google.android.material.R.attr.colorErrorContainer,
+            setStatusCardColors(com.google.android.material.R.attr.colorSurfaceVariant,
                 com.google.android.material.R.attr.colorOnErrorContainer);
             btnStartService.setEnabled(false);
         } else if (serviceRunning) {
             tvStatus.setText("Running ✅");
-            setStatusCardColors(com.google.android.material.R.attr.colorSecondaryContainer,
+            setStatusCardColors(com.google.android.material.R.attr.colorSurfaceVariant,
                 com.google.android.material.R.attr.colorOnSecondaryContainer);
             btnStartService.setEnabled(false);
         } else {
             tvStatus.setText("Stopped ⚠️");
-            setStatusCardColors(com.google.android.material.R.attr.colorPrimaryContainer,
+            setStatusCardColors(com.google.android.material.R.attr.colorSurfaceVariant,
                 com.google.android.material.R.attr.colorOnPrimaryContainer);
             btnStartService.setEnabled(true);
         }
