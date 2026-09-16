@@ -23,8 +23,10 @@ import androidx.fragment.app.Fragment;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
+import com.google.android.material.color.MaterialColors;
 import com.shizuposed.manager.R;
 import com.shizuposed.manager.ShizuPosedManagerApp;
+import com.shizuposed.manager.ShizukuHelper;
 import com.shizuposed.manager.adapter.HookedProcessAdapter;
 import com.shizuposed.manager.core.ModuleLoader;
 import com.shizuposed.manager.core.ProcessMonitor;
@@ -52,6 +54,7 @@ public class HomeFragment extends Fragment {
     private TextView tvFrameworkVersion, tvApiVersion;
     private TextView tvShellPackage, tvShellUid;
     private TextView tvSystemVersion, tvDevice, tvSystemAbi;
+    private TextView tvAppProcessStatus;
 
     private Logger logger;
     private ProcessMonitor processMonitor;
@@ -118,6 +121,7 @@ public class HomeFragment extends Fragment {
         tvFrameworkVersion = null; tvApiVersion = null;
         tvShellPackage = null; tvShellUid = null;
         tvSystemVersion = null; tvDevice = null; tvSystemAbi = null;
+        tvAppProcessStatus = null;
     }
 
     @Override
@@ -164,6 +168,7 @@ public class HomeFragment extends Fragment {
         tvSystemVersion    = view.findViewById(R.id.tvSystemVersion);
         tvDevice           = view.findViewById(R.id.tvDevice);
         tvSystemAbi        = view.findViewById(R.id.tvSystemAbi);
+        tvAppProcessStatus = view.findViewById(R.id.tvAppProcessStatus);
     }
 
     private void populateFrameworkInfo() {
@@ -260,6 +265,7 @@ public class HomeFragment extends Fragment {
             || (app != null && app.isServiceAutoStarted());
 
         updateStatus(shizukuAuthorized, serviceRunning);
+        updateAppProcessStatus();
 
         if (tvTotalApps != null) {
             tvTotalApps.setText(String.valueOf(getTotalInstalledApps()));
@@ -297,29 +303,56 @@ public class HomeFragment extends Fragment {
             + ", Service: " + serviceRunning);
     }
 
+    private void updateAppProcessStatus() {
+        if (!viewReady || tvAppProcessStatus == null || !isAdded()) return;
+
+        ShizukuHelper helper = ShizukuHelper.getInstance(requireContext());
+        if (!helper.isAuthorized()) {
+            tvAppProcessStatus.setText("Needs Shizuku permission");
+            tvAppProcessStatus.setTextColor(com.google.android.material.color.MaterialColors
+                .getColor(tvAppProcessStatus, com.google.android.material.R.attr.colorError));
+            return;
+        }
+
+        String binary = helper.getAppProcessBinary();
+        if (binary == null) {
+            tvAppProcessStatus.setText("Unavailable on this ROM\nApp launch disabled");
+            tvAppProcessStatus.setTextColor(com.google.android.material.color.MaterialColors
+                .getColor(tvAppProcessStatus, com.google.android.material.R.attr.colorError));
+        } else {
+            tvAppProcessStatus.setText("Ready (" + binary + ")");
+            tvAppProcessStatus.setTextColor(com.google.android.material.color.MaterialColors
+                .getColor(tvAppProcessStatus, com.google.android.material.R.attr.colorPrimary));
+        }
+    }
+
     private void updateStatus(boolean shizukuAuthorized, boolean serviceRunning) {
         if (tvStatus == null || cardStatus == null || btnStartService == null) return;
         if (!isAdded()) return;
 
         if (!shizukuAuthorized) {
             tvStatus.setText("No Shizuku Permission");
-            tvStatus.setTextColor(requireContext().getColor(android.R.color.holo_red_light));
-            cardStatus.setCardBackgroundColor(
-                requireContext().getColor(android.R.color.holo_red_light));
+            setStatusCardColors(com.google.android.material.R.attr.colorSurfaceVariant,
+                com.google.android.material.R.attr.colorOnErrorContainer);
             btnStartService.setEnabled(false);
         } else if (serviceRunning) {
             tvStatus.setText("Running ✅");
-            tvStatus.setTextColor(requireContext().getColor(android.R.color.holo_green_light));
-            cardStatus.setCardBackgroundColor(
-                requireContext().getColor(android.R.color.holo_green_light));
+            setStatusCardColors(com.google.android.material.R.attr.colorSurfaceVariant,
+                com.google.android.material.R.attr.colorOnSecondaryContainer);
             btnStartService.setEnabled(false);
         } else {
             tvStatus.setText("Stopped ⚠️");
-            tvStatus.setTextColor(requireContext().getColor(android.R.color.holo_orange_light));
-            cardStatus.setCardBackgroundColor(
-                requireContext().getColor(android.R.color.holo_orange_light));
+            setStatusCardColors(com.google.android.material.R.attr.colorSurfaceVariant,
+                com.google.android.material.R.attr.colorOnPrimaryContainer);
             btnStartService.setEnabled(true);
         }
+    }
+
+    private void setStatusCardColors(int backgroundAttribute, int textAttribute) {
+        int background = MaterialColors.getColor(cardStatus, backgroundAttribute);
+        int text = MaterialColors.getColor(cardStatus, textAttribute);
+        cardStatus.setCardBackgroundColor(background);
+        tvStatus.setTextColor(text);
     }
 
     private int getTotalInstalledApps() {

@@ -6,6 +6,20 @@ ShizuPosed runs Xposed-API modules in apps that are launched through it, without
 
 Version 4.0.
 
+## Start here
+
+ShizuPosed is an ARM64 Android 10+ manager for launching selected apps with
+Xposed-compatible modules through Shizuku. It does not require root or a
+modified system partition.
+
+For the normal user path, read [Requirements](#requirements), then follow
+[Installation](#installation). Developers can jump to [Building](#building),
+[Module development](#module-development), or [Architecture](#architecture).
+
+Prebuilt debug and release APKs are published by the
+[Build and Release workflow](.github/workflows/release.yml) when a `v*` tag is
+created. Release builds are signed in CI; debug builds remain debuggable.
+
 ---
 
 ## What this is — and what it is not
@@ -359,9 +373,11 @@ Only the programmatic form is supported. XML-level resource replacement is not i
 
 **No root required.**
 
-**JDK 21** and **Android SDK 36** for building.
+**JDK 21**, **Gradle 9.7**, and **Android SDK 37** for building.
 
-**clang** (Termux `clang` or NDK r25+) if you want to rebuild the native libraries. Prebuilt `.so` binaries are committed under `app/src/main/jniLibs/arm64-v8a/`, so a plain `./gradlew :app:assembleDebug` works without a compiler toolchain on the build host.
+Prebuilt native libraries are committed under
+`app/src/main/jniLibs/arm64-v8a/`, so a normal debug build does not require a
+native compiler toolchain.
 
 Shevery (a modernized Shizuku fork) is also supported. Some Shevery privileged-API paths have known issues in the current release; Shizuku upstream or the thedjchi fork is the more reliable choice at the moment.
 
@@ -373,11 +389,13 @@ Install Shizuku (fork recommended) from https://github.com/thedjchi/Shizuku, or 
 
 Start Shizuku via ADB or via the Shizuku app's own start flow. The Shizuku app walks you through this.
 
-Install the ShizuPosed Manager APK:
+Install the ShizuPosed Manager APK downloaded from the GitHub Release:
 
+```bash
+adb install -r ShizuPosed-<tag>-release.apk
 ```
-adb install -r ShizuPosed-R-3.9.apk
-```
+
+Use the debug APK instead when testing a development build.
 
 Open the manager. It requests Shizuku permission on first launch. Confirm it appears in Shizuku's authorized apps list.
 
@@ -385,7 +403,14 @@ Add a module from the **Modules** tab: tap the add button, pick the module's APK
 
 Open the module's detail sheet and tap **Edit scope**. Choose the apps this module should apply to.
 
-Then tap **Launch App under ShizuPosed** and pick one of the scoped apps. That app is now running with hooks installed.
+Open the module details again and tap **Launch scoped app under ShizuPosed**.
+Choose a target if more than one scoped app is available. The target must be
+started through this action for hooks to load; launching it normally cannot
+retroactively install hooks.
+
+The Home screen reports **App launch capability**. If it says `Ready`, the
+device exposes a usable `app_process` binary. If it says `Unavailable on this
+ROM`, ShizuPosed cannot use its bootstrap launch path on that device.
 
 **Activation is not retroactive.** A module's UI will show "Activated" only after at least one scoped app has been launched through ShizuPosed at least once.
 
@@ -415,21 +440,36 @@ The Framework Info card now includes an Amiru line that reports whether the nati
 export ANDROID_HOME=$HOME/Android/Sdk
 git clone <repo>
 cd ShizuPosed
-./gradlew clean :app:assembleDebug
+gradle clean :app:assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-The build produces the manager APK, `XposedHook.dex` (compiled by the `makeDex` Gradle task), and the two native libraries.
+The build produces the manager APK, `XposedHook.dex` (compiled by the `makeDex`
+Gradle task), and packages the committed native libraries.
 
-To rebuild only the native libraries:
+Build both APK variants with:
 
 ```bash
-cd native
-clang -shared -fPIC -O2 -o ../app/src/main/jniLibs/arm64-v8a/libshizuposed.so libshizuposed.c -llog -ldl
-clang -shared -fPIC -O2 -o ../app/src/main/jniLibs/arm64-v8a/libamiru.so     libamiru.c     -llog -ldl
+gradle :app:assembleDebug :app:assembleRelease
 ```
 
-For release builds, add a signing config as described in the full documentation.
+For a local signed release, create `keystore.properties` at the project root:
+
+```properties
+storeFile=/absolute/path/to/release.jks
+storePassword=...
+keyAlias=...
+keyPassword=...
+```
+
+Never commit `keystore.properties` or the keystore. The GitHub Actions workflow
+creates this file from protected repository secrets and publishes a signed
+release APK.
+
+Required CI secrets are `ANDROID_KEYSTORE_BASE64`,
+`ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and
+`ANDROID_KEY_PASSWORD`. The debug APK is intentionally unsigned and intended
+for testing only.
 
 ---
 
@@ -471,13 +511,9 @@ ShizuPosed/
 │       │       ├── LSPosedManager.java
 │       │       └── ...
 │       └── res/
-├── native/
-│   ├── libshizuposed.c
-│   ├── libamiru.c                             ← new in v3.9
-│   └── build-termux.sh
-├── libs/
-│   ├── pine-0.3.0.jar
-│   └── shizuku-*.jar
+├── .github/workflows/release.yml
+├── app/libs/                                  Local Shizuku and Pine JARs
+├── app/src/main/jniLibs/arm64-v8a/            Prebuilt native libraries
 └── ...
 ```
 
