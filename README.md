@@ -18,7 +18,7 @@ For the normal user path, read [Requirements](#requirements), then follow
 
 Prebuilt debug and release APKs are published by the
 [Build and Release workflow](.github/workflows/release.yml) when a `v*` tag is
-created. The release APK is unsigned unless signing is configured separately.
+created. Release builds are signed in CI; debug builds remain debuggable.
 
 ---
 
@@ -403,7 +403,14 @@ Add a module from the **Modules** tab: tap the add button, pick the module's APK
 
 Open the module's detail sheet and tap **Edit scope**. Choose the apps this module should apply to.
 
-Then tap **Launch App under ShizuPosed** and pick one of the scoped apps. That app is now running with hooks installed.
+Open the module details again and tap **Launch scoped app under ShizuPosed**.
+Choose a target if more than one scoped app is available. The target must be
+started through this action for hooks to load; launching it normally cannot
+retroactively install hooks.
+
+The Home screen reports **App launch capability**. If it says `Ready`, the
+device exposes a usable `app_process` binary. If it says `Unavailable on this
+ROM`, ShizuPosed cannot use its bootstrap launch path on that device.
 
 **Activation is not retroactive.** A module's UI will show "Activated" only after at least one scoped app has been launched through ShizuPosed at least once.
 
@@ -446,8 +453,7 @@ Build both APK variants with:
 gradle :app:assembleDebug :app:assembleRelease
 ```
 
-The release APK is unsigned unless `keystore.properties` exists at the project
-root with these properties:
+For a local signed release, create `keystore.properties` at the project root:
 
 ```properties
 storeFile=/absolute/path/to/release.jks
@@ -457,7 +463,13 @@ keyPassword=...
 ```
 
 Never commit `keystore.properties` or the keystore. The GitHub Actions workflow
-currently publishes an unsigned release APK.
+creates this file from protected repository secrets and publishes a signed
+release APK.
+
+Required CI secrets are `ANDROID_KEYSTORE_BASE64`,
+`ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and
+`ANDROID_KEY_PASSWORD`. The debug APK is intentionally unsigned and intended
+for testing only.
 
 ---
 
@@ -499,13 +511,9 @@ ShizuPosed/
 │       │       ├── LSPosedManager.java
 │       │       └── ...
 │       └── res/
-├── native/
-│   ├── libshizuposed.c
-│   ├── libamiru.c                             ← new in v3.9
-│   └── build-termux.sh
-├── libs/
-│   ├── pine-0.3.0.jar
-│   └── shizuku-*.jar
+├── .github/workflows/release.yml
+├── app/libs/                                  Local Shizuku and Pine JARs
+├── app/src/main/jniLibs/arm64-v8a/            Prebuilt native libraries
 └── ...
 ```
 
