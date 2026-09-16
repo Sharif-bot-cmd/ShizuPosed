@@ -23,6 +23,7 @@ import androidx.fragment.app.Fragment;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
+import com.google.android.material.color.MaterialColors;
 import com.shizuposed.manager.R;
 import com.shizuposed.manager.ShizuPosedManagerApp;
 import com.shizuposed.manager.ShizukuHelper;
@@ -331,23 +332,27 @@ public class HomeFragment extends Fragment {
 
         if (!shizukuAuthorized) {
             tvStatus.setText("No Shizuku Permission");
-            tvStatus.setTextColor(requireContext().getColor(android.R.color.holo_red_light));
-            cardStatus.setCardBackgroundColor(
-                requireContext().getColor(android.R.color.holo_red_light));
+            setStatusCardColors(com.google.android.material.R.attr.colorErrorContainer,
+                com.google.android.material.R.attr.colorOnErrorContainer);
             btnStartService.setEnabled(false);
         } else if (serviceRunning) {
             tvStatus.setText("Running ✅");
-            tvStatus.setTextColor(requireContext().getColor(android.R.color.holo_green_light));
-            cardStatus.setCardBackgroundColor(
-                requireContext().getColor(android.R.color.holo_green_light));
+            setStatusCardColors(com.google.android.material.R.attr.colorSecondaryContainer,
+                com.google.android.material.R.attr.colorOnSecondaryContainer);
             btnStartService.setEnabled(false);
         } else {
             tvStatus.setText("Stopped ⚠️");
-            tvStatus.setTextColor(requireContext().getColor(android.R.color.holo_orange_light));
-            cardStatus.setCardBackgroundColor(
-                requireContext().getColor(android.R.color.holo_orange_light));
+            setStatusCardColors(com.google.android.material.R.attr.colorPrimaryContainer,
+                com.google.android.material.R.attr.colorOnPrimaryContainer);
             btnStartService.setEnabled(true);
         }
+    }
+
+    private void setStatusCardColors(int backgroundAttribute, int textAttribute) {
+        int background = MaterialColors.getColor(cardStatus, backgroundAttribute);
+        int text = MaterialColors.getColor(cardStatus, textAttribute);
+        cardStatus.setCardBackgroundColor(background);
+        tvStatus.setTextColor(text);
     }
 
     private int getTotalInstalledApps() {
