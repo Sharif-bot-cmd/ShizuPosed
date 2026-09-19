@@ -1,364 +1,225 @@
-# ShizuPosed - Xposed via Shizuku | Non-Root Hook Framework
+# ShizuPosed
 
-[![Version](https://img.shields.io/badge/version-3.3-green.svg)](https://github.com/Sharif-bot-cmd/ShizuPosed)
-[![Android](https://img.shields.io/badge/Android-10%2B-brightgreen.svg)](https://developer.android.com)
-[![API](https://img.shields.io/badge/API-29%2B-blue.svg)](https://developer.android.com)
-[![License](https://img.shields.io/badge/License-Apache%202.0-red.svg)](LICENSE)
+**A non-root Xposed-compatible hook framework built on `app_process`.**
 
-**ShizuPosed** is a **non-root Xposed-style hook framework** for Android 10+
-(API 29+). It runs a shell-side hook process via
-[Shizuku](https://github.com/thedjchi/Shizuku) (UID 2000) or [Shevery](https://github.com/HmnDev-Tech/shevery) and installs
-method hooks through a **multi-backend dispatcher** whose primary engine is
-[Pine](https://github.com/canyie/pine), with a bundled native shim
-(`libshizuposed.so`) as a second ART engine and `Instrumentation` as a
-fallback for Application and Activity lifecycle hooks. A compatibility layer
-absorbs hidden-API renames so the framework keeps running on Android 16, 17,
-and later.
+ShizuPosed runs Xposed-API modules in apps launched through it — no root, no bootloader unlock, no system partition changes. Shizuku invokes `app_process` as the shell UID, a Java runtime bootstraps inside the target's process, and method hooks go in through a multi-backend dispatcher. Modules written for LSPosed and classic Xposed keep working.
 
-It is **not** a zygote-timing framework. `Application.onCreate` and
-`ContentProvider.onCreate` run in the hooked process under bootstrap mode;
-`Activity.onCreate` and `Service.onCreate` are delivered by AMS to the
-original process, so only hooks that Pine, the native shim, or
-Instrumentation can install before dispatch will fire.
+Version 5.1.
 
 ---
 
-## Key features
+## What this is, and what it isn't
 
-| Feature | Status |
-|---|---|
-| No root, no bootloader unlock | ✅ |
-| Non-system-modifying | ✅ |
-| Multi-backend dispatcher (Pine → Native → Instrumentation → Proxy → Noop) | ✅ |
-| Bootstrap mode (hooks before `Application.onCreate`) | ✅ |
-| `Instrumentation` fallback for Application / Activity lifecycle | ✅ v2.8 |
-| Native ART engine (`libshizuposed.so`, in-process) | ✅ v3.1 |
-| Native JNI hooking (inline patch via `dlsym`) | ✅ v3.1 |
-| Dynamic ART layout probe (auto-detects offsets) | ✅ v3.3 |
-| Dynamic argument marshaling (any primitive signature) | ✅ v3.3 |
-| LSPosed API 93 compatibility (`LSPosedManager`) | ✅ |
-| Active-state API (`isModuleActive`, `getModuleScope`) | ✅ |
-| Resource hooking (`IXposedHookInitPackageResources`) | ✅ |
-| `XposedBridge.log(...)`, `XSharedPreferences` shims | ✅ |
-| Auto-detect installed Xposed modules | ✅ |
-| Auto-purge uninstalled modules | ✅ |
-| Home tab Framework Info card | ✅ |
-| Repo tab (placeholder) | ✅ v2.9 |
-| `app_process` binary fallback (64 / universal / 32) | ✅ |
-| Forward-compatible compat layer | ✅ |
+This part comes first because everything else is downstream of it.
 
-### Hook dispatcher order
+ShizuPosed is **not** a drop-in LSPosed replacement. It doesn't try to be. It uses a different injection primitive — `app_process` into a target launched by ShizuPosed — because that's the only injection path that reliably works without root on modern Android. That choice is what makes ShizuPosed possible. It's also what defines the ceiling.
 
-1. `PineBackend` — Pine AUTO mode
-2. `PineReplaceBackend` — Pine REPLACEMENT mode
-3. `NativeBackend` — `libshizuposed.so` ART entry-point patcher
-4. `InstrumentationBackend` — Application / Activity lifecycle
-5. `ProxyBackend` — interface methods
-6. `NoopBackend` — always succeeds, does nothing
+If you need zygote-wide hooking, `system_server` interception, cross-UID hooks, or `Service.onCreate` coverage, use LSPosed. ShizuPosed exists for the people who can't root or won't, and who still want LSPosed-API modules to work in the apps ShizuPosed launches.
 
-Each backend is tried in order per method. The first one that installs wins.
-`InstrumentationBackend` only accepts lifecycle methods; everything else
-passes through to `Proxy` and `Noop`. `NativeBackend` is only reachable when
-Pine's `.so` is missing, blocked, or its `isInitialized()` probe fails — in
-that case the native shim takes over ART hooking for methods it can reach.
+The rest of this document is honest about where that line falls.
 
 ---
 
-### Structure
+## Why `app_process`
 
-```
-ShizuPosedManager/
-├── app/
-│   ├── build.gradle
-│   ├── proguard-rules.pro
-│   └── src/
-│       └── main/
-│           ├── AndroidManifest.xml
-│           ├── assets/
-│           │   └── XposedHook.dex                # built by :app:makeDex
-│           ├── jniLibs/
-│           │   └── arm64-v8a/
-│           │       └── libshizuposed.so          # built from native/libshizuposed.c
-│           ├── java/
-│           │   ├── com/shizuposed/manager/
-│           │   │   ├── ShizuPosedManagerApp.java
-│           │   │   ├── MainActivity.java
-│           │   │   ├── ShizukuHelper.java
-│           │   │   ├── ui/
-│           │   │   │   ├── HomeFragment.java
-│           │   │   │   ├── ModulesFragment.java
-│           │   │   │   ├── ModuleDetailSheet.java
-│           │   │   │   ├── RepoFragment.java              # v2.9
-│           │   │   │   ├── LogsFragment.java
-│           │   │   │   └── SettingsFragment.java
-│           │   │   ├── adapter/
-│           │   │   │   ├── ModuleAdapter.java
-│           │   │   │   ├── IconResolver.java
-│           │   │   │   ├── AppSelectionAdapter.java
-│           │   │   │   ├── HookedProcessAdapter.java
-│           │   │   │   ├── LogAdapter.java
-│           │   │   │   └── MainPagerAdapter.java
-│           │   │   ├── model/
-│           │   │   │   ├── ModuleInfo.java
-│           │   │   │   ├── HookedProcess.java
-│           │   │   │   └── LogEntry.java
-│           │   │   ├── service/
-│           │   │   │   └── ShizuPosedService.java
-│           │   │   ├── core/
-│           │   │   │   ├── XposedHook.java
-│           │   │   │   ├── HookEngine.java
-│           │   │   │   ├── HookDispatcher.java
-│           │   │   │   ├── XposedHookBridge.java
-│           │   │   │   ├── XposedHelpersImpl.java
-│           │   │   │   ├── NativeBridge.java              # v3.1
-│           │   │   │   ├── NativeDispatcher.java          # v3.3
-│           │   │   │   ├── ModuleLoader.java
-│           │   │   │   ├── ModuleScanner.java
-│           │   │   │   ├── ProcessMonitor.java
-│           │   │   │   ├── ResourceHooking.java
-│           │   │   │   ├── backends/
-│           │   │   │   │   ├── PineBackend.java
-│           │   │   │   │   ├── PineReplaceBackend.java
-│           │   │   │   │   ├── NativeBackend.java         # v3.1
-│           │   │   │   │   ├── InstrumentationBackend.java
-│           │   │   │   │   ├── ProxyBackend.java
-│           │   │   │   │   └── NoopBackend.java
-│           │   │   │   ├── hooks/
-│           │   │   │   │   └── LifecycleRegistry.java
-│           │   │   │   └── compat/
-│           │   │   │       ├── AndroidCompat.java
-│           │   │   │       ├── CompatLog.java
-│           │   │   │       ├── HiddenApiBypass.java
-│           │   │   │       └── ReflectionUnsafe.java
-│           │   │   ├── status/
-│           │   │   │   └── ModuleStatusProvider.java
-│           │   │   ├── utils/
-│           │   │   │   ├── Logger.java
-│           │   │   │   ├── FileUtils.java
-│           │   │   │   └── ShellUtils.java
-│           │   │   └── receiver/
-│           │   │       └── BootReceiver.java
-│           │   └── de/robv/android/xposed/
-│           │       ├── XposedHelpers.java
-│           │       ├── XposedBridge.java
-│           │       ├── LSPosedManager.java
-│           │       ├── XResources.java
-│           │       ├── XSharedPreferences.java
-│           │       ├── XC_MethodHook.java
-│           │       ├── XC_MethodReplacement.java
-│           │       ├── IXposedHookLoadPackage.java
-│           │       ├── IXposedHookInitPackageResources.java
-│           │       └── callbacks/
-│           │           ├── XC_LoadPackage.java
-│           │           └── XC_InitPackageResources.java
-│           └── res/
-│               ├── drawable/
-│               │   ├── ic_launcher.xml
-│               │   ├── ic_launcher_background.xml
-│               │   ├── ic_launcher_foreground.xml
-│               │   ├── ic_module.xml
-│               │   ├── ic_home.xml
-│               │   ├── ic_repo.xml                        # v2.9
-│               │   ├── ic_logs.xml
-│               │   ├── ic_settings.xml
-│               │   ├── status_indicator_enabled.xml
-│               │   └── status_indicator_disabled.xml
-│               ├── layout/
-│               │   ├── activity_main.xml
-│               │   ├── fragment_home.xml
-│               │   ├── fragment_modules.xml
-│               │   ├── fragment_repo.xml                  # v2.9
-│               │   ├── fragment_logs.xml
-│               │   ├── fragment_settings.xml
-│               │   ├── item_module.xml
-│               │   ├── item_hooked_process.xml
-│               │   ├── item_log.xml
-│               │   ├── item_app_selection.xml
-│               │   ├── dialog_add_module.xml
-│               │   ├── dialog_select_apps.xml
-│               │   └── sheet_module_detail.xml
-│               ├── menu/
-│               │   ├── main_menu.xml
-│               │   └── main_options_menu.xml
-│               ├── mipmap-anydpi-v26/
-│               │   ├── ic_launcher.xml
-│               │   └── ic_launcher_round.xml
-│               ├── values/
-│               │   ├── colors.xml
-│               │   ├── strings.xml
-│               │   └── themes.xml
-│               └── xml/
-│                   ├── backup_rules.xml
-│                   ├── data_extraction_rules.xml
-│                   └── file_paths.xml
-├── native/
-│   ├── libshizuposed.c                           # single-file native shim
-│   └── build-termux.sh                           # optional Termux build wrapper
-├── keystore/
-│   └── shizuposed-release.jks                    # not committed
-├── keystore.properties                           # not committed
-├── libs/
-│   ├── shizuku-api.jar
-│   ├── shizuku-provider.jar
-│   ├── shizuku-aidl.jar
-│   ├── shizuku-shared.jar
-│   └── pine-0.3.0.jar
-├── build.gradle
-├── settings.gradle
-├── gradle.properties
-├── gradlew (if applicable)
-├── gradlew.bat (if applicable)
-├── .gitignore
-└── README.md
-```
+It helps to understand what ShizuPosed *can't* do before looking at what it can.
 
-## Timing model
+Without root, the injection primitives on Android 10+ are narrow. `ptrace` is blocked by SELinux for non-root UIDs. `LD_PRELOAD` needs a writable, executable path the target will load from, and app data directories are mounted `noexec`. Zygote fork requires being inside zygote, which means root or being the ROM. `Runtime.exec` runs as the caller's UID, not the target's. `am instrument` gives you an `Instrumentation` handle only after `Application.onCreate` — too late for bootstrap hooks. ContentProvider hijack works only if the target already declares a provider you can take over.
 
-| Phase | Zygote (LSPosed) | Bootstrap (ShizuPosed) | Post-Application |
-|---|---|---|---|
-| `Application.attachBaseContext` | ✅ | ✅ | ❌ |
-| `Application.onCreate` | ✅ | ✅ | ❌ |
-| `ContentProvider.onCreate` | ✅ | ✅ | ❌ |
-| `Activity.onCreate` | ✅ | ✅ via Pine, Native, or Instrumentation | ❌ |
-| `Service.onCreate` | ✅ | ❌ | ❌ |
-| Bootloader unlock | ✅ usually | ❌ | ❌ |
+`app_process` is the one that works. It's a platform binary that exists on every Android device. Shizuku can invoke it as shell (UID 2000). It starts a Java runtime, so you can load arbitrary dex into it. And Shizuku can pass the target package and UID as arguments.
+
+That's the entire mechanism. Everything else in ShizuPosed is a consequence of it.
 
 ---
 
-## Requirements
+## The timing model
 
-| Requirement | Minimum |
-|---|---|
-| Android | 10 (API 29) |
-| Architecture | ARM64 |
-| Shizuku | 13.1.1+ |
-| JDK | 21 |
-| Android SDK | API 36 |
-| clang (native shim only) | Termux `clang` or NDK r25+ |
+LSPosed is a zygote-timing framework: it forks from zygote and installs hooks before the target's `Application` object exists. ShizuPosed is a bootstrap-timing framework: it's `app_process`-launched into the target, installs hooks, then drives the target's own `ActivityThread` bootstrap so that `Application.onCreate` runs with hooks already live.
 
-Shizuku must be running and ShizuPosed must be granted Shizuku permission
-before any hooking occurs. Root-started Shizuku enables uid switching during
-bootstrap.
+What ShizuPosed reaches in bootstrap mode:
 
-`clang` is only needed if you build `libshizuposed.so` yourself. Prebuilt
-`.so` binaries are committed under `app/src/main/jniLibs/arm64-v8a/`, so a
-plain `./gradlew :app:assembleDebug` works without a compiler toolchain on
-the build host.
+- `Application.attachBaseContext` — hookable
+- `Application.onCreate` — hookable
+- `ContentProvider.onCreate` — hookable
+- `Activity.onCreate` — hookable via Pine, Amiru, Native, or Instrumentation
+- `LayoutInflater.inflate` — hookable, drives `XC_LayoutInflated` callbacks
+- `Service.onCreate` — not hookable
+- `system_server` — not hookable
+
+The `Service.onCreate` gap is structural. There's no fallback because there's no mechanism. If you need it, LSPosed is the answer.
 
 ---
 
-## Building
+## Architecture
 
-```bash
-export ANDROID_HOME=$HOME/Android/Sdk
-git clone <repo>
-cd ShizuPosedManager
-./gradlew clean :app:assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+ShizuPosed Manager (APK)
+        │
+        │  Shizuku AIDL
+        ▼
+Shizuku (shell, UID 2000)
+        │
+        │  app_process
+        ▼
+Target process
+  ├── XposedHook.main()          bootstrap entry
+  ├── IXposedHookCmdInit         pre-Application dispatch
+  ├── HookEngine                 backend selection
+  ├── HookDispatcher             per-method backend chain
+  ├── ModuleLoader               dex load + entry invocation
+  ├── ResourceHooking            resource + layout hooks
+  ├── XStealthModule             built-in privacy module
+  │     ├── XStealthNative       libc symbol interposition
+  │     ├── XStealthNativeNext   libc syscall stub patching
+  │     └── ApiProtectionCheck   Xposed API call guarding
+  └── markers written to         <shell-base>/hooked/
 ```
 
-For release builds, add a signing config as described in the full
-documentation.
+The manager never touches the target process directly. Everything passes through Shizuku.
 
 ---
 
-## Native hooking (`libshizuposed.so`)
+## The multi-backend dispatcher
 
-ShizuPosed ships a small native shim that gives the framework a second ART
-hooking engine, independent of Pine. It exists for three reasons:
+Not every method can be hooked the same way, so the dispatcher tries a fixed order and takes the first backend that succeeds.
 
-1. **Redundancy.** If Pine's `.so` is missing, blocked by a ROM, or its
-   ART-layout probe fails on a new Android version, `NativeBackend` keeps
-   hooking working for methods it can reach.
-2. **Self-containment.** The shim is under 1000 lines of C with no external
-   dependencies beyond `liblog` and `libdl`. It's the piece of the framework
-   that can be audited end-to-end.
-3. **Dynamic adaptation.** The layout probe and argument marshaling adapt to
-   Android changes at runtime. No hardcoded offset lists, no per-signature
-   codegen, no rebuild when ART shifts.
+Pine AUTO is the primary engine. Pine REPLACEMENT catches methods Pine AUTO rejects. Amiru is a per-method stub engine reached when Pine declines. Native is the original `libshizuposed.so` shared-dispatcher engine. Instrumentation covers the Application and Activity lifecycle only. Proxy handles interface methods. Noop always succeeds and does nothing — so a module that hooks ten methods and finds one it can't hook doesn't lose the other nine.
 
-### What it does
+---
 
-| Capability | How |
-|---|---|
-| Detect the ART `ArtMethod` layout | Walks the first 64 bytes of two real methods (`Object.hashCode`, `Object.toString`), cross-validates the entry-point and access-flags offsets, and confirms the entry point lands in executable memory via `/proc/self/maps` |
-| Hook a Java method | Patches the `ArtMethod` quick-compiled entry point to a per-method stub; saves the original as a trampoline |
-| Route to a Java callback | Per-method stubs load the `jmethodID` into `x17` and branch to a shared dispatcher, which forwards the raw argument registers to `NativeDispatcher` |
-| Marshal arguments | `NativeDispatcher` decodes the raw registers using `Method.getParameterTypes()` — primitive signatures work automatically, no per-shorty work |
-| Return a replacement value | Callbacks that call `setResult` have the value encoded and returned by the asm entry, skipping the original |
-| Call the original | Dispatcher tail-branches to the trampoline after the callback runs (when no replacement was set) |
-| Hook a native symbol | Inline-patches the prologue of any `dlsym` result (JNI functions, small libc leaves) |
-| Graceful degradation | Returns `false` on unknown layouts instead of corrupting memory; `NativeBackend` falls through to the next backend |
+## XStealth — the built-in privacy module
 
-### What it does not do
+XStealth ships with ShizuPosed and hides the framework's presence from detection checks in target apps. No separate APK. Its classes live in `XposedHook.dex`, its UI is a detail sheet in the Modules tab, and its master toggle lives only there.
 
-- **Hook methods in other apps.** No `ptrace`, no `process_vm_writev`, no
-  cross-UID memory access. The shim only works in processes ShizuPosed
-  launched via `app_process` — "be the target process" is the whole model.
-- **See object arguments.** `String`, `Bundle`, `Context`, and any other
-  object parameter arrive as `null` in the callback. The raw register value
-  is a JVM-internal reference, not a `jobject` handle, and reconstructing
-  one requires per-ABI native work that isn't done yet. Primitive arguments
-  work.
-- **See `thisObject`.** Instance methods currently see `null` for `this` in
-  the callback, for the same reason.
-- **Run after-hooks.** The asm entry returns or tail-branches immediately
-  after `NativeDispatcher.dispatch(...)` completes. There is no post-call
-  hook point. Modules that need `afterHookedMethod` should rely on Pine.
-- **Hook PC-relative prologues.** The inline hooker refuses `adrp`, `adr`,
-  `b`, `bl`, and `ldr literal` at the top of the target function. Many real
-  functions start with `adrp`, so the inline path only covers small leaf
-  functions. Full instruction decoding is not implemented.
+### How it compares to Shamiko
 
-### When it activates
+XStealth is often described as a "Shamiko equivalent" for non-root setups. Useful shorthand, but not literal. Shamiko runs inside zygote and hides root artifacts before the target starts. XStealth runs inside the target and hides ShizuPosed's own artifacts. Different mechanism, lower ceiling. For the checks that matter in practice, XStealth behaves similarly. Against an adversary with root, it doesn't.
 
-`NativeBackend` is placed after `PineBackend` and `PineReplaceBackend` in
-the dispatch chain. It is only reached when Pine declines a method or is
-entirely unavailable. On a normal device running a healthy Pine, the native
-shim never runs a hook. On a device where Pine is broken, the native shim
-becomes the primary ART engine.
+### What XStealth hides
 
-### Argument marshaling in practice
+- Developer Options enabled
+- ADB enabled
+- Shizuku package presence
+- ShizuPosed package presence
+- Running processes (Shizuku, ShizuPosed, `app_process`)
+- `/proc` entries — with the native layer active, hidden strings are scrubbed from `/proc/self/maps`, `cmdline`, `status`, and `mountinfo`
+- File access to ShizuPosed's payload paths
 
-The dynamic dispatcher handles any primitive signature. For a hook on
-`Activity.onCreate(Bundle)`:
+### What XStealth doesn't hide
 
-- The `Bundle` argument is `null` in the callback (object arg).
-- The callback still fires before the original runs.
-- If the callback calls `setResult(...)`, that's ignored because the return
-  type is `void`.
-- The original `onCreate` runs normally.
+**Hardware attestation.** Play Integrity's `MEETS_STRONG_INTEGRITY` is a cryptographic proof of bootloader and ROM state. XStealth doesn't touch any of the inputs to that check.
 
-For a hook on `SomeClass.compute(int, long)`:
+**Root-empowered inspection.** An app that already has root can read `/proc` directly, bypassing both the Java and libc layers.
 
-- The `int` and `long` arguments are decoded from registers and visible in
-  `param.args`.
-- If the callback calls `setResult(42)`, the asm entry returns `42` without
-  calling the original.
-- Otherwise the original runs.
+**Server-side cross-reference.** XStealth can spoof what an app reports locally. A server that cross-checks against Play Store inventory notices.
 
-A healthy load looks like:
+---
+
+## XStealth Next — the aggressive engine
+
+The primary native engine (`libxstealth.so`) interposes libc functions by symbol. That covers anything that goes through the named wrappers. A target that resolves the syscall stub directly, or goes through the generic syscall dispatcher, sidesteps symbol interposition entirely.
+
+XStealth Next closes that gap. It finds the libc stubs and inline-patches their prologues with a branch to a per-syscall handler. Any entry into the stub lands in the handler instead of executing the real `svc #0`. It also patches the generic `syscall()` dispatcher and covers `fstatat`/`newfstatat` in addition to `stat`/`lstat` — which closes the most common stat path on modern Android.
+
+Each stub's prologue is validated before patching. Unknown shapes are refused rather than corrupted, and the failure is logged with the actual bytes so a future bionic change is visible in logcat rather than silent.
+
+Turning Next on renames the module's display in the Modules tab to **XStealth (Next)**. The package name never changes.
+
+### What Next still doesn't catch
+
+A target that emits its own `svc #0` sequence never touches the libc stub, and there's no user-space way to intercept raw syscall instructions without `ptrace` or an LSM. Next raises the cost of detection for libc-mediated code. It isn't undefeatable.
+
+---
+
+## API call protection
+
+Some apps walk their own classpath looking for `de.robv.android.xposed.*` and flag the device as modified. Others call into the Xposed API just to see if it answers. Both are fingerprinting.
+
+API call protection hooks `ClassLoader.loadClass` and `Class.forName`. When the caller isn't a loaded module or the framework itself, lookups of the shim package return `ClassNotFoundException`. The app never sees the Xposed classes.
+
+This is a defensive measure. It raises the cost of runtime fingerprinting; it doesn't remove the classes from the process. They're still loadable by the module dexes, and a determined target that inspects its own memory map for them will still find them.
+
+Off by default. When on, it's greyed out unless the XStealth master toggle is also on — nothing installs the check otherwise.
+
+Status appears in the Home tab's Framework Info card as **API Protection: Active / Disabled / Inactive**.
+
+---
+
+## Dex optimization
+
+By default, a module's dex goes to the shell side as-is, and the target compiles it on first use. Small delay on cold start.
+
+Dex Optimization runs `dex2oat` on the cached dex before pushing, so the target loads a pre-optimized file. The wrapper tries three compiler filters in order — `speed`, `speed-profile`, `quicken` — and uses whichever succeeds first. If all three fail (dex2oat missing, out of memory, incompatible filters, permission error), the original dex goes unchanged.
+
+Performance feature, not a security one. Faster module loading on cold start.
+
+Off by default. Status appears in the Home tab's Framework Info card as **Dex Optimization: Enabled / Disabled**.
+
+---
+
+## Module loading
+
+Standard Xposed module resolution. The manager scans each installed module's APK for `assets/xposed_init`, caches the APK as a dex container, and pushes the descriptor and dex to the shell side. `XposedHook` reads the module JSON, checks the target against the module's scope, and loads the dex with a `DexClassLoader` whose parent is the target's classloader. The entry class comes from `xposed_init`, from `assets/xposed_init`, or from one of eight conventionally-named candidates.
+
+Built-in modules skip the dex load — their classes resolve against `XposedHook`'s own classloader. The marker file is the source of truth for activation state.
+
+### Recommended scope
+
+Modules can declare which apps they're *intended* for by shipping an `assets/scope.list` file inside the APK — one package name per line, blank lines and `#` comments ignored. This is the LSPosed convention.
+
+ShizuPosed reads that file at install and load time and surfaces the packages as **recommended**:
+
+- The scope editor shows a **Recommended** chip that selects every recommended app currently in the list.
+- Recommended apps appear first in the scope list, with a small **Recommended** badge on each row.
+- The module row shows a **· N recommended** hint next to the hooked-apps count.
+
+Modules without a `scope.list` see no change — the chip is hidden, the hint doesn't appear, and the scope editor behaves exactly as before. Recommended is informational. It doesn't pre-select anything; it just tells the user what the author had in mind.
+
+---
+
+## Activation state — how "Activated" actually works
+
+Two distinct questions. "Am I enabled?" comes from `XposedBridge.isModuleEnabled(pkg)`, sourced from the manager's preference store. "Am I active?" comes from `XposedBridge.isModuleActive(pkg)`, sourced from the shell-side marker files.
+
+A module's own UI runs in its own process, launched by the launcher and not by ShizuPosed. So the chain is:
 
 ```
-I ShizuPosedNative: JNI_OnLoad: libshizuposed 1.0.0
-I ShizuPosedNative: layout probed: entry@0x20 access@0x4 ptr=1
-D NativeBridge: libshizuposed.so loaded
-D NativeBridge: szp_dispatch_entry = 0x...
-D NativeBackend: Native ART hooker available: valid=1 entry@0x20 access@0x4 ptr=1
+Module UI process
+  → XposedBridge.isModuleActive(pkg)
+    → LSPosedManager.isModuleActive(pkg)
+      → ContentResolver.query(content://com.shizuposed.manager.status/active/<pkg>)
+        → ModuleStatusProvider
+          → reads <shell-base>/hooked/*.json
+          → returns active=1 or active=0
 ```
 
-If you see `layout probe: no candidate matched`, the ART layout has changed
-again and a new candidate needs adding to `probe_layout` in
-`native/libshizuposed.c`.
+The provider caches marker scans for three seconds.
+
+---
+
+## Compatibility shims
+
+The `de.robv.android.xposed.*` package ships every class modules link against.
+
+`XposedHelpers` provides `findAndHookMethod`, `findClass`, `findClassIfExists`, `findFieldIfExists`, `findMethodIfExists`, `findConstructorIfExists`, reflection helpers, and forwards for version and enabled-state queries.
+
+`XposedBridge` provides `getXposedVersion`, `isModuleEnabled`, `isModuleActive`, `getModuleScope`, and `log(...)`.
+
+`LSPosedManager` provides the LSPosed-compatible manager API.
+
+`XCallback` and `XCallback.Priority` ship as marker types so modules that reference the callback hierarchy link cleanly.
+
+`IXposedMod`, `IXposedHookLoadPackage`, `IXposedHookInitPackageResources`, and `IXposedHookCmdInit` are all present. `IXposedHookCmdInit` is wired, not stubbed — it fires from `XposedHook.main()` before the target's `Application` object exists.
+
+`XC_LayoutInflated` ships as a functional callback type. Modules can register callbacks via `XResources.hookLayout()`; the framework installs a global `LayoutInflater.inflate` hook to drive them.
+
+The API version reported is **93** (LSPosed's generation). Modules that check `getXposedVersion() >= 82` accept ShizuPosed as compatible.
 
 ---
 
 ## Module development
 
-Standard Xposed API. The entry point is `assets/xposed_init` or a class
-name under the module's own package (`<pkg>.MainHook`, `<pkg>.XposedMain`,
-`<pkg>.Hook`, `<pkg>.XposedEntry`, `<pkg>.XposedModule`, `<pkg>.Module`,
-`<pkg>.Main`, `<pkg>.XposedInit`).
+Standard Xposed API.
 
 ```java
 public class MainHook implements IXposedHookLoadPackage {
@@ -378,12 +239,42 @@ public class MainHook implements IXposedHookLoadPackage {
 }
 ```
 
+### Earliest hook: `IXposedHookCmdInit`
+
+Fires from `XposedHook.main()` after the backend chain is installed and before the target's `Application` exists. The classloader it receives is the framework's own — the target's loader isn't resolved until `runBootstrapMode()`. Modules that need the target's classloader should use `IXposedHookLoadPackage` instead.
+
+```java
+public class MainHook implements IXposedHookLoadPackage, IXposedHookCmdInit {
+
+    @Override
+    public void initCmdProcess(InitCmdProcessParam param) {
+        XposedBridge.log("cmd init: pkg=" + param.processName
+            + " argv=" + Arrays.toString(param.argv));
+    }
+
+    @Override
+    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+        // ...
+    }
+}
+```
+
+A module that throws inside `initCmdProcess()` is logged and skipped. The launch continues.
+
 ### Reporting state in a module UI
 
 ```java
 boolean enabled = XposedBridge.isModuleEnabled(getPackageName());
 boolean active  = XposedBridge.isModuleActive(getPackageName());
 String[] scope  = XposedBridge.getModuleScope(getPackageName());
+```
+
+For the module UI to reach the provider on Android 11+, the module's own `AndroidManifest.xml` needs:
+
+```xml
+<queries>
+    <provider android:authorities="com.shizuposed.manager.status" />
+</queries>
 ```
 
 ### Resource replacement
@@ -398,79 +289,264 @@ public class Res implements IXposedHookInitPackageResources {
 }
 ```
 
+Only the programmatic form is supported. XML-level replacement is on the limitations list.
+
+### Layout hooks
+
+```java
+public class Res implements IXposedHookInitPackageResources {
+    @Override
+    public void handleInitPackageResources(
+            XC_InitPackageResources.InitPackageResourcesParam resparam) {
+        resparam.res.hookLayout(R.layout.main, new XC_LayoutInflated() {
+            @Override
+            public void handleLayoutInflated(LayoutInflatedParam param) {
+                // param.view, param.resId, param.resName are set
+            }
+        });
+    }
+}
+```
+
+The global `inflate` hook is installed before `Application.onCreate` in bootstrap mode, so callbacks fire for every layout the target inflates from that point on. In post-application mode, the hook is installed later — layouts already inflated are missed.
+
+If the hook couldn't be installed for a target, `hookLayout()` logs a warning at registration time. A callback that will never fire is easier to debug than one that silently doesn't.
+
 ---
 
-## Compatibility shims
+## Requirements
 
-The `de.robv.android.xposed.*` package ships the classes modules link
-against:
+Android 10 or newer, ARM64. Shizuku 13.1.1 or newer, running and authorized — the recommended build is the fork by **thedjchi** at `github.com/thedjchi/Shizuku`. About 200 MB free storage. No root required. For building: JDK 21 and Android SDK 37. For rebuilding the native libraries: `clang` (Termux `clang` or NDK r25+).
 
-| Class | Purpose |
-|---|---|
-| `XposedHelpers` | `findAndHookMethod`, reflection helpers |
-| `XposedBridge` | `getXposedVersion`, `isModuleEnabled`, `isModuleActive`, `getModuleScope`, `log(...)` |
-| `LSPosedManager` | LSPosed-compatible manager API |
-| `XSharedPreferences` | Read-only `SharedPreferences` shim |
-| `XResources` | Resource replacement object |
-| `IXposedHookLoadPackage` | Module entry point |
-| `IXposedHookInitPackageResources` | Resource entry point |
-| `XC_MethodHook`, `XC_MethodReplacement` | Callback base classes |
-| `XC_LoadPackage`, `XC_InitPackageResources` | Param classes |
-
-The API version reported is **93** (LSPosed's generation). Modules that
-check `getXposedVersion() >= 82` accept ShizuPosed as compatible.
+Shevery is also supported, though some of its privileged-API paths have known issues.
 
 ---
 
-## Repo tab
+## Installation
 
-As of v2.9 the bottom navigation has a **Repo** tab alongside Home, Modules,
-Logs, and Settings. It currently displays a "Not yet implemented"
-placeholder. When the module repository backend ships, this tab will let you
-browse, install, and update Xposed modules directly from the manager,
-similar to LSPosed's Repo tab.
+Install Shizuku (fork recommended) from the link above, then start it via ADB or via the Shizuku app's own start flow.
 
-Nothing about the existing hook path changes. Modules continue to install
-via the Modules tab or be auto-detected from the device.
+Install the ShizuPosed Manager APK:
+
+```
+adb install -r ShizuPosed-R-5.1.apk
+```
+
+Open the manager. It requests Shizuku permission on first launch. Add a module from the Modules tab, or use one that auto-detects. Edit the module's scope to choose which apps it applies to. Then tap **Launch App under ShizuPosed** and pick a scoped app.
+
+Activation isn't retroactive. A module's UI will show "Activated" only after at least one scoped app has been launched through ShizuPosed.
+
+---
+
+## The manager
+
+Five tabs.
+
+**Home** shows the Framework Info card, the status card, the counters, and the list of currently hooked processes. The Framework Info card reports framework version, API version, shell package, system version, device, system ABI, shell UID, API Protection state, and Dex Optimization state.
+
+**Modules** lists installed modules with XStealth always at the top. Tapping a module opens its detail sheet. XStealth's sheet has the master toggle, the Next toggle, the API Protection and Dex Optimization toggles, the six per-check toggles, and a status line. Sub-toggles grey out when the master is off.
+
+**Repo** shows every installed module with its README, metadata, and quick links. Tap a row for the module's details: icon, version, author, description, homepage and support buttons, and a two-tab content area with **README** (rendered from Markdown) and **Details** (metadata table). READMEs are read from `assets/README.md`, `assets/readme.md`, or `README.md` at the APK root. Modules that ship one get a **README** badge on their row. Modules that don't see a friendly empty state. Search filters by name, package, author, and description.
+
+**Logs** shows the manager's own log with search.
+
+**Settings** has the runtime toggles, cache management, and config export. The XStealth toggle isn't here — the detail sheet is the only place for it.
+
+---
+
+## Building
+
+```bash
+export ANDROID_HOME=$HOME/Android/Sdk
+git clone <repo>
+cd ShizuPosed
+./gradlew clean :app:assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+---
+
+## Changelog
+
+### 5.1
+
+```
+NEW
+• Repo tab. Installed modules are now browsable. Each module
+  shows its README (rendered from Markdown), metadata, and
+  quick links. READMEs are read from assets/README.md,
+  assets/readme.md, or README.md at the APK root.
+
+• Markdown rendering. Lightweight renderer handles headings,
+  bold, italic, inline code, code blocks, links, lists,
+  blockquotes, and horizontal rules. No external dependency.
+
+• Recommended scope. Modules can declare intended scope via
+  assets/scope.list. Recommended apps get a badge and sort to
+  the top of the scope editor, and a Recommended chip selects
+  them in one tap. The module row shows "· N recommended"
+  when a scope is declared.
+
+• IXposedHookCmdInit. Fires before the target's Application
+  exists, giving modules the earliest hook point ShizuPosed
+  offers. Receives argv, target package, and the framework's
+  own classloader.
+
+• Layout hooks. XC_LayoutInflated is functional. Modules
+  register via XResources.hookLayout(); a global
+  LayoutInflater.inflate hook drives the callbacks.
+
+• XCallback and XCallback.Priority ship as marker types so
+  modules that reference the callback hierarchy link cleanly.
+
+• XC_LoadPackage.LoadPackageParam and
+  XC_InitPackageResources.InitPackageResourcesParam now
+  extend XCallback and implement XCallback.Param, matching
+  upstream. Modules that type a parameter as XCallback no
+  longer fail with NoClassDefFoundError.
+
+• Scope editor no longer shows the module being scoped in its
+  own list. Matches LSPosed behavior.
+
+CHANGED
+• Repo tab is no longer a placeholder.
+
+• Framework Info card unchanged; layout-hook state is
+  reported per-target in the log rather than on the card.
+
+NOTES
+• Layout hooks fire only for inflations that happen after
+  the global inflate hook is installed. Post-application
+  mode misses anything inflated during Application.onCreate.
+
+• Recommended scope is informational. It does not
+  pre-select anything.
+```
+
+### 5.0
+
+```
+NEW
+• ShizuPosed 5.0 release.
+
+• Shell base fallback and path resolution hardened across
+  both the manager and the shell side.
+
+• Multi-backend dispatcher refined. Pine AUTO remains the
+  primary engine; Pine REPLACEMENT, Amiru, Native,
+  Instrumentation, Proxy, and Noop round out the chain.
+
+• XStealth and XStealth Next documentation expanded.
+
+• Module scanner runs discovery before purge, preventing
+  spurious "1 module detected" notifications.
+
+• XposedHook.dex deployment hardened with size verification
+  and permission normalization.
+
+NOTES
+• ShizuPosed is not a drop-in LSPosed replacement. It uses
+  a different injection primitive and has a narrower reach.
+```
+
+### 4.9
+
+```
+NEW
+• API call protection. Hooks ClassLoader.loadClass and
+  Class.forName to refuse Xposed shim lookups from non-module
+  code. Raises the cost of runtime fingerprinting. Off by
+  default.
+
+• Dex optimization. Runs dex2oat on module dex files before
+  pushing them to the shell side. Falls back to the original
+  dex if optimization fails. Off by default.
+
+• Framework Info card now shows API Protection and Dex
+  Optimization state.
+
+CHANGED
+• libxstealth and libxstealth_next resolve their interposed
+  symbols through alias tables. A future bionic that renames
+  or hides a symbol is still reachable.
+
+• libxstealth_next also patches fstatat/newfstatat and the
+  generic syscall() dispatcher.
+
+• Failed symbol resolution is logged with the actual bytes,
+  so a bionic change is visible in logcat rather than silent.
+
+• Module scanner runs discovery before purge, so a module
+  the discovery pass just observed cannot be purged in the
+  same scan.
+
+• Module scanner refreshes stale apkPath values in place
+  instead of re-registering the module, eliminating another
+  source of spurious "detected" notifications.
+
+NOTES
+• API Protection and Dex Optimization are opt-in.
+• Neither engine catches a target that emits its own svc #0
+  instruction, kernel-level watchers, or inspection from a
+  root process outside the target.
+```
+
+### 4.6
+
+```
+NEW
+• XStealth Next — an opt-in native engine that inline-patches
+  libc syscall stubs. Catches detection code that resolves the
+  stub directly or goes through the generic syscall() dispatcher.
+
+• Turning on Next renames the module to "XStealth (Next)" in
+  the Modules tab.
+
+• Hide /proc entries is now a real toggle in the XStealth
+  detail sheet.
+
+• XStealth row shows the shield icon.
+
+CHANGED
+• XStealth master toggle moved out of Settings. The detail
+  sheet is the only place.
+
+• Sub-toggles are greyed out when the master is off.
+
+• The dead hideClassLoaderArtifacts flag was removed.
+```
+
+### 4.3
+
+```
+NEW
+• XStealth — built-in privacy module.
+
+• Shell base fallback for hardened ROMs.
+
+• findClassIfExists, findFieldIfExists, findMethodIfExists,
+  findConstructorIfExists added to XposedHelpers.
+```
+
+### Earlier
+
+See the release notes for 4.2 and below on the Releases page.
 
 ---
 
 ## Known limitations
 
-- `system_server` is not hooked.
-- `Activity.onCreate` and `Service.onCreate` are dispatched by AMS to the
-  original process. Pine and the native shim can hook them from bootstrap
-  mode when the ART layout allows; `Instrumentation` covers them when
-  neither can.
-- `Service.onCreate` is not covered by any fallback — Instrumentation
-  doesn't dispatch Service lifecycle.
-- XML-level resource replacement is not supported; only the programmatic
-  `setReplacement(id, value)` form.
-- No hot-reload; relaunch the target under ShizuPosed.
-- ROMs that block `app_process` under all names (`app_process64`,
-  `app_process`, `app_process32`) cannot run the framework at all.
-- The Repo tab is a placeholder; it does not fetch or install anything yet.
+These are structural, not bugs to be fixed.
 
-### Native shim specific
+`system_server` isn't hooked. `Service.onCreate` has no fallback. XML-level resource replacement isn't supported. No hot-reload. ROMs that block `app_process` can't run the framework. Modules that require zygote-wide timing won't work.
 
-- `libshizuposed.so` is **in-process only**. It cannot hook apps ShizuPosed
-  did not launch, `system_server`, `zygote`, or any other UID's process.
-  This is a hard constraint of running without root — no `ptrace`, no
-  cross-UID memory access — not a missing feature.
-- After-hooks are not dispatched from the native path. Use Pine when you
-  need `afterHookedMethod`.
-- Argument marshaling is not implemented in the native dispatcher. The
-  Java callback sees an empty `args` array. Hooks that read or mutate
-  arguments will not see them.
-- The inline (native symbol) hooker refuses prologues containing
-  PC-relative instructions. Only small leaf functions are hookable this
-  way; a full arm64 instruction decoder is not part of the shim.
-- Live-process hooking (after `Application.onCreate`) is not synchronised
-  against concurrent execution of the target method. It is safe under
-  bootstrap timing, which is the only mode ShizuPosed uses.
-- Only `arm64-v8a` is supported. The `.so` contains no armv7, x86, or
-  x86_64 code paths. On an x86_64 emulator, `System.loadLibrary` throws
-  and `NativeBackend` degrades to Pine.
+Layout hooks fire only for inflations that happen after the global inflate hook is installed. Post-application mode misses anything inflated during `Application.onCreate`.
+
+**Amiru-specific:** object arguments arrive as `null`, `thisObject` arrives as `null`, after-hooks aren't dispatched, JIT-inlined callers aren't invalidated, constructors aren't hookable, ARM64 only.
+
+**Native engines:** in-process only, object arguments and `thisObject` arrive as `null`, after-hooks aren't dispatched, ARM64 only.
+
+**XStealth:** defeats common detection checks, not a security boundary. The primary engine covers Java and libc-mediated code. Next covers libc syscall stubs. Neither covers raw `svc #0` instructions, kernel-level watchers, or inspection from a root process outside the target.
 
 ---
 
@@ -491,3 +567,11 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ```
+
+---
+
+## Acknowledgements
+
+Rikka, for Shizuku — the primitive that makes all of this possible. canyie, for Pine, the primary ART hooking engine. LSPosed, for the API generation ShizuPosed targets, and for the design of the module status provider contract.
+
+And every module author who kept the `de.robv.android.xposed.*` API alive long enough for an alternative to matter.

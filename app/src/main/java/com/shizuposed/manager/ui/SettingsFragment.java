@@ -5,7 +5,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.os.Build;
 import android.os.Bundle;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -13,7 +12,6 @@ import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.CompoundButton;
 import android.widget.EditText;
-import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -21,6 +19,7 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.fragment.app.Fragment;
 
+import com.google.android.material.materialswitch.MaterialSwitch;
 import com.shizuposed.manager.R;
 import com.shizuposed.manager.ShizukuHelper;
 import com.shizuposed.manager.ShizuPosedManagerApp;
@@ -32,43 +31,49 @@ import java.io.File;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+/**
+ * SettingsFragment
+ *
+ * App settings. The XStealth master toggle no longer lives here —
+ * it moved to the XStealth detail sheet, which is reached by
+ * tapping the XStealth row in the Modules tab. Settings keeps the
+ * runtime toggles (auto-start, debug, log-to-file), cache
+ * management, and config export.
+ */
 public class SettingsFragment extends Fragment {
-    private Switch swAutoStart, swDebugMode, swLogToFile;
+    private MaterialSwitch swAutoStart, swDebugMode, swLogToFile;
     private EditText etScanInterval, etHookDelay;
     private Button btnClearCache, btnExportConfig;
     private TextView tvVersion, tvShizukuStatus, tvServiceStatus;
+
     private Logger logger;
-    private ExecutorService executor = Executors.newSingleThreadExecutor();
     private ShizukuHelper shizukuHelper;
     private SharedPreferences prefs;
+    private ExecutorService executor = Executors.newSingleThreadExecutor();
 
-    // ─────────────────────────────────────────────────────────────
-    // NAMED LISTENERS
-    // Kept as fields so loadSettings() can detach them while it
-    // programmatically sets the switch state, and reattach after.
-    // ─────────────────────────────────────────────────────────────
+    private volatile boolean viewReady = false;
+
     private final CompoundButton.OnCheckedChangeListener autoStartListener =
         (buttonView, isChecked) -> {
             saveSetting("auto_start", isChecked);
             if (isChecked) {
                 enableBootReceiver();
-                tryStartServiceNowIfForeground();
-                Toast.makeText(requireContext(),
+                maybeStartServiceIfAuthorized();
+                if (isAdded()) Toast.makeText(requireContext(),
                     "Auto-start enabled — service will start after boot",
                     Toast.LENGTH_SHORT).show();
             } else {
                 disableBootReceiver();
-                Toast.makeText(requireContext(),
-                    "Auto-start disabled",
-                    Toast.LENGTH_SHORT).show();
+                if (isAdded()) Toast.makeText(requireContext(),
+                    "Auto-start disabled", Toast.LENGTH_SHORT).show();
             }
         };
 
     private final CompoundButton.OnCheckedChangeListener debugModeListener =
         (buttonView, isChecked) -> {
             saveSetting("debug_mode", isChecked);
-            Logger.getInstance(requireContext()).setDebug(isChecked);
-            Toast.makeText(requireContext(),
+            if (logger != null) logger.setDebug(isChecked);
+            if (isAdded()) Toast.makeText(requireContext(),
                 isChecked ? "Debug mode enabled" : "Debug mode disabled",
                 Toast.LENGTH_SHORT).show();
         };
@@ -76,28 +81,69 @@ public class SettingsFragment extends Fragment {
     private final CompoundButton.OnCheckedChangeListener logToFileListener =
         (buttonView, isChecked) -> {
             saveSetting("log_to_file", isChecked);
-            Logger.getInstance(requireContext()).setLogToFile(isChecked);
-            Toast.makeText(requireContext(),
+            if (logger != null) logger.setLogToFile(isChecked);
+            if (isAdded()) Toast.makeText(requireContext(),
                 isChecked ? "Logging to file enabled" : "Logging to file disabled",
                 Toast.LENGTH_SHORT).show();
         };
+
+    @Override
+    public void onAttach(@NonNull Context context) {
+        super.onAttach(context);
+        logger = Logger.getInstance(context);
+        shizukuHelper = ShizukuHelper.getInstance(context);
+        prefs = context.getSharedPreferences("shizuposed_settings", Context.MODE_PRIVATE);
+    }
 
     @Nullable
     @Override
     public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container,
                              @Nullable Bundle savedInstanceState) {
         View view = inflater.inflate(R.layout.fragment_settings, container, false);
-
-        logger = Logger.getInstance(requireContext());
-        shizukuHelper = ShizukuHelper.getInstance(requireContext());
-        prefs = requireContext().getSharedPreferences("shizuposed_settings", Context.MODE_PRIVATE);
-
         initViews(view);
+        return view;
+    }
+
+    @Override
+    public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
+        super.onViewCreated(view, savedInstanceState);
+        viewReady = true;
         setupListeners();
         loadSettings();
         updateRealStatus();
+    }
 
-        return view;
+    @Override
+    public void onResume() {
+        super.onResume();
+        if (logger == null) return;
+        loadSettings();
+        updateRealStatus();
+    }
+
+    @Override
+    public void onDestroyView() {
+        super.onDestroyView();
+        viewReady = false;
+        swAutoStart = null;
+        swDebugMode = null;
+        swLogToFile = null;
+        etScanInterval = null;
+        etHookDelay = null;
+        btnClearCache = null;
+        btnExportConfig = null;
+        tvVersion = null;
+        tvShizukuStatus = null;
+        tvServiceStatus = null;
+    }
+
+    @Override
+    public void onDetach() {
+        super.onDetach();
+        if (executor != null) {
+            executor.shutdownNow();
+            executor = null;
+        }
     }
 
     private void initViews(View view) {
@@ -112,87 +158,63 @@ public class SettingsFragment extends Fragment {
         tvShizukuStatus = view.findViewById(R.id.tvShizukuStatus);
         tvServiceStatus = view.findViewById(R.id.tvServiceStatus);
 
-        tvVersion.setText("v3.3");
+        if (tvVersion != null) tvVersion.setText("5.1");
     }
 
     private void setupListeners() {
-        btnClearCache.setOnClickListener(v -> clearCacheSafe());
-        btnExportConfig.setOnClickListener(v -> exportConfig());
-
-        swAutoStart.setOnCheckedChangeListener(autoStartListener);
-        swDebugMode.setOnCheckedChangeListener(debugModeListener);
-        swLogToFile.setOnCheckedChangeListener(logToFileListener);
+        if (btnClearCache != null) btnClearCache.setOnClickListener(v -> clearCacheSafe());
+        if (btnExportConfig != null) btnExportConfig.setOnClickListener(v -> exportConfig());
+        if (swAutoStart != null) swAutoStart.setOnCheckedChangeListener(autoStartListener);
+        if (swDebugMode != null) swDebugMode.setOnCheckedChangeListener(debugModeListener);
+        if (swLogToFile != null) swLogToFile.setOnCheckedChangeListener(logToFileListener);
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Boot receiver enable/disable
-    // ─────────────────────────────────────────────────────────────
-
     private void enableBootReceiver() {
+        if (!isAdded()) return;
         try {
             PackageManager pm = requireContext().getPackageManager();
             ComponentName receiver = new ComponentName(requireContext(), BootReceiver.class);
-            pm.setComponentEnabledSetting(
-                receiver,
+            pm.setComponentEnabledSetting(receiver,
                 PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-                PackageManager.DONT_KILL_APP
-            );
-            prefs.edit().putBoolean("boot_receiver_enabled", true).apply();
-            logger.i("BootReceiver enabled");
+                PackageManager.DONT_KILL_APP);
+            if (prefs != null) prefs.edit().putBoolean("boot_receiver_enabled", true).apply();
+            if (logger != null) logger.i("BootReceiver enabled");
         } catch (Exception e) {
-            logger.e("Failed to enable boot receiver: " + e.getMessage());
+            if (logger != null) logger.e("Failed to enable boot receiver: " + e.getMessage());
         }
     }
 
     private void disableBootReceiver() {
+        if (!isAdded()) return;
         try {
             PackageManager pm = requireContext().getPackageManager();
             ComponentName receiver = new ComponentName(requireContext(), BootReceiver.class);
-            pm.setComponentEnabledSetting(
-                receiver,
+            pm.setComponentEnabledSetting(receiver,
                 PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-                PackageManager.DONT_KILL_APP
-            );
-            prefs.edit().putBoolean("boot_receiver_enabled", false).apply();
-            logger.i("BootReceiver disabled");
+                PackageManager.DONT_KILL_APP);
+            if (prefs != null) prefs.edit().putBoolean("boot_receiver_enabled", false).apply();
+            if (logger != null) logger.i("BootReceiver disabled");
         } catch (Exception e) {
-            logger.e("Failed to disable boot receiver: " + e.getMessage());
+            if (logger != null) logger.e("Failed to disable boot receiver: " + e.getMessage());
         }
     }
 
-    /**
-     * If the user enables auto_start while the app is in the foreground,
-     * try to start the service right away. This is the one context where
-     * an FGS start is always allowed on Android 12+.
-     *
-     * Wrapped so a ForegroundServiceStartNotAllowedException (or any
-     * SecurityException on odd OEM ROMs) doesn't crash the app.
-     */
-    private void tryStartServiceNowIfForeground() {
-        if (!isAdded() || getContext() == null) return;
+    private void maybeStartServiceIfAuthorized() {
+        if (!isAdded()) return;
         try {
-            Intent svc = new Intent(requireContext(), ShizuPosedService.class);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                requireContext().startForegroundService(svc);
-            } else {
-                requireContext().startService(svc);
-            }
-            logger.i("Service start requested from Settings toggle");
+            ShizuPosedManagerApp app = ShizuPosedManagerApp.getInstance();
+            if (app == null) return;
+            if (!app.isShizukuAuthorized()) return;
+            app.autoStartService();
         } catch (Throwable t) {
-            logger.w("Foreground start refused (will retry at boot): "
+            if (logger != null) logger.w("maybeStartServiceIfAuthorized failed: "
                 + t.getClass().getSimpleName() + ": " + t.getMessage());
         }
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Settings load/save
-    // ─────────────────────────────────────────────────────────────
-
-    /**
-     * Populate the switches from prefs WITHOUT firing their listeners.
-     */
     private void loadSettings() {
-        if (prefs == null) return;
+        if (prefs == null || !viewReady) return;
+        if (swAutoStart == null) return;
 
         swAutoStart.setOnCheckedChangeListener(null);
         swDebugMode.setOnCheckedChangeListener(null);
@@ -201,16 +223,22 @@ public class SettingsFragment extends Fragment {
         swAutoStart.setChecked(prefs.getBoolean("auto_start", false));
         swDebugMode.setChecked(prefs.getBoolean("debug_mode", false));
         swLogToFile.setChecked(prefs.getBoolean("log_to_file", true));
-        etScanInterval.setText(prefs.getString("scan_interval", "1"));
-        etHookDelay.setText(prefs.getString("hook_delay", "5"));
+
+        if (etScanInterval != null) {
+            etScanInterval.setText(prefs.getString("scan_interval", "1"));
+        }
+        if (etHookDelay != null) {
+            etHookDelay.setText(prefs.getString("hook_delay", "5"));
+        }
 
         swAutoStart.setOnCheckedChangeListener(autoStartListener);
         swDebugMode.setOnCheckedChangeListener(debugModeListener);
         swLogToFile.setOnCheckedChangeListener(logToFileListener);
 
-        Logger logger = Logger.getInstance(requireContext());
-        logger.setDebug(prefs.getBoolean("debug_mode", false));
-        logger.setLogToFile(prefs.getBoolean("log_to_file", true));
+        if (logger != null) {
+            logger.setDebug(prefs.getBoolean("debug_mode", false));
+            logger.setLogToFile(prefs.getBoolean("log_to_file", true));
+        }
     }
 
     private void saveSetting(String key, boolean value) {
@@ -218,25 +246,17 @@ public class SettingsFragment extends Fragment {
         prefs.edit().putBoolean(key, value).apply();
     }
 
-    private void saveSetting(String key, String value) {
-        if (prefs == null) return;
-        prefs.edit().putString(key, value).apply();
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // Status display
-    // ─────────────────────────────────────────────────────────────
-
     private void updateRealStatus() {
-        if (!isAdded() || getContext() == null || getActivity() == null) return;
+        if (!viewReady || !isAdded() || getActivity() == null) return;
+        if (tvShizukuStatus == null || tvServiceStatus == null) return;
 
         requireActivity().runOnUiThread(() -> {
-            if (!isAdded()) return;
+            if (!isAdded() || tvShizukuStatus == null) return;
 
-            boolean shizukuAvailable = shizukuHelper.isAvailable();
-            boolean shizukuAuthorized = shizukuHelper.isAuthorized();
-            boolean isSui = shizukuHelper.isSui();
-            int version = shizukuHelper.getVersion();
+            boolean shizukuAvailable = shizukuHelper != null && shizukuHelper.isAvailable();
+            boolean shizukuAuthorized = shizukuHelper != null && shizukuHelper.isAuthorized();
+            boolean isSui = shizukuHelper != null && shizukuHelper.isSui();
+            int version = shizukuHelper == null ? 0 : shizukuHelper.getVersion();
 
             if (isSui) {
                 tvShizukuStatus.setText("✅ Sui Active (Root)");
@@ -248,7 +268,9 @@ public class SettingsFragment extends Fragment {
                 tvShizukuStatus.setText("⚠️ Available - Not Authorized");
                 tvShizukuStatus.setTextColor(requireContext().getColor(android.R.color.holo_orange_light));
             } else {
-                ShizukuHelper.ShizukuStatus status = shizukuHelper.checkShizukuActive();
+                ShizukuHelper.ShizukuStatus status = shizukuHelper == null
+                    ? ShizukuHelper.ShizukuStatus.NOT_INSTALLED
+                    : shizukuHelper.checkShizukuActive();
                 if (status == ShizukuHelper.ShizukuStatus.NOT_INSTALLED) {
                     tvShizukuStatus.setText("❌ Not Installed");
                 } else if (status == ShizukuHelper.ShizukuStatus.NOT_ACTIVE) {
@@ -264,25 +286,25 @@ public class SettingsFragment extends Fragment {
                 ShizuPosedService.isServiceRunning()
                 || (app != null && app.isServiceAutoStarted());
 
-            if (serviceRunning) {
-                tvServiceStatus.setText("✅ Running");
-                tvServiceStatus.setTextColor(requireContext().getColor(android.R.color.holo_green_light));
-            } else {
-                tvServiceStatus.setText("❌ Stopped");
-                tvServiceStatus.setTextColor(requireContext().getColor(android.R.color.holo_red_light));
+            if (tvServiceStatus != null) {
+                if (serviceRunning) {
+                    tvServiceStatus.setText("✅ Running");
+                    tvServiceStatus.setTextColor(requireContext().getColor(android.R.color.holo_green_light));
+                } else {
+                    tvServiceStatus.setText("❌ Stopped");
+                    tvServiceStatus.setTextColor(requireContext().getColor(android.R.color.holo_red_light));
+                }
             }
         });
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // Cache / export
-    // ─────────────────────────────────────────────────────────────
-
     private void clearCacheSafe() {
+        if (!isAdded() || executor == null) return;
         new android.app.AlertDialog.Builder(requireContext())
             .setTitle("Clear Cache")
             .setMessage("This will remove all cached DEX files and temporary data. Continue?")
             .setPositiveButton("Clear", (dialog, which) -> {
+                if (!isAdded()) return;
                 Toast.makeText(requireContext(), "Clearing cache...", Toast.LENGTH_SHORT).show();
 
                 executor.execute(() -> {
@@ -292,7 +314,6 @@ public class SettingsFragment extends Fragment {
                         File syscallCache = new File(requireContext().getFilesDir(), ".syscall_cache");
 
                         int deletedCount = 0;
-
                         if (internalCache != null && internalCache.exists()) {
                             deletedCount += deleteDirectorySafe(internalCache);
                         }
@@ -307,19 +328,23 @@ public class SettingsFragment extends Fragment {
                         }
 
                         final int finalCount = deletedCount;
-                        if (!isAdded()) return;
+                        if (!isAdded() || getActivity() == null) return;
                         requireActivity().runOnUiThread(() -> {
+                            if (!isAdded()) return;
                             Toast.makeText(requireContext(),
                                 "Cache cleared (" + finalCount + " files removed)",
                                 Toast.LENGTH_LONG).show();
-                            logger.i("Cache cleared, removed " + finalCount + " files");
+                            if (logger != null) logger.i("Cache cleared, removed " + finalCount + " files");
                         });
                     } catch (Exception e) {
-                        logger.e("Clear cache error: " + e.getMessage());
-                        if (!isAdded()) return;
-                        requireActivity().runOnUiThread(() -> Toast.makeText(requireContext(),
-                            "Error clearing cache: " + e.getMessage(),
-                            Toast.LENGTH_LONG).show());
+                        if (logger != null) logger.e("Clear cache error: " + e.getMessage());
+                        if (!isAdded() || getActivity() == null) return;
+                        requireActivity().runOnUiThread(() -> {
+                            if (!isAdded()) return;
+                            Toast.makeText(requireContext(),
+                                "Error clearing cache: " + e.getMessage(),
+                                Toast.LENGTH_LONG).show();
+                        });
                     }
                 });
             })
@@ -335,26 +360,24 @@ public class SettingsFragment extends Fragment {
                 File[] children = dir.listFiles();
                 if (children != null) {
                     for (File child : children) {
-                        if (child.isDirectory()) {
-                            count += deleteDirectorySafe(child);
-                        }
+                        if (child.isDirectory()) count += deleteDirectorySafe(child);
                         if (child.exists() && child.delete()) count++;
                     }
                 }
             }
             if (dir.exists() && dir.delete()) count++;
         } catch (Exception e) {
-            logger.e("Delete error: " + e.getMessage());
+            if (logger != null) logger.e("Delete error: " + e.getMessage());
         }
         return count;
     }
 
     private void exportConfig() {
+        if (!isAdded() || getContext() == null || prefs == null) return;
         try {
             StringBuilder config = new StringBuilder();
             config.append("# ShizuPosed Manager Configuration\n");
             config.append("# Generated: ").append(new java.util.Date()).append("\n\n");
-
             config.append("## Settings\n");
             config.append("auto_start=").append(prefs.getBoolean("auto_start", false)).append("\n");
             config.append("debug_mode=").append(prefs.getBoolean("debug_mode", false)).append("\n");
@@ -364,33 +387,43 @@ public class SettingsFragment extends Fragment {
             config.append("boot_receiver_enabled=")
                   .append(prefs.getBoolean("boot_receiver_enabled", false)).append("\n");
 
+            config.append("\n## XStealth\n");
+            config.append("xstealth_enabled=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isEnabled(requireContext()))
+                  .append("\n");
+            config.append("xstealth_next_enabled=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isNextEnabled(requireContext()))
+                  .append("\n");
+            config.append("xstealth_hide_dev_options=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isHideDevOptions(requireContext()))
+                  .append("\n");
+            config.append("xstealth_hide_adb=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isHideAdb(requireContext()))
+                  .append("\n");
+            config.append("xstealth_hide_shizuku_package=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isHideShizukuPackage(requireContext()))
+                  .append("\n");
+            config.append("xstealth_hide_shizuposed_package=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isHideShizuPosedPackage(requireContext()))
+                  .append("\n");
+            config.append("xstealth_hide_running_processes=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isHideRunningProcesses(requireContext()))
+                  .append("\n");
+            config.append("xstealth_hide_procfs=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isHideProcFs(requireContext()))
+                  .append("\n");
+
             String fileName = "shizuposed_config_"
                 + new java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.getDefault())
                 .format(new java.util.Date()) + ".txt";
-
             File configFile = new File(requireContext().getExternalFilesDir(null), fileName);
             com.shizuposed.manager.utils.FileUtils.writeFile(configFile, config.toString());
 
             Toast.makeText(requireContext(), "Config exported: " + fileName, Toast.LENGTH_LONG).show();
-            logger.i("Config exported: " + configFile.getAbsolutePath());
+            if (logger != null) logger.i("Config exported: " + configFile.getAbsolutePath());
         } catch (Exception e) {
             Toast.makeText(requireContext(), "Failed to export config", Toast.LENGTH_SHORT).show();
-            logger.e("Export error: " + e.getMessage());
-        }
-    }
-
-    @Override
-    public void onResume() {
-        super.onResume();
-        loadSettings();
-        updateRealStatus();
-    }
-
-    @Override
-    public void onDestroyView() {
-        super.onDestroyView();
-        if (executor != null) {
-            executor.shutdownNow();
+            if (logger != null) logger.e("Export error: " + e.getMessage());
         }
     }
 }

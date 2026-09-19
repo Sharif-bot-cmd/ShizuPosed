@@ -20,12 +20,43 @@
         android:orientation="vertical"
         android:layout_marginStart="12dp">
 
-        <TextView
-            android:id="@+id/tvAppName"
-            android:layout_width="wrap_content"
+        <!-- App name row: name + recommended badge -->
+        <LinearLayout
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="App Name"
-            android:textSize="14sp" />
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:id="@+id/tvAppName"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="App Name"
+                android:textSize="14sp"
+                android:maxLines="1"
+                android:ellipsize="end" />
+
+            <!--
+                ── CHANGE: recommended badge.
+                Small pill shown only on rows whose package is in the
+                module's recommended scope (assets/scope.list). Hidden
+                by default; visibility is driven by the adapter.
+            -->
+            <TextView
+                android:id="@+id/tvRecommendedBadge"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:text="Recommended"
+                android:textSize="10sp"
+                android:textStyle="bold"
+                android:textColor="?attr/colorPrimary"
+                android:background="@drawable/bg_recommended_badge"
+                android:paddingHorizontal="6dp"
+                android:paddingVertical="1dp"
+                android:visibility="gone" />
+
+        </LinearLayout>
 
         <TextView
             android:id="@+id/tvPackageName"

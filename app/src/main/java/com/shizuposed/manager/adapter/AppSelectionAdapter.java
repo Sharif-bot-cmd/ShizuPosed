@@ -17,6 +17,7 @@ import androidx.recyclerview.widget.RecyclerView;
 import com.shizuposed.manager.R;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -30,11 +31,27 @@ import java.util.Set;
  * name — not by position, and not by whether the app is currently
  * visible in the filtered list.
  *
+ * RECOMMENDED APPS
+ * ----------------
+ * A module can declare a recommended scope via assets/scope.list in
+ * its APK. ModuleLoader reads that list and stores it on
+ * ModuleInfo.recommendedApps. The dialog hands it to this adapter,
+ * which:
+ *   • renders a "Recommended" badge on those rows,
+ *   • sorts them to the top of the list,
+ *   • exposes selectRecommended() for the Recommended chip.
+ *
+ * The comparator is built by recommendedFirst() on each call rather
+ * than stored as a field. A field initializer cannot capture `this`,
+ * so a lambda that reads `packageManager` is rejected by javac when
+ * it appears in a field initializer — regardless of field order.
+ * Building it in a method sidesteps the rule. The comparator is
+ * cheap, so caching it would save nothing.
+ *
  * The checkbox's onCheckedChangeListener is always detached before the
  * programmatic setChecked(...) call, and reattached afterwards. This
  * prevents a recycled ViewHolder from firing its stale callback against
- * the wrong package name, which was the cause of the "checkbox state
- * disappears after search" symptom.
+ * the wrong package name.
  */
 public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapter.AppViewHolder> {
 
@@ -44,9 +61,14 @@ public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapte
 
     private List<ApplicationInfo> apps;
     private final Set<String> selectedApps;
+
     private final Context context;
     private final PackageManager packageManager;
+
     private OnSelectionChangedListener selectionChangedListener;
+
+    /** Packages the module declares as its recommended scope. */
+    private final Set<String> recommendedApps = new HashSet<>();
 
     public AppSelectionAdapter(Context context) {
         this.context = context;
@@ -59,9 +81,18 @@ public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapte
         this.selectionChangedListener = l;
     }
 
-    /** Replace the displayed list. Does NOT touch the selection. */
+    /**
+     * Replace the displayed list. Does NOT touch the selection.
+     * Recommended apps are sorted to the top.
+     */
     public void setApps(List<ApplicationInfo> apps) {
-        this.apps = apps != null ? apps : new ArrayList<>();
+        List<ApplicationInfo> copy = (apps != null)
+            ? new ArrayList<>(apps)
+            : new ArrayList<>();
+        try {
+            copy.sort(recommendedFirst());
+        } catch (Throwable ignored) {}
+        this.apps = copy;
         notifyDataSetChanged();
     }
 
@@ -80,27 +111,103 @@ public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapte
         return new HashSet<>(selectedApps);
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // RECOMMENDED
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Set the packages the module declares as its recommended scope.
+     * Copies the incoming set. Re-sorts the current list so the
+     * badge and the ordering stay in sync.
+     */
+    public void setRecommendedApps(Set<String> recommended) {
+        this.recommendedApps.clear();
+        if (recommended != null) {
+            this.recommendedApps.addAll(recommended);
+        }
+        try {
+            this.apps.sort(recommendedFirst());
+        } catch (Throwable ignored) {}
+        notifyDataSetChanged();
+    }
+
+    /**
+     * Returns a comparator that sorts recommended apps to the top,
+     * then alphabetically. Built on each call rather than stored as
+     * a field, because a field initializer cannot capture `this`.
+     */
+    private Comparator<ApplicationInfo> recommendedFirst() {
+        return (a, b) -> {
+            boolean ra = recommendedApps.contains(a.packageName);
+            boolean rb = recommendedApps.contains(b.packageName);
+            if (ra != rb) return ra ? -1 : 1;
+            try {
+                return a.loadLabel(packageManager).toString()
+                    .compareToIgnoreCase(b.loadLabel(packageManager).toString());
+            } catch (Throwable t) {
+                return 0;
+            }
+        };
+    }
+
+    /** Is this package in the recommended set? */
+    public boolean isRecommended(String packageName) {
+        return packageName != null && recommendedApps.contains(packageName);
+    }
+
+    /** How many recommended apps are currently visible? */
+    public int getRecommendedVisibleCount() {
+        int n = 0;
+        for (ApplicationInfo app : apps) {
+            if (app != null && recommendedApps.contains(app.packageName)) n++;
+        }
+        return n;
+    }
+
+    /**
+     * Select every recommended app that is currently in the
+     * displayed list. Like the other quick actions, this operates
+     * on the visible list — which, given recommended-first sorting,
+     * is the set the user is looking at.
+     */
+    public void selectRecommended() {
+        for (ApplicationInfo app : apps) {
+            if (app == null || app.packageName == null) continue;
+            if (recommendedApps.contains(app.packageName)) {
+                selectedApps.add(app.packageName);
+            }
+        }
+        notifyDataSetChanged();
+        notifySelectionChanged();
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // QUICK ACTIONS
+    // ═════════════════════════════════════════════════════════════
+
     public void selectAll() {
         for (ApplicationInfo app : apps) {
-            selectedApps.add(app.packageName);
+            if (app != null && app.packageName != null) {
+                selectedApps.add(app.packageName);
+            }
         }
         notifyDataSetChanged();
         notifySelectionChanged();
     }
 
     public void clearAll() {
-        // Only clear the visible ones? Or everything? Clear everything
-        // currently displayed — the user expects "clear the list I see".
-        for (ApplicationInfo app : apps) {
-            selectedApps.remove(app.packageName);
-        }
+        selectedApps.clear();
         notifyDataSetChanged();
         notifySelectionChanged();
     }
 
     public void selectSystemApps() {
         for (ApplicationInfo app : apps) {
-            if ((app.flags & ApplicationInfo.FLAG_SYSTEM) != 0) {
+            if (app == null || app.packageName == null) continue;
+            int flags = app.flags;
+            boolean isSystem = (flags & (ApplicationInfo.FLAG_SYSTEM
+                    | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) != 0;
+            if (isSystem) {
                 selectedApps.add(app.packageName);
             }
         }
@@ -135,14 +242,15 @@ public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapte
             holder.ivIcon.setImageResource(R.drawable.ic_module);
         }
 
+        // Recommended badge visibility.
+        if (holder.tvRecommendedBadge != null) {
+            holder.tvRecommendedBadge.setVisibility(
+                recommendedApps.contains(pkg) ? View.VISIBLE : View.GONE);
+        }
+
         // ── Critical ordering ─────────────────────────────────────
-        // 1. Detach the old listener first.
         holder.cbSelected.setOnCheckedChangeListener(null);
-
-        // 2. Set the checked state from the source of truth.
         holder.cbSelected.setChecked(selectedApps.contains(pkg));
-
-        // 3. Attach a NEW listener that closes over THIS app's package.
         holder.cbSelected.setOnCheckedChangeListener((buttonView, isChecked) -> {
             if (isChecked) {
                 selectedApps.add(pkg);
@@ -152,7 +260,6 @@ public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapte
             notifySelectionChanged();
         });
 
-        // 4. Row click toggles the checkbox (which fires the listener above).
         holder.itemView.setOnClickListener(v -> holder.cbSelected.toggle());
     }
 
@@ -169,7 +276,7 @@ public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapte
 
     static class AppViewHolder extends RecyclerView.ViewHolder {
         ImageView ivIcon;
-        TextView tvAppName, tvPackageName;
+        TextView tvAppName, tvPackageName, tvRecommendedBadge;
         CheckBox cbSelected;
 
         AppViewHolder(@NonNull View itemView) {
@@ -177,6 +284,7 @@ public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapte
             ivIcon = itemView.findViewById(R.id.ivIcon);
             tvAppName = itemView.findViewById(R.id.tvAppName);
             tvPackageName = itemView.findViewById(R.id.tvPackageName);
+            tvRecommendedBadge = itemView.findViewById(R.id.tvRecommendedBadge);
             cbSelected = itemView.findViewById(R.id.cbSelected);
         }
     }

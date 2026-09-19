@@ -10,6 +10,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.view.Menu;
 import android.view.MenuItem;
+import android.view.View;
 import android.widget.Toast;
 
 import androidx.activity.result.ActivityResultLauncher;
@@ -19,6 +20,10 @@ import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.Toolbar;
 import androidx.core.content.ContextCompat;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowCompat;
+import androidx.core.view.WindowInsetsCompat;
 import androidx.fragment.app.Fragment;
 import androidx.viewpager2.widget.ViewPager2;
 
@@ -35,7 +40,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class MainActivity extends AppCompatActivity {
-    private static final String VERSION_LABEL = "v3.3";
+    private static final String VERSION_LABEL = "5.1";
 
     private ViewPager2 viewPager;
     private BottomNavigationView bottomNavigation;
@@ -43,8 +48,6 @@ public class MainActivity extends AppCompatActivity {
     private MainPagerAdapter pagerAdapter;
     private ShizuPosedManagerApp app;
     private Logger logger;
-    private boolean shizukuAuthorized = false;
-    private boolean isShizukuAvailable = false;
     private boolean permissionsGranted = false;
     private boolean shizukuChecked = false;
 
@@ -69,12 +72,15 @@ public class MainActivity extends AppCompatActivity {
                 }
 
                 shizukuChecked = false;
-                mainHandler.postDelayed(this::checkShizukuAndRequestPermission, 500);
+                refreshShizukuStatus();
             });
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+
         setContentView(R.layout.activity_main);
 
         app = ShizuPosedManagerApp.getInstance();
@@ -82,6 +88,7 @@ public class MainActivity extends AppCompatActivity {
         logger = Logger.getInstance(this);
 
         initViews();
+        applyWindowInsets();
         setupToolbar();
         setupViewPager();
         setupBottomNavigation();
@@ -89,6 +96,28 @@ public class MainActivity extends AppCompatActivity {
         startServices();
         checkAndRequestPermissions();
     }
+
+    // ═════════════════════════════════════════════════════════════
+    // EDGE-TO-EDGE INSETS
+    // ═════════════════════════════════════════════════════════════
+
+    private void applyWindowInsets() {
+        View root = findViewById(android.R.id.content);
+        if (root == null) return;
+
+        ViewCompat.setOnApplyWindowInsetsListener(root, (v, insets) -> {
+            Insets bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars()
+                    | WindowInsetsCompat.Type.displayCutout());
+
+            v.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+            return WindowInsetsCompat.CONSUMED;
+        });
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // PERMISSIONS + INIT
+    // ═════════════════════════════════════════════════════════════
 
     private void checkAndRequestPermissions() {
         List<String> permissionsNeeded = new ArrayList<>();
@@ -106,17 +135,19 @@ public class MainActivity extends AppCompatActivity {
         } else {
             permissionsGranted = true;
             logger.i("✅ All permissions already granted");
-            mainHandler.postDelayed(this::checkShizukuAndRequestPermission, 300);
         }
+
+        mainHandler.postDelayed(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            refreshShizukuStatus();
+        }, 300);
     }
 
     public void onShizukuPermissionGranted() {
         runOnUiThread(() -> {
-            shizukuAuthorized = true;
-            isShizukuAvailable = true;
             shizukuChecked = true;
             notActiveDialogShownThisSession = false;
-            updateToolbarStatus(VERSION_LABEL + " • 🔑 Privileged");
+            updateToolbarFromHelper();
             refreshAll();
             invalidateOptionsMenu();
         });
@@ -129,76 +160,87 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    private void checkShizukuAndRequestPermission() {
-        if (shizukuChecked && shizukuAuthorized) {
-            logger.d("Shizuku already checked and authorized");
-            updateToolbarStatus(VERSION_LABEL + " • 🔑 Privileged");
-            return;
-        }
+    // ═════════════════════════════════════════════════════════════
+    // SHIZUKU STATE REFLECTION
+    // ═════════════════════════════════════════════════════════════
 
+    private void updateToolbarFromHelper() {
         try {
             ShizukuHelper helper = ShizukuHelper.getInstance(this);
-            isShizukuAvailable = helper.isAvailable();
-            shizukuAuthorized = helper.isAuthorized();
+            String status = helper.getStatusString();
+            updateToolbarStatus(VERSION_LABEL + " • " + status);
+        } catch (Throwable t) {
+            updateToolbarStatus(VERSION_LABEL);
+        }
+    }
+
+    private void refreshShizukuStatus() {
+        try {
+            ShizukuHelper helper = ShizukuHelper.getInstance(this);
+            boolean available = helper.isAvailable();
+            boolean authorized = helper.isAuthorized();
             shizukuChecked = true;
 
-            logger.i("Shizuku Status - Available: " + isShizukuAvailable
-                + ", Authorized: " + shizukuAuthorized);
+            String provider = helper.isSui() ? "Sui"
+                            : helper.isSheveryOnly() ? "Shevery(stub)"
+                            : "Shizuku";
 
-            if (!isShizukuAvailable) {
+            logger.i("Shizuku status — available=" + available
+                    + " authorized=" + authorized
+                    + " provider=" + provider);
+
+            if (!available) {
                 ShizukuHelper.ShizukuStatus status = helper.checkShizukuActive();
                 if (status == ShizukuHelper.ShizukuStatus.NOT_INSTALLED) {
                     showShizukuNotInstalledDialog();
-                    updateToolbarStatus(VERSION_LABEL + " • ❌ Shizuku Not Installed");
                 } else if (status == ShizukuHelper.ShizukuStatus.NOT_ACTIVE) {
                     if (!notActiveDialogShownThisSession) {
                         notActiveDialogShownThisSession = true;
                         showShizukuNotActiveDialog();
                     }
-                    updateToolbarStatus(VERSION_LABEL + " • ⏹ Shizuku Stopped");
-                } else {
-                    updateToolbarStatus(VERSION_LABEL + " • ❌ Shizuku Error");
                 }
-                return;
-            }
-
-            notActiveDialogShownThisSession = false;
-
-            if (!shizukuAuthorized) {
-                updateToolbarStatus(VERSION_LABEL + " • ⚠️ Not Authorized");
-                helper.requestPermission();
             } else {
-                updateToolbarStatus(VERSION_LABEL + " • 🔑 Privileged");
+                notActiveDialogShownThisSession = false;
             }
+
+            updateToolbarFromHelper();
+
         } catch (Exception e) {
             logger.e("Shizuku check error: " + e.getMessage());
             updateToolbarStatus(VERSION_LABEL + " • ⏹ Shizuku Stopped");
         }
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // SHIZUKU DIALOGS
+    // ═════════════════════════════════════════════════════════════
+
     private void showShizukuNotInstalledDialog() {
+        if (isFinishing() || isDestroyed()) return;
         new AlertDialog.Builder(this)
             .setTitle("Shizuku Not Found")
             .setMessage("Shizuku is required for privileged operations.\n\n" +
                        "Please install Shizuku from:\n" +
                        "• Google Play Store\n" +
                        "• F-Droid\n" +
-                       "• GitHub: https://github.com/thedjchi/Shizuku")
+                       "• GitHub: https://shizuku.rikka.app/")
             .setPositiveButton("Open Play Store", (d, w) -> {
                 try {
                     startActivity(new Intent(Intent.ACTION_VIEW,
                         Uri.parse("market://details?id=moe.shizuku.manager")));
                 } catch (Exception e) {
                     startActivity(new Intent(Intent.ACTION_VIEW,
-                        Uri.parse("https://github.com/thedjchi/Shizuku/releases")));
+                        Uri.parse("https://shizuku.rikka.app/")));
                 }
             })
-            .setNegativeButton("Skip", (d, w) -> updateToolbarStatus(VERSION_LABEL + " • ⚠️ Limited"))
+            .setNegativeButton("Skip", (d, w) ->
+                updateToolbarStatus(VERSION_LABEL + " • ⚠️ Limited"))
             .setCancelable(false)
             .show();
     }
 
     private void showShizukuNotActiveDialog() {
+        if (isFinishing() || isDestroyed()) return;
         new AlertDialog.Builder(this)
             .setTitle("Shizuku Not Running")
             .setMessage("Shizuku is installed but not running.\n\n" +
@@ -212,10 +254,12 @@ public class MainActivity extends AppCompatActivity {
                         .getLaunchIntentForPackage("moe.shizuku.manager");
                     if (intent != null) startActivity(intent);
                 } catch (Exception e) {
-                    Toast.makeText(this, "Please open Shizuku manually", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, "Please open Shizuku manually",
+                            Toast.LENGTH_SHORT).show();
                 }
             })
-            .setNegativeButton("Skip", (d, w) -> updateToolbarStatus(VERSION_LABEL + " • ⚠️ Limited"))
+            .setNegativeButton("Skip", (d, w) ->
+                updateToolbarStatus(VERSION_LABEL + " • ⚠️ Limited"))
             .setCancelable(false)
             .show();
     }
@@ -226,22 +270,44 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // LIFECYCLE
+    // ═════════════════════════════════════════════════════════════
+
     @Override
     protected void onResume() {
         super.onResume();
-        if (!shizukuAuthorized) {
-            shizukuChecked = false;
-            mainHandler.postDelayed(this::checkShizukuAndRequestPermission, 200);
-        } else {
-            updateToolbarStatus(VERSION_LABEL + " • 🔑 Privileged");
-        }
+
+        try {
+            ShizukuHelper.getInstance(this).refreshFromBinder();
+        } catch (Throwable ignored) {}
+
+        shizukuChecked = false;
+        mainHandler.postDelayed(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            refreshShizukuStatus();
+        }, 200);
+
         updateServiceMenuState();
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // VIEW SETUP
+    // ═════════════════════════════════════════════════════════════
+
     private void initViews() {
         viewPager = findViewById(R.id.viewPager);
-        bottomNavigation = findViewById(R.id.bottomNavigation);
         toolbar = findViewById(R.id.toolbar);
+
+        // The layout names the concrete BottomNavigationView subclass.
+        // The previous version named the abstract NavigationBarView
+        // base, which the inflater cannot instantiate regardless of
+        // R8 — that was the source of the NoSuchMethodException in
+        // the 5.0 crash. ProGuard rules now also pin the constructors
+        // of both the base and the concrete class, so even if the
+        // layout tag is ever changed back by mistake, the reflective
+        // lookup still succeeds.
+        bottomNavigation = findViewById(R.id.bottomNavigation);
     }
 
     private void setupToolbar() {
@@ -259,6 +325,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setupBottomNavigation() {
+        if (bottomNavigation == null) return;
+
         bottomNavigation.setOnItemSelectedListener(item -> {
             int itemId = item.getItemId();
             if (itemId == R.id.nav_home)     { viewPager.setCurrentItem(0); return true; }
@@ -270,26 +338,32 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
-    /**
-     * Start the foreground service.
-     *
-     * Skips the start if the Application already auto-started it — this
-     * prevents two back-to-back startForegroundService() calls during
-     * cold start, which is a known trigger for
-     * ForegroundServiceDidNotStartInTimeException on ColorOS.
-     */
+    // ═════════════════════════════════════════════════════════════
+    // SERVICE LIFECYCLE
+    // ═════════════════════════════════════════════════════════════
+
     private void startServices() {
         try {
-            if (app != null && app.isServiceAutoStarted()) {
-                logger.d("Service already auto-started by Application — skipping startServices()");
+            ShizukuHelper helper = ShizukuHelper.getInstance(this);
+            boolean authorized = helper.isAvailable() && helper.isAuthorized();
+            if (!authorized) {
+                logger.i("startServices: Shizuku not authorized — deferring "
+                        + "service start until grant arrives");
                 return;
             }
+
+            if (app != null && app.isServiceAutoStarted()) {
+                logger.d("Service already auto-started by Application — skipping");
+                return;
+            }
+
             Intent serviceIntent = new Intent(this, ShizuPosedService.class);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(serviceIntent);
             } else {
                 startService(serviceIntent);
             }
+            logger.i("Service start dispatched from MainActivity");
         } catch (Throwable t) {
             logger.e("Failed to start service: " + t.getMessage());
         }
@@ -305,10 +379,16 @@ public class MainActivity extends AppCompatActivity {
     public boolean onPrepareOptionsMenu(Menu menu) {
         boolean running = isShizuPosedServiceRunning();
 
+        boolean authorized = false;
+        try {
+            ShizukuHelper helper = ShizukuHelper.getInstance(this);
+            authorized = helper.isAvailable() && helper.isAuthorized();
+        } catch (Throwable ignored) {}
+
         MenuItem startItem = menu.findItem(R.id.action_start_service);
         MenuItem stopItem  = menu.findItem(R.id.action_stop_service);
 
-        if (startItem != null) startItem.setVisible(!running);
+        if (startItem != null) startItem.setVisible(authorized && !running);
         if (stopItem != null)  stopItem.setVisible(running);
 
         lastServiceRunning = running;
@@ -319,28 +399,18 @@ public class MainActivity extends AppCompatActivity {
     public boolean onOptionsItemSelected(@NonNull MenuItem item) {
         int id = item.getItemId();
 
-        if (id == R.id.action_grant_shizuku) {
-            shizukuChecked = false;
-            ShizukuHelper.getInstance(this).requestPermission();
-            Toast.makeText(this, "Check Shizuku app", Toast.LENGTH_SHORT).show();
-            return true;
-
-        } else if (id == R.id.action_start_service) {
+        if (id == R.id.action_start_service) {
             handleStartService();
             return true;
-
         } else if (id == R.id.action_stop_service) {
             handleStopService();
             return true;
-
         } else if (id == R.id.action_status) {
             showStatusDialog();
             return true;
-
         } else if (id == R.id.action_refresh) {
             refreshAll();
             return true;
-
         } else if (id == R.id.action_restart) {
             restartServices();
             return true;
@@ -350,11 +420,23 @@ public class MainActivity extends AppCompatActivity {
 
     private void handleStartService() {
         try {
+            ShizukuHelper helper = ShizukuHelper.getInstance(this);
+            if (!helper.isAvailable() || !helper.isAuthorized()) {
+                Toast.makeText(this,
+                    "Cannot start: Shizuku is not authorized.\n" +
+                    "Open Shizuku and grant permission first.",
+                    Toast.LENGTH_LONG).show();
+                logger.w("handleStartService blocked: Shizuku not authorized");
+                return;
+            }
+
             if (app != null && app.isServiceAutoStarted()) {
-                Toast.makeText(this, "Service already running", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "Service already running",
+                        Toast.LENGTH_SHORT).show();
                 updateServiceMenuState();
                 return;
             }
+
             Intent serviceIntent = new Intent(this, ShizuPosedService.class);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(serviceIntent);
@@ -365,12 +447,14 @@ public class MainActivity extends AppCompatActivity {
             logger.i("Service start requested from menu");
 
             mainHandler.postDelayed(() -> {
+                if (isFinishing() || isDestroyed()) return;
                 updateServiceMenuState();
                 refreshAll();
             }, 500);
 
         } catch (Throwable t) {
-            Toast.makeText(this, "Failed to start service", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Failed to start service",
+                    Toast.LENGTH_SHORT).show();
             logger.e("handleStartService error: " + t.getMessage());
         }
     }
@@ -380,23 +464,27 @@ public class MainActivity extends AppCompatActivity {
             .setTitle("Stop Service")
             .setMessage("Stop the ShizuPosed service?\n\n" +
                        "Running hooks will continue in already-launched targets, " +
-                       "but new targets will not be hooked until the service is started again.")
+                       "but new targets will not be hooked until the service " +
+                       "is started again.")
             .setPositiveButton("Stop", (d, w) -> {
                 try {
                     Intent serviceIntent = new Intent(this, ShizuPosedService.class);
                     stopService(serviceIntent);
-                    Toast.makeText(this, "Service stopped", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, "Service stopped",
+                            Toast.LENGTH_SHORT).show();
                     logger.i("Service stop requested from menu");
 
                     lastServiceRunning = false;
                     invalidateOptionsMenu();
                     mainHandler.postDelayed(() -> {
+                        if (isFinishing() || isDestroyed()) return;
                         updateServiceMenuState();
                         refreshAll();
                     }, 500);
 
                 } catch (Throwable t) {
-                    Toast.makeText(this, "Failed to stop service", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, "Failed to stop service",
+                            Toast.LENGTH_SHORT).show();
                     logger.e("handleStopService error: " + t.getMessage());
                 }
             })
@@ -423,24 +511,46 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void refreshAll() {
+        if (pagerAdapter == null) return;
+
         for (int i = 0; i < pagerAdapter.getItemCount(); i++) {
             Fragment fragment = pagerAdapter.getFragment(i);
-            if (fragment instanceof HomeFragment) {
-                ((HomeFragment) fragment).refresh();
-            } else if (fragment instanceof ModulesFragment) {
-                ((ModulesFragment) fragment).refresh();
-            } else if (fragment instanceof RepoFragment) {
-                ((RepoFragment) fragment).refresh();
-            } else if (fragment instanceof LogsFragment) {
-                ((LogsFragment) fragment).refresh();
+            if (fragment == null) continue;
+            if (!fragment.isAdded()) continue;
+
+            try {
+                if (fragment instanceof HomeFragment) {
+                    ((HomeFragment) fragment).refresh();
+                } else if (fragment instanceof ModulesFragment) {
+                    ((ModulesFragment) fragment).refresh();
+                } else if (fragment instanceof RepoFragment) {
+                    ((RepoFragment) fragment).refresh();
+                } else if (fragment instanceof LogsFragment) {
+                    ((LogsFragment) fragment).refresh();
+                }
+            } catch (Throwable t) {
+                if (logger != null) {
+                    logger.e("refreshAll: " + fragment.getClass().getSimpleName()
+                            + " threw: " + t.getMessage());
+                }
             }
         }
+
         shizukuChecked = false;
-        checkShizukuAndRequestPermission();
+        refreshShizukuStatus();
     }
 
     private void restartServices() {
         try {
+            ShizukuHelper helper = ShizukuHelper.getInstance(this);
+            if (!helper.isAvailable() || !helper.isAuthorized()) {
+                Toast.makeText(this,
+                    "Cannot restart: Shizuku is not authorized.",
+                    Toast.LENGTH_LONG).show();
+                logger.w("restartServices blocked: Shizuku not authorized");
+                return;
+            }
+
             Intent serviceIntent = new Intent(this, ShizuPosedService.class);
             stopService(serviceIntent);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -451,11 +561,13 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "Service restarted", Toast.LENGTH_SHORT).show();
 
             mainHandler.postDelayed(() -> {
+                if (isFinishing() || isDestroyed()) return;
                 updateServiceMenuState();
                 refreshAll();
             }, 500);
         } catch (Throwable t) {
-            Toast.makeText(this, "Failed to restart service", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Failed to restart service",
+                    Toast.LENGTH_SHORT).show();
             logger.e("Restart service error: " + t.getMessage());
         }
     }
@@ -466,11 +578,12 @@ public class MainActivity extends AppCompatActivity {
         boolean authorized = helper.isAuthorized();
         int version = helper.getVersion();
         boolean isSui = helper.isSui();
+        boolean sheveryOnly = helper.isSheveryOnly();
 
         boolean serviceRunning = isShizuPosedServiceRunning();
 
         StringBuilder status = new StringBuilder();
-        status.append("ShizuPosed").append(VERSION_LABEL).append("\n\n");
+        status.append("ShizuPosed ").append(VERSION_LABEL).append("\n\n");
         status.append("Permissions: ")
               .append(permissionsGranted ? "✅ Granted" : "⚠️ Missing").append("\n");
         status.append("Shizuku Status: ")
@@ -480,6 +593,9 @@ public class MainActivity extends AppCompatActivity {
         status.append("Shizuku Version: ").append(version).append("\n");
         if (isSui) {
             status.append("Sui Active: ✅ Yes\n");
+        }
+        if (sheveryOnly) {
+            status.append("Provider: Shevery (compat layer)\n");
         }
         status.append("\n");
         status.append("Service: ")

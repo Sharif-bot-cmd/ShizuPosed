@@ -28,6 +28,41 @@ public final class XposedHelpers {
         return com.shizuposed.manager.core.XposedHelpersImpl.findClass(className, cl);
     }
 
+    /**
+     * Like {@link #findClass(String, ClassLoader)} but returns null
+     * instead of throwing when the class cannot be loaded.
+     *
+     * Modules use this to probe for optional classes — classes that
+     * exist on some Android versions or some OEM ROMs but not others
+     * — without wrapping every lookup in a try/catch.
+     *
+     * @param className   fully-qualified name, e.g.
+     *                    "android.provider.Settings$Global"
+     * @param classLoader loader to resolve against; if null, the
+     *                    caller's own classloader is used
+     * @return the Class, or null if it cannot be found
+     */
+    public static Class<?> findClassIfExists(String className, ClassLoader classLoader) {
+        if (className == null) return null;
+        try {
+            if (classLoader != null) {
+                return Class.forName(className, false, classLoader);
+            }
+            // Fall back to the shim's own loader. In practice this is
+            // the same classloader the module was loaded with, so the
+            // lookup succeeds against the same set of classes the
+            // module can see.
+            return Class.forName(className, false, XposedHelpers.class.getClassLoader());
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** Convenience overload that uses the shim's own classloader. */
+    public static Class<?> findClassIfExists(String className) {
+        return findClassIfExists(className, null);
+    }
+
     public static Object newInstance(Class<?> clazz, Object... args) {
         return com.shizuposed.manager.core.XposedHelpersImpl.newInstance(clazz, args);
     }
@@ -54,6 +89,69 @@ public final class XposedHelpers {
 
     public static Object callStaticMethod(Class<?> clazz, String methodName, Object... args) {
         return com.shizuposed.manager.core.XposedHelpersImpl.callStaticMethod(clazz, methodName, args);
+    }
+
+    /**
+     * Find a field on a class hierarchy, walking up superclasses if
+     * the field is not declared on the class itself. Returns the
+     * Field or null.
+     */
+    public static java.lang.reflect.Field findFieldIfExists(Class<?> clazz, String fieldName) {
+        if (clazz == null || fieldName == null) return null;
+        Class<?> cur = clazz;
+        while (cur != null) {
+            try {
+                java.lang.reflect.Field f = cur.getDeclaredField(fieldName);
+                com.shizuposed.manager.core.compat.HiddenApiBypass.forceAccessible(f);
+                return f;
+            } catch (NoSuchFieldException ignored) {
+            } catch (Throwable t) {
+                return null;
+            }
+            cur = cur.getSuperclass();
+        }
+        return null;
+    }
+
+    /**
+     * Find a method on a class hierarchy with the given parameter
+     * types. Returns the Method or null.
+     */
+    public static java.lang.reflect.Method findMethodIfExists(
+            Class<?> clazz, String methodName, Class<?>... parameterTypes) {
+        if (clazz == null || methodName == null) return null;
+        Class<?> cur = clazz;
+        while (cur != null) {
+            try {
+                java.lang.reflect.Method m = cur.getDeclaredMethod(
+                    methodName, parameterTypes);
+                com.shizuposed.manager.core.compat.HiddenApiBypass.forceAccessible(m);
+                return m;
+            } catch (NoSuchMethodException ignored) {
+            } catch (Throwable t) {
+                return null;
+            }
+            cur = cur.getSuperclass();
+        }
+        return null;
+    }
+
+    /**
+     * Find a constructor with the given parameter types. Returns the
+     * Constructor or null.
+     */
+    public static java.lang.reflect.Constructor<?> findConstructorIfExists(
+            Class<?> clazz, Class<?>... parameterTypes) {
+        if (clazz == null) return null;
+        try {
+            java.lang.reflect.Constructor<?> c = clazz.getDeclaredConstructor(parameterTypes);
+            com.shizuposed.manager.core.compat.HiddenApiBypass.forceAccessible(c);
+            return c;
+        } catch (NoSuchMethodException ignored) {
+            return null;
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     // ═════════════════════════════════════════════════════════════

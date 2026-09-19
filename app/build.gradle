@@ -11,9 +11,6 @@ if (keystorePropsFile.exists()) {
 android {
     namespace 'com.shizuposed.manager'
 
-    // API 37 uses minor-versioned platforms (android-37.0, 37.1, 37.2).
-    // AGP 8.10+ exposes compileSdkMinor. If your AGP is older and rejects
-    // it, comment the line out — AGP will fall back to "android-37".
     compileSdk 37
     compileSdkMinor 0
 
@@ -21,13 +18,10 @@ android {
         applicationId "com.shizuposed.manager"
         minSdk 29
         targetSdk 37
-        versionCode 17
-        versionName "3.3"
+        versionCode 51
+        versionName "R-5.1"
 
         ndk {
-            // Only arm64 is supported by libshizuposed.so. Shipping other
-            // ABIs would produce an APK that installs on x86_64 emulators
-            // but whose native hooks silently fall through to Pine.
             abiFilters 'arm64-v8a'
         }
     }
@@ -86,22 +80,17 @@ android {
                 'META-INF/NOTICE.txt'
             ]
         }
-        // Keep libshizuposed.so uncompressed so dlopen can mmap it from
-        // the APK directly. NativeBridge.dispatchStubAddress() does
-        // dlsym("libshizuposed.so", ...) against the already-loaded lib;
-        // if the loader extracted a compressed copy instead, that lookup
-        // still works but costs an extraction on every process start.
         jniLibs {
             useLegacyPackaging = true
-            // Belt-and-braces: if a future AGP version changes the
-            // default, keep the .so out of any compressor.
-            keepDebugSymbols += ['**/libshizuposed.so']
+            keepDebugSymbols += [
+                '**/libshizuposed.so',
+                '**/libamiru.so',
+                '**/libxstealth.so',
+                '**/libxstealth_next.so'
+            ]
         }
     }
 
-    // jniLibs is the default source dir, but we make it explicit so
-    // there's no ambiguity for anyone reading this file. The .so is
-    // built by `native/build-termux.sh` or the one-liner in the README.
     sourceSets {
         main {
             jniLibs.srcDirs = ['src/main/jniLibs']
@@ -128,14 +117,20 @@ dependencies {
     implementation files('libs/shizuku-shared.jar')
     implementation files('libs/pine-0.3.0.jar')
 
-    implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'com.google.android.material:material:1.12.0'
+
+    implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
     implementation 'androidx.core:core:1.13.1'
+
+    implementation 'androidx.activity:activity:1.9.0'
+
     implementation 'androidx.lifecycle:lifecycle-viewmodel:2.8.4'
     implementation 'androidx.lifecycle:lifecycle-livedata:2.8.4'
+
     implementation 'androidx.recyclerview:recyclerview:1.3.2'
     implementation 'androidx.cardview:cardview:1.0.0'
+
     implementation 'androidx.preference:preference:1.2.1'
 
     implementation 'com.google.code.gson:gson:2.11.0'
@@ -146,18 +141,18 @@ dependencies {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// libshizuposed.so presence check
+// Native library presence checks
 //
-// The native shim is built outside Gradle (clang one-liner, Termux-friendly).
-// This task fails the build early with a clear message if the .so is
-// missing, instead of letting the APK ship without it and NativeBackend
-// silently degrade to Pine-only.
+// libshizuposed.so        required — NativeBackend depends on it.
+// libamiru.so             optional — AmiruBackend reports unavailable.
+// libxstealth.so          optional — XStealthNative reports unavailable.
+// libxstealth_next.so     optional — XStealthNativeNext reports unavailable.
 //
-// Skip with: -PskipNativeCheck=true
+// Skip all four with: -PskipNativeCheck=true
 // ─────────────────────────────────────────────────────────────────────────
 
 tasks.register('checkNativeShim') {
-    description = 'Verify libshizuposed.so is present for arm64-v8a'
+    description = 'Verify libshizuposed.so is present for arm64-v8a (required)'
     group = 'verification'
 
     doLast {
@@ -188,20 +183,121 @@ tasks.register('checkNativeShim') {
     }
 }
 
+tasks.register('checkAmiru') {
+    description = 'Verify libamiru.so is present for arm64-v8a (optional)'
+    group = 'verification'
+
+    doLast {
+        if (project.hasProperty('skipNativeCheck')
+                && project.property('skipNativeCheck') == 'true') {
+            println "checkAmiru: skipped via -PskipNativeCheck=true"
+            return
+        }
+        def so = file('src/main/jniLibs/arm64-v8a/libamiru.so')
+        if (!so.exists()) {
+            logger.warn(
+                "libamiru.so not found at ${so.absolutePath}\n" +
+                "  Amiru will be unavailable and the dispatcher will fall\n" +
+                "  through to the existing native shim. To build it:\n" +
+                "    clang -shared -fPIC -O2 -Wall -Wextra \\\n" +
+                "        --target=aarch64-linux-android29 \\\n" +
+                "        -o app/src/main/jniLibs/arm64-v8a/libamiru.so \\\n" +
+                "        native/libamiru.c -llog -ldl\n" +
+                "  This is a warning, not an error — the build will proceed.")
+            return
+        }
+        def len = so.length()
+        if (len < 1024) {
+            logger.warn(
+                "libamiru.so at ${so.absolutePath} is only ${len} bytes — " +
+                "probably a failed or empty build. Amiru will be unavailable.")
+            return
+        }
+        println "checkAmiru: OK — ${len} bytes at ${so.absolutePath}"
+    }
+}
+
+tasks.register('checkXStealth') {
+    description = 'Verify libxstealth.so is present for arm64-v8a (optional)'
+    group = 'verification'
+
+    doLast {
+        if (project.hasProperty('skipNativeCheck')
+                && project.property('skipNativeCheck') == 'true') {
+            println "checkXStealth: skipped via -PskipNativeCheck=true"
+            return
+        }
+        def so = file('src/main/jniLibs/arm64-v8a/libxstealth.so')
+        if (!so.exists()) {
+            logger.warn(
+                "libxstealth.so not found at ${so.absolutePath}\n" +
+                "  XStealth native hiding will be unavailable. The Java-level\n" +
+                "  hiding checks still work; the native fallback that covers\n" +
+                "  /proc reads and libc file access does not. To build it:\n" +
+                "    clang -shared -fPIC -O2 -Wall -Wextra \\\n" +
+                "        --target=aarch64-linux-android29 \\\n" +
+                "        -o app/src/main/jniLibs/arm64-v8a/libxstealth.so \\\n" +
+                "        native/libxstealth.c -llog -ldl\n" +
+                "  This is a warning, not an error — the build will proceed.")
+            return
+        }
+        def len = so.length()
+        if (len < 1024) {
+            logger.warn(
+                "libxstealth.so at ${so.absolutePath} is only ${len} bytes — " +
+                "probably a failed or empty build. XStealth native hiding " +
+                "will be unavailable.")
+            return
+        }
+        println "checkXStealth: OK — ${len} bytes at ${so.absolutePath}"
+    }
+}
+
+tasks.register('checkXStealthNext') {
+    description = 'Verify libxstealth_next.so is present (optional)'
+    group = 'verification'
+
+    doLast {
+        if (project.hasProperty('skipNativeCheck')
+                && project.property('skipNativeCheck') == 'true') {
+            println "checkXStealthNext: skipped via -PskipNativeCheck=true"
+            return
+        }
+        def so = file('src/main/jniLibs/arm64-v8a/libxstealth_next.so')
+        if (!so.exists()) {
+            logger.warn(
+                "libxstealth_next.so not found at ${so.absolutePath}\n" +
+                "  XStealth Next will be unavailable. The standard XStealth\n" +
+                "  engine still works. To build Next:\n" +
+                "    clang -shared -fPIC -O2 -Wall -Wextra \\\n" +
+                "        --target=aarch64-linux-android29 \\\n" +
+                "        -o app/src/main/jniLibs/arm64-v8a/libxstealth_next.so \\\n" +
+                "        native/libxstealth_next.c -llog -ldl\n" +
+                "  This is a warning, not an error.")
+            return
+        }
+        def len = so.length()
+        if (len < 1024) {
+            logger.warn("libxstealth_next.so is only ${len} bytes.")
+            return
+        }
+        println "checkXStealthNext: OK — ${len} bytes"
+    }
+}
+
+// Wire all four checks in front of the jniLibs merge. This is the
+// single place that attaches the checks to the build. Do not add
+// a second tasks.matching{} block for the same purpose.
 tasks.matching { it.name == 'mergeDebugJniLibFolders' ||
                  it.name == 'mergeReleaseJniLibFolders' }.configureEach {
     dependsOn 'checkNativeShim'
+    dependsOn 'checkAmiru'
+    dependsOn 'checkXStealth'
+    dependsOn 'checkXStealthNext'
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // XposedHook.dex pipeline
-//
-// Notes:
-//  • Uses AGP's android.jar from the resolved compileSdk platform, not
-//    android.bootClasspath (removed in newer AGP).
-//  • Uses android.defaultConfig.minSdk for --min-api.
-//  • Output-only inputs (see below) — no `inputs.dir` on the classes dir.
-//  • Writes only into build/, never into src/.
 // ─────────────────────────────────────────────────────────────────────────
 
 tasks.register('makeDex') {
@@ -214,8 +310,6 @@ tasks.register('makeDex') {
     def outDirProvider     = layout.buildDirectory.dir('outputs/dex')
     def outDexProvider     = outDirProvider.map { dir -> new File(dir.asFile, 'XposedHook.dex') }
 
-    // Output-only. Gradle tracks these for up-to-date checks without
-    // needing the input directory to exist at configuration time.
     outputs.dir(outDirProvider)
     outputs.file(outDexProvider)
 
@@ -244,11 +338,6 @@ tasks.register('makeDex') {
             "d8 not found under $buildToolsRoot. Install build-tools via sdkmanager.")
     }
 
-    // Resolve android.jar once at configuration time. We know the
-    // compileSdk and the minor version from the android { } block above.
-    // API 37 uses a versioned platform dir (android-37.0) on newer AGP;
-    // fall back to android-37 for older AGP, then to android-36 as a
-    // last resort so the build still works on the API 36 preview SDK.
     def compileSdkVersion = android.compileSdk
     def compileSdkMinor   = 0
     try {
@@ -298,7 +387,9 @@ tasks.register('makeDex') {
         classesDir.eachFileRecurse { f ->
             if (!f.name.endsWith('.class')) return
             def p = f.absolutePath
-            if (p.contains('/core/') || p.contains('/de/robv/android/xposed/')) {
+            if (p.contains('/core/')
+                    || p.contains('/de/robv/android/xposed/')
+                    || p.contains('/stealth/')) {
                 wanted << p
             }
         }
@@ -349,7 +440,6 @@ tasks.register('makeDex') {
             println "makeDex: warning — could not resolve debugCompileClasspath: ${t.message}"
         }
 
-        // Add the resolved android.jar as a --lib entry.
         libJars << platformJar.absolutePath
         println "makeDex: using platform jar ${platformJar.absolutePath}"
         println "makeDex: platform dir ${platformDirUsed.absolutePath}"
