@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Small rounded pill used behind the "Recommended" label on
+    app rows in the scope editor. Tinted with the theme's primary
+    color at low alpha so it reads as an accent without competing
+    with the app name.
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="#1F6750A4" />
+    <corners android:radius="4dp" />
+    <padding
+        android:left="6dp"
+        android:top="1dp"
+        android:right="6dp"
+        android:bottom="1dp" />
+</shape>

@@ -14,55 +14,80 @@
         android:text="Select Apps to Hook"
         android:textSize="18sp"
         android:textStyle="bold"
+        android:textColor="?attr/colorOnSurface"
         android:layout_marginBottom="12dp" />
 
-    <!-- Quick Actions -->
-    <LinearLayout
+    <!-- Quick actions -->
+    <com.google.android.material.chip.ChipGroup
+        android:id="@+id/chipGroupFilters"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:layout_marginBottom="12dp">
+        android:layout_marginBottom="8dp"
+        app:singleLine="true"
+        app:singleSelection="false"
+        app:chipSpacingHorizontal="8dp"
+        app:chipSpacingVertical="4dp"
+        android:gravity="end">
 
-        <Button
-            android:id="@+id/btnSelectAll"
-            android:layout_width="0dp"
+        <com.google.android.material.chip.Chip
+            android:id="@+id/chipRecommended"
+            style="@style/Widget.Material3.Chip.Assist"
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
+            android:text="Recommended"
+            android:checkable="false"
+            android:clickable="true"
+            android:focusable="true"
+            android:visibility="gone" />
+
+        <com.google.android.material.chip.Chip
+            android:id="@+id/chipSelectAll"
+            style="@style/Widget.Material3.Chip.Assist"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
             android:text="All"
-            android:layout_marginEnd="4dp"
-            style="@style/Widget.AppCompat.Button.Borderless" />
+            android:checkable="false"
+            android:clickable="true"
+            android:focusable="true" />
 
-        <Button
-            android:id="@+id/btnClearAll"
-            android:layout_width="0dp"
+        <com.google.android.material.chip.Chip
+            android:id="@+id/chipClearAll"
+            style="@style/Widget.Material3.Chip.Assist"
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
             android:text="Clear"
-            android:layout_marginStart="4dp"
-            android:layout_marginEnd="4dp"
-            style="@style/Widget.AppCompat.Button.Borderless" />
+            android:checkable="false"
+            android:clickable="true"
+            android:focusable="true" />
 
-        <Button
-            android:id="@+id/btnSelectSystem"
-            android:layout_width="0dp"
+        <com.google.android.material.chip.Chip
+            android:id="@+id/chipSelectSystem"
+            style="@style/Widget.Material3.Chip.Assist"
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
             android:text="System"
-            android:layout_marginStart="4dp"
-            style="@style/Widget.AppCompat.Button.Borderless" />
+            android:checkable="false"
+            android:clickable="true"
+            android:focusable="true" />
 
-    </LinearLayout>
+    </com.google.android.material.chip.ChipGroup>
 
     <!-- Search -->
-    <EditText
-        android:id="@+id/etSearchApps"
+    <com.google.android.material.textfield.TextInputLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:hint="Search apps..."
-        android:inputType="text"
-        android:padding="12dp"
-        android:background="@android:drawable/editbox_background"
-        android:layout_marginBottom="12dp" />
+        android:layout_marginBottom="12dp"
+        style="@style/Widget.Material3.TextInputLayout.OutlinedBox.Dense"
+        android:hint="Search apps">
+
+        <com.google.android.material.textfield.TextInputEditText
+            android:id="@+id/etSearchApps"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="text"
+            android:maxLines="1" />
+
+    </com.google.android.material.textfield.TextInputLayout>
 
     <TextView
         android:id="@+id/tvSelectedCount"
@@ -70,10 +95,10 @@
         android:layout_height="wrap_content"
         android:text="0 selected"
         android:textSize="12sp"
-        android:textColor="?android:attr/textColorSecondary"
+        android:textColor="?attr/colorOnSurfaceVariant"
         android:layout_marginBottom="4dp" />
 
-    <CheckBox
+    <com.google.android.material.checkbox.MaterialCheckBox
         android:id="@+id/cbHideSystem"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
@@ -81,22 +106,37 @@
         android:checked="true"
         android:layout_marginBottom="8dp" />
 
-    <!-- App List -->
-    <androidx.recyclerview.widget.RecyclerView
-        android:id="@+id/appRecyclerView"
+    <!-- App List + Spinner container -->
+    <FrameLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
         android:minHeight="250dp"
-        android:layout_marginBottom="12dp" />
+        android:layout_marginBottom="12dp">
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/appRecyclerView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clipToPadding="false"
+            android:paddingBottom="8dp"
+            android:visibility="gone" />
+
+        <ProgressBar
+            android:id="@+id/appListSpinner"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:visibility="visible" />
+
+    </FrameLayout>
 
     <!-- Apply Button -->
-    <Button
+    <com.google.android.material.button.MaterialButton
         android:id="@+id/btnApply"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="Apply Selection"
-        android:padding="12dp"
-        style="@style/Widget.AppCompat.Button" />
+        style="@style/Widget.Material3.Button" />
 
 </LinearLayout>

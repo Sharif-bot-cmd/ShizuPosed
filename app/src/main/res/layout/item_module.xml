@@ -96,7 +96,7 @@
             </LinearLayout>
 
             <!-- Enable Switch -->
-            <Switch
+            <com.google.android.material.materialswitch.MaterialSwitch
                 android:id="@+id/swEnabled"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
@@ -104,7 +104,21 @@
 
         </LinearLayout>
 
-        <!-- Bottom row: Hooked Apps Info -->
+        <!--
+            Bottom row: Hooked Apps Info + Recommended hint + Select Apps.
+
+            ── CHANGE: added tvRecommended between the hooked-apps
+            count and the Select Apps button.
+
+            Layout behavior:
+              • tvHookedApps keeps weight=1, so it absorbs the
+                remaining space and stays left-aligned.
+              • tvRecommended sits immediately to its right with a
+                small start margin. It is GONE by default, so when
+                the module declares no scope.list the row looks
+                exactly as before — no extra gap, no phantom space.
+              • btnSelectApps stays pinned to the trailing edge.
+        -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -120,6 +134,23 @@
                 android:text="Hooked Apps: 0"
                 android:textSize="12sp"
                 android:textColor="?android:attr/textColorSecondary" />
+
+            <!--
+                ── CHANGE: recommended count hint.
+                Visibility is driven entirely by ModuleAdapter.
+                GONE when the module declares no scope.list, so this
+                view is invisible in the common case.
+            -->
+            <TextView
+                android:id="@+id/tvRecommended"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="8dp"
+                android:text="· 0 recommended"
+                android:textSize="12sp"
+                android:textColor="?attr/colorPrimary"
+                android:maxLines="1"
+                android:visibility="gone" />
 
             <Button
                 android:id="@+id/btnSelectApps"

@@ -5,17 +5,28 @@ import android.content.ContentValues;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
+import android.os.Bundle;
+import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import com.shizuposed.manager.ShizukuHelper;
+import com.shizuposed.manager.core.MarkerCache;
 import com.shizuposed.manager.core.ModuleLoader;
 import com.shizuposed.manager.model.ModuleInfo;
+import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.utils.Logger;
 import com.shizuposed.manager.utils.ShellUtils;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * ModuleStatusProvider
@@ -24,21 +35,24 @@ import java.util.List;
  * their own app processes) ask questions about their state in
  * ShizuPosed.
  *
- * Modules query:
- *   content://com.shizuposed.manager.status/module/<packageName>
- *       — is the module enabled in the manager?
- *   content://com.shizuposed.manager.status/modules
- *       — list every enabled module package
- *   content://com.shizuposed.manager.status/info
- *       — framework name, version, enabled module count
- *   content://com.shizuposed.manager.status/active/<packageName>
- *       — has the module loaded into at least one target process?
- *   content://com.shizuposed.manager.status/scope/<packageName>
- *       — which packages has the module loaded into?
- *
  * The "active" and "scope" endpoints read the shell-side hooked
- * markers written by XposedHook, so they reflect what the framework
- * has actually done, not just what the user configured.
+ * markers written by XposedHook. Since R-5.4 those markers are read
+ * from a local mirror maintained by MarkerCache, not queried from
+ * ShizuPosed's shell process directly. This makes activation queries
+ * fast, and immune to Shizuku being killed or restarted between a
+ * marker write and a module UI query.
+ *
+ * MARKER SCAN CACHING
+ * -------------------
+ * The local mirror is refreshed by ProcessMonitor every 5 seconds.
+ * On top of that, the provider caches the parsed scan for
+ * MARKER_CACHE_TTL_MS so that repeated queries within a short window
+ * do not re-read the same files.
+ *
+ * If the mirror is empty when a query arrives — which happens on a
+ * cold start before the monitor has run — the provider asks
+ * MarkerCache to refresh once, synchronously. If Shizuku is not
+ * available, the query returns an empty result rather than blocking.
  */
 public class ModuleStatusProvider extends ContentProvider {
 
@@ -48,8 +62,10 @@ public class ModuleStatusProvider extends ContentProvider {
     public static final Uri MODULES_URI = Uri.parse("content://" + AUTHORITY + "/modules");
     public static final Uri INFO_URI    = Uri.parse("content://" + AUTHORITY + "/info");
 
-    private static final String HOOKED_DIR =
-        "/data/user/0/com.android.shell/files/.syscall_cache/hooked";
+    private static final String TAG = "ShizuPosedProvider";
+
+    /** How long a marker scan stays valid. */
+    private static final long MARKER_CACHE_TTL_MS = 3000L;
 
     public static Uri moduleUri(String packageName) {
         return Uri.parse("content://" + AUTHORITY + "/module/" + packageName);
@@ -65,6 +81,14 @@ public class ModuleStatusProvider extends ContentProvider {
 
     private Logger logger;
 
+    // ── In-memory cache of the parsed mirror ────────────────────
+    // Key: target package name. Value: the marker JSON body.
+    private volatile Map<String, String> markerCache =
+        Collections.emptyMap();
+    private volatile long markerCacheAt = 0L;
+    private final Object markerLock = new Object();
+    private final Object moduleLock = new Object();
+
     @Override
     public boolean onCreate() {
         if (getContext() != null) {
@@ -79,12 +103,17 @@ public class ModuleStatusProvider extends ContentProvider {
     // ─────────────────────────────────────────────────────────────
 
     private void ensureModulesLoaded() {
-        try {
-            ModuleLoader loader = ModuleLoader.getInstance(getContext());
-            if (loader.getCachedModules().isEmpty()) {
-                loader.loadModules();
+        if (getContext() == null) return;
+        synchronized (moduleLock) {
+            try {
+                ModuleLoader loader = ModuleLoader.getInstance(getContext());
+                if (loader.getCachedModules().isEmpty()) {
+                    loader.loadModules();
+                }
+            } catch (Throwable t) {
+                Log.e(TAG, "ensureModulesLoaded failed", t);
             }
-        } catch (Throwable ignored) {}
+        }
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -99,32 +128,31 @@ public class ModuleStatusProvider extends ContentProvider {
                         @Nullable String[] selectionArgs,
                         @Nullable String sortOrder) {
 
-        if (getContext() == null) return null;
+        if (getContext() == null) {
+            Log.w(TAG, "query with null context: " + uri);
+            return null;
+        }
 
         String path = uri.getPath() == null ? "" : uri.getPath();
         String[] segments = path.split("/");
 
-        // content://.../module/<pkg>
         if (segments.length >= 3 && "module".equals(segments[1])) {
             return queryModule(segments[2]);
         }
-        // content://.../active/<pkg>
         if (segments.length >= 3 && "active".equals(segments[1])) {
             return queryModuleActive(segments[2]);
         }
-        // content://.../scope/<pkg>
         if (segments.length >= 3 && "scope".equals(segments[1])) {
             return queryModuleScope(segments[2]);
         }
-        // content://.../modules
         if (segments.length >= 2 && "modules".equals(segments[1])) {
             return queryModules();
         }
-        // content://.../info
         if (segments.length >= 2 && "info".equals(segments[1])) {
             return queryInfo();
         }
 
+        Log.w(TAG, "query: unknown path " + path);
         return new MatrixCursor(new String[]{"value"});
     }
 
@@ -134,7 +162,9 @@ public class ModuleStatusProvider extends ContentProvider {
         ModuleInfo m = null;
         try {
             m = ModuleLoader.getInstance(getContext()).getModule(pkg);
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            Log.e(TAG, "queryModule(" + pkg + ") failed", t);
+        }
 
         boolean enabled = m != null && m.enabled;
 
@@ -156,9 +186,13 @@ public class ModuleStatusProvider extends ContentProvider {
             List<ModuleInfo> list = ModuleLoader.getInstance(getContext())
                 .getEnabledModules();
             for (ModuleInfo m : list) {
-                c.addRow(new Object[]{m.packageName});
+                if (m != null && m.packageName != null) {
+                    c.addRow(new Object[]{m.packageName});
+                }
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            Log.e(TAG, "queryModules failed", t);
+        }
         return c;
     }
 
@@ -168,7 +202,9 @@ public class ModuleStatusProvider extends ContentProvider {
         int count = 0;
         try {
             count = ModuleLoader.getInstance(getContext()).getEnabledModules().size();
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            Log.e(TAG, "queryInfo failed", t);
+        }
 
         MatrixCursor c = new MatrixCursor(
             new String[]{"framework", "version", "count", "enabled"});
@@ -177,51 +213,21 @@ public class ModuleStatusProvider extends ContentProvider {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // ACTIVE / SCOPE — read the shell-side hooked markers
+    // ACTIVE / SCOPE — read the local marker mirror
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Has the module loaded into at least one target process?
-     *
-     * Reads every marker file under <shell>/hooked/ and checks
-     * whether the module's package name appears inside the
-     * moduleList array of any marker.
-     */
     private Cursor queryModuleActive(String modulePkg) {
         boolean active = false;
         try {
-            if (getContext() != null) {
-                ShizukuHelper sh = ShizukuHelper.getInstance(getContext());
-                if (sh.isAvailable() && sh.isAuthorized()) {
-                    ShellUtils.CommandResult ls = sh.executeCommand(
-                        "ls " + HOOKED_DIR + " 2>/dev/null; true");
-                    if (ls.stdout != null) {
-                        for (String line : ls.stdout) {
-                            String name = line == null ? null : line.trim();
-                            if (name == null || name.isEmpty()
-                                    || !name.endsWith(".json")) continue;
-
-                            ShellUtils.CommandResult cat = sh.executeCommand(
-                                "cat " + HOOKED_DIR + "/" + name);
-                            if (cat.stdout == null) continue;
-
-                            StringBuilder body = new StringBuilder();
-                            for (String l : cat.stdout) if (l != null) body.append(l);
-
-                            // Check both the raw package name and the
-                            // quoted form to be robust against JSON
-                            // escaping issues.
-                            String b = body.toString();
-                            if (b.contains("\"" + modulePkg + "\"")) {
-                                active = true;
-                                break;
-                            }
-                        }
-                    }
+            Map<String, String> markers = getMarkers();
+            for (Map.Entry<String, String> e : markers.entrySet()) {
+                if (markerContainsModule(e.getValue(), modulePkg)) {
+                    active = true;
+                    break;
                 }
             }
         } catch (Throwable t) {
-            if (logger != null) logger.d("queryModuleActive: " + t.getMessage());
+            Log.e(TAG, "queryModuleActive(" + modulePkg + ") failed", t);
         }
 
         MatrixCursor c = new MatrixCursor(
@@ -234,45 +240,146 @@ public class ModuleStatusProvider extends ContentProvider {
         return c;
     }
 
-    /**
-     * Which packages has the module loaded into?
-     *
-     * Same marker scan as queryModuleActive, but returns every target
-     * package that lists the module in its moduleList.
-     */
     private Cursor queryModuleScope(String modulePkg) {
         MatrixCursor c = new MatrixCursor(new String[]{"package"});
         try {
-            if (getContext() != null) {
-                ShizukuHelper sh = ShizukuHelper.getInstance(getContext());
-                if (sh.isAvailable() && sh.isAuthorized()) {
-                    ShellUtils.CommandResult ls = sh.executeCommand(
-                        "ls " + HOOKED_DIR + " 2>/dev/null; true");
-                    if (ls.stdout != null) {
-                        for (String line : ls.stdout) {
-                            String name = line == null ? null : line.trim();
-                            if (name == null || name.isEmpty()
-                                    || !name.endsWith(".json")) continue;
-                            String pkg = name.substring(0, name.length() - 5);
-
-                            ShellUtils.CommandResult cat = sh.executeCommand(
-                                "cat " + HOOKED_DIR + "/" + name);
-                            if (cat.stdout == null) continue;
-
-                            StringBuilder body = new StringBuilder();
-                            for (String l : cat.stdout) if (l != null) body.append(l);
-
-                            if (body.toString().contains("\"" + modulePkg + "\"")) {
-                                c.addRow(new Object[]{pkg});
-                            }
-                        }
-                    }
+            Map<String, String> markers = getMarkers();
+            for (Map.Entry<String, String> e : markers.entrySet()) {
+                if (markerContainsModule(e.getValue(), modulePkg)) {
+                    c.addRow(new Object[]{e.getKey()});
                 }
             }
         } catch (Throwable t) {
-            if (logger != null) logger.d("queryModuleScope: " + t.getMessage());
+            Log.e(TAG, "queryModuleScope(" + modulePkg + ") failed", t);
         }
         return c;
+    }
+
+    private boolean markerContainsModule(String markerJson, String modulePkg) {
+        if (markerJson == null || modulePkg == null) return false;
+        try {
+            JSONObject obj = new JSONObject(markerJson);
+            JSONArray arr = obj.optJSONArray("moduleList");
+            if (arr == null) return false;
+            for (int i = 0; i < arr.length(); i++) {
+                if (modulePkg.equals(arr.optString(i))) return true;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "bad marker json: " + t.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * Return the parsed marker set. Reads from the local mirror via
+     * MarkerCache — never queries Shizuku directly.
+     *
+     * If the mirror is empty (cold start, or ProcessMonitor has not
+     * run its first refresh), asks MarkerCache to refresh once,
+     * synchronously. If Shizuku is unavailable, the refresh is a
+     * no-op and we return the empty map.
+     */
+    // ── FIX: no more Shizuku in the query path.
+    private Map<String, String> getMarkers() {
+        long now = System.currentTimeMillis();
+        Map<String, String> cached = markerCache;
+        if (now - markerCacheAt < MARKER_CACHE_TTL_MS) {
+            return cached;
+        }
+        synchronized (markerLock) {
+            if (System.currentTimeMillis() - markerCacheAt < MARKER_CACHE_TTL_MS) {
+                return markerCache;
+            }
+            Map<String, String> fresh = readLocalMirror();
+            markerCache = fresh;
+            markerCacheAt = System.currentTimeMillis();
+            return fresh;
+        }
+    }
+
+    /**
+     * Read the local mirror. If empty, ask MarkerCache to refresh
+     * once from the shell side, then read again.
+     *
+     * Never throws. A failure to refresh is not a failure to answer:
+     * we return whatever the mirror currently holds, which may be an
+     * older but still valid snapshot.
+     */
+    private Map<String, String> readLocalMirror() {
+        Map<String, String> out = new HashMap<>();
+        try {
+            if (getContext() == null) return out;
+
+            out = MarkerCache.read(getContext());
+
+            if (out.isEmpty()) {
+                // Cold cache. Ask for one synchronous refresh. The
+                // refresh is a no-op if Shizuku is unavailable, in
+                // which case out stays empty and we return that.
+                int n = MarkerCache.refresh(getContext());
+                if (n > 0) {
+                    out = MarkerCache.read(getContext());
+                }
+                if (logger != null) {
+                    logger.i("readLocalMirror: cold cache, refresh returned "
+                        + n + ", mirrored " + out.size() + " marker(s)");
+                }
+            } else if (logger != null) {
+                logger.d("readLocalMirror: " + out.size() + " marker(s) from cache");
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "readLocalMirror failed", t);
+        }
+        return out;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // CALL — modern modules sometimes use ContentResolver.call()
+    // ─────────────────────────────────────────────────────────────
+
+    @Nullable
+    @Override
+    public Bundle call(@NonNull String method,
+                       @Nullable String arg,
+                       @Nullable Bundle extras) {
+        Bundle b = new Bundle();
+        try {
+            String path = method == null ? "" : method;
+            if ("active".equals(path) && arg != null) {
+                Cursor c = queryModuleActive(arg);
+                if (c != null && c.moveToFirst()) {
+                    int idx = c.getColumnIndex("active");
+                    b.putBoolean("active", idx != -1 && c.getInt(idx) == 1);
+                    b.putString("value", idx != -1 && c.getInt(idx) == 1 ? "1" : "0");
+                    c.close();
+                }
+            } else if ("enabled".equals(path) && arg != null) {
+                Cursor c = queryModule(arg);
+                if (c != null && c.moveToFirst()) {
+                    int idx = c.getColumnIndex("enabled");
+                    b.putBoolean("enabled", idx != -1 && c.getInt(idx) == 1);
+                    c.close();
+                }
+            } else if ("scope".equals(path) && arg != null) {
+                Cursor c = queryModuleScope(arg);
+                if (c != null) {
+                    ArrayList<String> pkgs = new ArrayList<>();
+                    int idx = c.getColumnIndex("package");
+                    while (c.moveToNext()) {
+                        String p = idx != -1 ? c.getString(idx) : null;
+                        if (p != null) pkgs.add(p);
+                    }
+                    c.close();
+                    b.putStringArrayList("scope", pkgs);
+                }
+            } else if ("info".equals(path)) {
+                b.putString("framework", "ShizuPosed");
+                b.putInt("version", 1);
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "call(" + method + ") failed", t);
+        }
+        return b;
     }
 
     // ─────────────────────────────────────────────────────────────

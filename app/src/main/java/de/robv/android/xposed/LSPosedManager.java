@@ -4,6 +4,7 @@ import android.content.ContentResolver;
 import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
+import android.util.Log;
 
 /**
  * LSPosed-compatible manager API shim.
@@ -26,11 +27,36 @@ import android.net.Uri;
  * derived from the shell-side hooked markers written by XposedHook,
  * not from the manager's module list, so it reflects what the
  * framework has actually done.
+ *
+ * NO-ARG OVERLOADS
+ * ----------------
+ * LSPosed declares isModuleActive() and isModuleEnabled() with no
+ * arguments. Module UIs call these forms because they run in their
+ * own process and mean "am I — this module — active?" ShizuPosed
+ * cannot inject a "current module" flag into the module's process
+ * the way a zygote-level framework can, so the calling package is
+ * derived from the stack.
+ *
+ * CONTEXT RESOLUTION
+ * ------------------
+ * ActivityThread.currentApplication() reliably returns the
+ * Application only on the main thread. Module UIs frequently call
+ * isModuleActive() from background threads, WorkManager workers,
+ * ContentProvider.onCreate, etc., where it can return null.
+ *
+ * This class therefore tries three sources in order:
+ *   1. ActivityThread.currentApplication()
+ *   2. ActivityThread.currentActivityThread().getSystemContext()
+ *   3. A static fallback context registered via setFallbackContext()
+ *
+ * The static fallback is populated automatically by XposedBridge.log()
+ * on first use, since log() runs in a context where the caller usually
+ * has a valid Application.
  */
 public final class LSPosedManager {
 
     /** Framework name reported to modules. */
-    public static final String FRAMEWORK_NAME = "ShizuPosed";
+    public static final String FRAMEWORK_NAME = "5.8";
 
     /** Reported API version. Matches XposedBridge.XPOSED_BRIDGE_VERSION. */
     public static final int API_VERSION = 93;
@@ -38,7 +64,42 @@ public final class LSPosedManager {
     /** Authority of ShizuPosed's ModuleStatusProvider. */
     private static final String PROVIDER_AUTHORITY = "com.shizuposed.manager.status";
 
+    private static final String LOG_TAG = "ShizuPosed";
+
+    /** Last-resort context, populated by setFallbackContext(). */
+    private static volatile Context sFallbackContext;
+
     private LSPosedManager() {}
+
+    // ═════════════════════════════════════════════════════════════
+    // FALLBACK CONTEXT
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Register a context to use when ActivityThread lookups fail.
+     * Called automatically by XposedBridge.log() so that later
+     * off-main-thread queries still have a usable Context.
+     */
+    public static void setFallbackContext(Context ctx) {
+        if (ctx != null) {
+            Context app = ctx.getApplicationContext();
+            sFallbackContext = app != null ? app : ctx;
+        }
+    }
+
+    /**
+     * Accessor for the shared fallback context.
+     *
+     * XposedBridge uses this as the last step in its own context
+     * resolution, so both shims agree on which Context is in play
+     * when ActivityThread lookups fail.
+     *
+     * @return the registered fallback Context, or null if none has
+     *         been set yet.
+     */
+    public static Context getFallbackContext() {
+        return sFallbackContext;
+    }
 
     // ═════════════════════════════════════════════════════════════
     // FRAMEWORK IDENTITY
@@ -65,7 +126,7 @@ public final class LSPosedManager {
     }
 
     public static String getVersionName() {
-        return "3.3";
+        return "(950)";
     }
 
     public static String getManagerPackageName() {
@@ -75,6 +136,20 @@ public final class LSPosedManager {
     // ═════════════════════════════════════════════════════════════
     // ENABLED STATE
     // ═════════════════════════════════════════════════════════════
+
+    /**
+     * No-arg form. Derives the calling package from the stack.
+     * LSPosed declares this form.
+     */
+    public static boolean isModuleEnabled() {
+        String pkg = getCallingPackage();
+        if (pkg == null) {
+            Log.w(LOG_TAG, "isModuleEnabled(): cannot determine "
+                + "calling package from stack");
+            return false;
+        }
+        return isModuleEnabled(pkg);
+    }
 
     public static boolean isModuleEnabled(String packageName) {
         Context ctx = currentApplication();
@@ -95,8 +170,11 @@ public final class LSPosedManager {
                     int vIdx = c.getColumnIndex("value");
                     if (vIdx != -1) return "1".equals(c.getString(vIdx));
                 }
+                logVisibilityHint("isModuleEnabled", packageName);
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            Log.e(LOG_TAG, "isModuleEnabled(" + packageName + ") failed", t);
+        }
         return false;
     }
 
@@ -108,15 +186,27 @@ public final class LSPosedManager {
             Uri uri = Uri.parse("content://" + PROVIDER_AUTHORITY + "/modules");
             try (Cursor c = cr.query(uri, null, null, null, null)) {
                 if (c == null) return new String[0];
-                String[] out = new String[c.getCount()];
+                int idx = c.getColumnIndex("package");
+                if (idx == -1) return new String[0];
+
+                // Two passes: first count non-null rows, then fill.
+                // Avoids inserting nulls into the returned array.
+                int count = 0;
+                c.moveToPosition(-1);
+                while (c.moveToNext()) {
+                    if (c.getString(idx) != null) count++;
+                }
+                String[] out = new String[count];
+                c.moveToPosition(-1);
                 int i = 0;
                 while (c.moveToNext()) {
-                    int idx = c.getColumnIndex("package");
-                    out[i++] = idx != -1 ? c.getString(idx) : null;
+                    String pkg = c.getString(idx);
+                    if (pkg != null) out[i++] = pkg;
                 }
                 return out;
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            Log.e(LOG_TAG, "getEnabledModules failed", t);
             return new String[0];
         }
     }
@@ -126,21 +216,34 @@ public final class LSPosedManager {
     // ═════════════════════════════════════════════════════════════
 
     /**
+     * No-arg form. Derives the calling package from the stack.
+     * LSPosed declares this form. Module UIs that call it fail to
+     * link without it.
+     */
+    public static boolean isModuleActive() {
+        String pkg = getCallingPackage();
+        if (pkg == null) {
+            Log.w(LOG_TAG, "isModuleActive(): cannot determine "
+                + "calling package from stack");
+            return false;
+        }
+        return isModuleActive(pkg);
+    }
+
+    /**
      * Has the module loaded into at least one target process?
      *
      * Reads the shell-side hooked markers via
      * content://.../active/<pkg>. Returns false if no marker lists
      * this module's package name.
-     *
-     * Modules that display "Activated" in their own UI rely on this.
-     * If the module has never been launched under ShizuPosed for any
-     * target in its scope, this returns false even though the module
-     * is enabled. That's the correct answer — the module hasn't
-     * actually done anything yet.
      */
     public static boolean isModuleActive(String modulePackage) {
         Context ctx = currentApplication();
-        if (ctx == null) return false;
+        if (ctx == null) {
+            Log.w(LOG_TAG, "isModuleActive(" + modulePackage
+                + "): no Context available (off-main-thread?)");
+            return false;
+        }
         return isModuleActive(ctx, modulePackage);
     }
 
@@ -157,16 +260,16 @@ public final class LSPosedManager {
                     int vIdx = c.getColumnIndex("value");
                     if (vIdx != -1) return "1".equals(c.getString(vIdx));
                 }
+                logVisibilityHint("isModuleActive", modulePackage);
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            Log.e(LOG_TAG, "isModuleActive(" + modulePackage + ") failed", t);
+        }
         return false;
     }
 
     /**
      * Packages the module has loaded into.
-     *
-     * Returns every target package whose shell-side hooked marker
-     * lists this module in its moduleList.
      */
     public static String[] getModuleScope(String modulePackage) {
         Context ctx = currentApplication();
@@ -182,27 +285,127 @@ public final class LSPosedManager {
                 + "/scope/" + modulePackage);
             try (Cursor c = cr.query(uri, null, null, null, null)) {
                 if (c == null) return new String[0];
-                String[] out = new String[c.getCount()];
+                int idx = c.getColumnIndex("package");
+                if (idx == -1) return new String[0];
+
+                int count = 0;
+                c.moveToPosition(-1);
+                while (c.moveToNext()) {
+                    if (c.getString(idx) != null) count++;
+                }
+                String[] out = new String[count];
+                c.moveToPosition(-1);
                 int i = 0;
                 while (c.moveToNext()) {
-                    int idx = c.getColumnIndex("package");
-                    out[i++] = idx != -1 ? c.getString(idx) : null;
+                    String pkg = c.getString(idx);
+                    if (pkg != null) out[i++] = pkg;
                 }
                 return out;
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            Log.e(LOG_TAG, "getModuleScope(" + modulePackage + ") failed", t);
             return new String[0];
         }
     }
 
-    // ─── reflective Application lookup ───────────────────────────────
+    // ═════════════════════════════════════════════════════════════
+    // PACKAGE VISIBILITY DIAGNOSTIC
+    // ═════════════════════════════════════════════════════════════
+
+    private static void logVisibilityHint(String call, String packageName) {
+        if (android.os.Build.VERSION.SDK_INT < 30) return;
+        Log.w(LOG_TAG, call + "(" + packageName + "): empty result. "
+            + "If this is Android 11+, the module's AndroidManifest.xml "
+            + "must declare: <queries><provider android:authorities=\""
+            + PROVIDER_AUTHORITY + "\" /></queries>. "
+            + "Without it, the provider is invisible to this app.");
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // CALLING PACKAGE RESOLUTION
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Walk the stack to find the first caller outside the framework,
+     * then derive its package name. Used by the no-arg overloads.
+     */
+    private static String getCallingPackage() {
+        try {
+            for (StackTraceElement e : Thread.currentThread().getStackTrace()) {
+                String cls = e.getClassName();
+                if (cls == null) continue;
+
+                if (cls.startsWith("de.robv.android.xposed.")) continue;
+                if (cls.startsWith("com.shizuposed.")) continue;
+                if (cls.startsWith("java.")) continue;
+                if (cls.startsWith("javax.")) continue;
+                if (cls.startsWith("android.")) continue;
+                if (cls.startsWith("com.android.")) continue;
+                if (cls.startsWith("dalvik.")) continue;
+                if (cls.startsWith("sun.")) continue;
+
+                try {
+                    Class<?> c = Class.forName(cls, false,
+                        LSPosedManager.class.getClassLoader());
+                    Package p = c.getPackage();
+                    if (p != null && p.getName() != null) {
+                        return p.getName();
+                    }
+                } catch (Throwable ignored) {}
+
+                int dot = cls.lastIndexOf('.');
+                if (dot > 0) return cls.substring(0, dot);
+            }
+        } catch (Throwable t) {
+            Log.e(LOG_TAG, "getCallingPackage failed", t);
+        }
+        return null;
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // CONTEXT RESOLUTION
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Resolve a Context, working off the main thread.
+     *
+     * Order:
+     *   1. ActivityThread.currentApplication()
+     *   2. ActivityThread.currentActivityThread().getSystemContext()
+     *   3. sFallbackContext
+     */
     private static Context currentApplication() {
+        Context fb = sFallbackContext;
+
         try {
             Class<?> at = Class.forName("android.app.ActivityThread");
-            java.lang.reflect.Method m = at.getMethod("currentApplication");
-            Object o = m.invoke(null);
-            if (o instanceof Context) return (Context) o;
-        } catch (Throwable ignored) {}
-        return null;
+
+            try {
+                java.lang.reflect.Method m = at.getMethod("currentApplication");
+                Object o = m.invoke(null);
+                if (o instanceof Context) {
+                    Context app = (Context) o;
+                    sFallbackContext = app;
+                    return app;
+                }
+            } catch (Throwable ignored) {}
+
+            try {
+                java.lang.reflect.Method cur = at.getMethod("currentActivityThread");
+                Object thread = cur.invoke(null);
+                if (thread != null) {
+                    java.lang.reflect.Method getSys = at.getMethod("getSystemContext");
+                    Object sys = getSys.invoke(thread);
+                    if (sys instanceof Context) {
+                        return (Context) sys;
+                    }
+                }
+            } catch (Throwable ignored) {}
+
+        } catch (Throwable t) {
+            Log.e(LOG_TAG, "currentApplication: reflective lookup failed", t);
+        }
+
+        return fb;
     }
 }

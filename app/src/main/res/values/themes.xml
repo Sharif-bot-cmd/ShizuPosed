@@ -1,43 +1,92 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <!-- Base application theme - Auto-fit and modern -->
-    <style name="Theme.ShizuPosedManager" parent="Theme.AppCompat.DayNight.NoActionBar">
-        <!-- Primary brand color -->
+
+    <!--
+        Material 3 theme.
+
+        Parent changed from Theme.AppCompat.DayNight.NoActionBar to
+        Theme.Material3.DayNight.NoActionBar. This switches every
+        Material component (cards, buttons, dialogs, chips, text
+        fields, bottom sheets) to their Material 3 styling.
+
+        The color roles reference the md_theme_light_* palette in
+        colors.xml. Material 3 needs the full set — not just
+        primary/secondary — because components draw from container
+        and surface roles, not just the accent colors.
+    -->
+    <style name="Theme.ShizuPosedManager" parent="Theme.Material3.DayNight.NoActionBar">
+
+        <!-- Primary -->
         <item name="colorPrimary">@color/md_theme_light_primary</item>
-        <item name="colorPrimaryDark">@color/md_theme_light_primaryContainer</item>
-        <item name="colorAccent">@color/md_theme_light_secondary</item>
+        <item name="colorOnPrimary">@color/md_theme_light_onPrimary</item>
+        <item name="colorPrimaryContainer">@color/md_theme_light_primaryContainer</item>
+        <item name="colorOnPrimaryContainer">@color/md_theme_light_onPrimaryContainer</item>
 
-        <!-- Surface & Background -->
-        <item name="android:windowBackground">@color/md_theme_light_surface</item>
+        <!-- Secondary -->
+        <item name="colorSecondary">@color/md_theme_light_secondary</item>
+        <item name="colorOnSecondary">@color/md_theme_light_onSecondary</item>
+        <item name="colorSecondaryContainer">@color/md_theme_light_secondaryContainer</item>
+        <item name="colorOnSecondaryContainer">@color/md_theme_light_onSecondaryContainer</item>
+
+        <!-- Tertiary -->
+        <item name="colorTertiary">@color/md_theme_light_tertiary</item>
+        <item name="colorOnTertiary">@color/md_theme_light_onTertiary</item>
+        <item name="colorTertiaryContainer">@color/md_theme_light_tertiaryContainer</item>
+        <item name="colorOnTertiaryContainer">@color/md_theme_light_onTertiaryContainer</item>
+
+        <!-- Error -->
+        <item name="colorError">@color/md_theme_light_error</item>
+        <item name="colorOnError">@color/md_theme_light_onError</item>
+        <item name="colorErrorContainer">@color/md_theme_light_errorContainer</item>
+        <item name="colorOnErrorContainer">@color/md_theme_light_onErrorContainer</item>
+
+        <!-- Surface -->
         <item name="android:colorBackground">@color/md_theme_light_surface</item>
+        <item name="colorOnBackground">@color/md_theme_light_onSurface</item>
+        <item name="colorSurface">@color/md_theme_light_surface</item>
+        <item name="colorOnSurface">@color/md_theme_light_onSurface</item>
+        <item name="colorSurfaceVariant">@color/md_theme_light_surfaceVariant</item>
+        <item name="colorOnSurfaceVariant">@color/md_theme_light_onSurfaceVariant</item>
+        <item name="colorOutline">@color/md_theme_light_outline</item>
+        <item name="colorOutlineVariant">@color/md_theme_light_outline</item>
 
-        <!-- Auto-fit: Make content fill the screen -->
+        <!-- Inverse -->
+        <item name="colorSurfaceInverse">@color/md_theme_light_inverseSurface</item>
+        <item name="colorOnSurfaceInverse">@color/md_theme_light_inverseOnSurface</item>
+        <item name="colorPrimaryInverse">@color/md_theme_light_inversePrimary</item>
+
+        <!-- Window / edge-to-edge -->
+        <item name="android:windowBackground">@color/md_theme_light_surface</item>
         <item name="android:windowFullscreen">false</item>
         <item name="android:windowContentOverlay">@null</item>
         <item name="android:windowNoTitle">true</item>
         <item name="android:windowActionBar">false</item>
 
-        <!-- Status bar -->
-        <item name="android:statusBarColor">?attr/colorPrimary</item>
+        <!-- Status bar: transparent for edge-to-edge; content color
+             is set by the system bar appearance flags at runtime. -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:windowLightStatusBar" tools:targetApi="m">true</item>
 
         <!-- Navigation bar -->
-        <item name="android:navigationBarColor">@color/md_theme_light_surface</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowLightNavigationBar" tools:targetApi="o_mr1">true</item>
 
         <!-- Window animations -->
         <item name="android:windowAnimationStyle">@style/Animation.Activity</item>
     </style>
 
-    <!-- Toolbar theme: renamed so it no longer extends itself.
-         Reference this from your Toolbar/theme overlay usage as
-         @style/ThemeOverlay.ShizuPosedManager.ActionBar -->
-    <style name="ThemeOverlay.ShizuPosedManager.ActionBar" parent="ThemeOverlay.AppCompat.Dark.ActionBar">
+    <!--
+        Toolbar theme overlay. Kept from the previous file because
+        the app uses it for the toolbar text color. The parent is
+        renamed to the Material 3 overlay so it composes correctly.
+    -->
+    <style name="ThemeOverlay.ShizuPosedManager.ActionBar"
+           parent="ThemeOverlay.Material3.Dark.ActionBar">
         <item name="android:textColorPrimary">@android:color/white</item>
         <item name="actionMenuTextColor">@android:color/white</item>
     </style>
 
-    <!-- Activity animation -->
+    <!-- Activity animation — unchanged. -->
     <style name="Animation.Activity" parent="@android:style/Animation.Activity">
         <item name="android:activityOpenEnterAnimation">@android:anim/fade_in</item>
         <item name="android:activityOpenExitAnimation">@android:anim/fade_out</item>

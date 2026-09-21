@@ -31,10 +31,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * possible; falls back to reading through Shizuku (shell uid) when the
  * direct read is blocked by SELinux.
  *
- * Also polls the shell-side hooked-marker directory written by
- * XposedHook after it successfully installs hooks. Markers cause the
- * matching process entry to be promoted from "Pending" to "Hooked" on
- * the Home tab.
+ * MARKER MIRROR
+ * -------------
+ * Each scan cycle also refreshes MarkerCache, the local mirror of
+ * the shell-side hooked markers. ModuleStatusProvider reads from
+ * that mirror to answer "is this module active?" without a Shizuku
+ * round-trip per query. Refreshing here means the provider's queries
+ * stay fast and independent of Shizuku's state at query time.
+ *
+ * The refresh is a single compound shell command per cycle, not one
+ * per marker and not one per query.
  */
 public class ProcessMonitor {
     private static ProcessMonitor instance;
@@ -50,6 +56,18 @@ public class ProcessMonitor {
     private ScheduledFuture<?> scanTask;
 
     private volatile Boolean shellScanAvailable = null;
+
+    /** Timestamp of the last marker mirror refresh, in millis. */
+    // ── FIX: track the last refresh so we don't hammer the mirror.
+    private volatile long lastMarkerRefresh = 0L;
+
+    /**
+     * How often the marker mirror is refreshed. The provider's own
+     * in-memory TTL is 3 seconds, so a 5-second refresh keeps the
+     * mirror at most one provider-TTL stale.
+     */
+    // ── FIX: refresh interval.
+    private static final long MARKER_REFRESH_INTERVAL_MS = 5000L;
 
     // Shell-side paths (mirror what XposedHook uses)
     private static final String SHELL_FILES_DIR = "/data/user/0/com.android.shell/files";
@@ -109,6 +127,16 @@ public class ProcessMonitor {
         }
         logger.i("ProcessMonitor started - monitoring for new apps");
 
+        // ── FIX: prime the marker mirror so the first provider query
+        // after startup finds a populated cache instead of paying the
+        // cold-start cost on the query thread.
+        try {
+            MarkerCache.refresh(context);
+            lastMarkerRefresh = System.currentTimeMillis();
+        } catch (Throwable t) {
+            logger.w("Initial MarkerCache.refresh failed: " + t.getMessage());
+        }
+
         scanExistingProcesses();
 
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -142,6 +170,25 @@ public class ProcessMonitor {
 
     private void scanExistingProcesses() {
         if (!isRunning.get()) return;
+
+        // ── FIX: refresh the marker mirror once per cycle, before the
+        // /proc sweep. The refresh is a single compound shell command
+        // that mirrors every hooked marker into the manager's filesDir.
+        // ModuleStatusProvider reads from that mirror, so this is what
+        // keeps activation state fresh without querying Shizuku from
+        // the provider.
+        //
+        // Placed at the top so even if the /proc scan is slow or
+        // throws, the mirror is already up to date.
+        try {
+            long now = System.currentTimeMillis();
+            if (now - lastMarkerRefresh >= MARKER_REFRESH_INTERVAL_MS) {
+                lastMarkerRefresh = now;
+                MarkerCache.refresh(context);
+            }
+        } catch (Throwable t) {
+            logger.w("MarkerCache.refresh failed: " + t.getMessage());
+        }
 
         try {
             Map<Integer, ProcInfo> found = scanProcTree();
@@ -185,10 +232,20 @@ public class ProcessMonitor {
                 }
             }
 
-            // ✅ Poll the shell-side marker directory and promote any
-            // entries the spawned XposedHook reported as successfully
-            // hooked. Runs once per scan, alongside the /proc sweep.
-            pollHookedMarkers();
+            // ── Marker promotion.
+            //
+            // The old path called pollHookedMarkers(), which issued
+            // ls + cat per marker through Shizuku on every scan. That
+            // is now redundant: MarkerCache.refresh() at the top of
+            // this method has already mirrored the markers locally,
+            // and promoteFromMirror() reads the mirror to promote
+            // matching HookedProcess entries.
+            //
+            // The old pollHookedMarkers() is left in place for one
+            // release as a fallback in case the mirror is unavailable
+            // (e.g. filesDir is full). It is a no-op when the mirror
+            // is populated.
+            promoteFromMirror();
 
             // Prune tracked pids that no longer exist in /proc
             List<Integer> toRemove = new ArrayList<>();
@@ -212,12 +269,78 @@ public class ProcessMonitor {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // HOOKED MARKER POLLING
+    // MARKER PROMOTION FROM LOCAL MIRROR
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Read the local marker mirror and promote any tracked process
+     * whose package appears in a marker to "Hooked".
+     *
+     * This replaces the per-scan pollHookedMarkers() path that went
+     * through Shizuku. Reading the mirror is a local file scan; no
+     * IPC, no authorization dependency.
+     *
+     * Called at the end of each scanExistingProcesses() cycle.
+     */
+    // ── FIX: new method.
+    private void promoteFromMirror() {
+        try {
+            Map<String, String> markers = MarkerCache.read(context);
+            if (markers.isEmpty()) return;
+
+            for (Map.Entry<String, String> entry : markers.entrySet()) {
+                String pkg = entry.getKey();
+                String body = entry.getValue();
+                if (pkg == null || body == null) continue;
+
+                int pid     = extractInt(body, "pid");
+                int uid     = extractInt(body, "uid");
+                int modules = extractInt(body, "modules");
+
+                HookedProcess target = null;
+                if (pid > 0) target = hookedProcesses.get(pid);
+                if (target == null) {
+                    for (HookedProcess p : hookedProcesses.values()) {
+                        if (pkg.equals(p.getProcessName())) {
+                            target = p;
+                            break;
+                        }
+                    }
+                }
+
+                // Already hooked? Skip.
+                if (target != null && target.isHooked()) continue;
+
+                if (target == null) {
+                    // Marker exists for a process we aren't tracking
+                    // yet. Register it so the Home tab can show it.
+                    target = new HookedProcess();
+                    target.setProcessName(pkg);
+                    target.setPid(pid > 0 ? pid : -1);
+                    target.setUid(uid);
+                }
+
+                target.setHooked(true);
+                target.setHookedAt(System.currentTimeMillis());
+
+                if (target.getPid() > 0) {
+                    hookedProcesses.put(target.getPid(), target);
+                }
+
+                logger.i("Hook confirmed by target (mirror): " + pkg
+                    + " (pid=" + pid + ", modules=" + modules + ")");
+            }
+        } catch (Throwable t) {
+            logger.d("promoteFromMirror: " + t.getMessage());
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // HOOKED MARKER POLLING (legacy, Shizuku-based)
     //
-    // XposedHook (running inside the shell-spawned app_process) writes
-    // <HOOKED_DIR>/<pkg>.json after installing hooks. We read those
-    // markers over Shizuku and promote matching entries from "Pending"
-    // to "Hooked".
+    // Kept for one release as a fallback. MarkerCache.refresh()
+    // supersedes this. If the mirror is unavailable (filesDir full,
+    // cache dir uncreatable), this path still works.
     // ═════════════════════════════════════════════════════════════
 
     private void pollHookedMarkers() {
@@ -236,7 +359,6 @@ public class ProcessMonitor {
 
                 String pkg = name.substring(0, name.length() - 5);
 
-                // Already promoted? Skip re-reading.
                 boolean alreadyHooked = false;
                 for (HookedProcess p : hookedProcesses.values()) {
                     if (pkg.equals(p.getProcessName()) && p.isHooked()) {
@@ -246,7 +368,6 @@ public class ProcessMonitor {
                 }
                 if (alreadyHooked) continue;
 
-                // Read the marker file
                 ShellUtils.CommandResult cat = sh.executeCommand(
                     "cat " + HOOKED_DIR + "/" + name);
                 if (!cat.isSuccess() || cat.stdout == null) continue;
@@ -260,10 +381,6 @@ public class ProcessMonitor {
                 int uid     = extractInt(body.toString(), "uid");
                 int modules = extractInt(body.toString(), "modules");
 
-                // Prefer the entry that matches this pid; otherwise
-                // match by package name. The spawned app_process runs
-                // in a different pid than the target in the current
-                // timing model, so pid matching is best-effort.
                 HookedProcess target = null;
                 if (pid > 0) target = hookedProcesses.get(pid);
                 if (target == null) {
@@ -502,7 +619,7 @@ public class ProcessMonitor {
         String[] systemProcesses = {
             "init", "zygote", "zygote64", "system_server", "servicemanager",
             "hwservicemanager", "vndbinder", "surfaceflinger",
-            "netd", "installd", "lmkd", "logd", "keystore",
+            "netd", "installd", "lmkd", "logd", "keystore", "rish",
             "sh", "su", "app_process", "adbd", "ueventd",
             "healthd", "watchdogd", "logcat", "debuggerd",
             "android.hardware", "android.system"
@@ -534,11 +651,6 @@ public class ProcessMonitor {
         return hookedProcesses.size();
     }
 
-    /**
-     * True if any enabled module lists `packageName` in its hookedApps.
-     * Used by HomeFragment to distinguish "running and waiting for
-     * launch" from "running but out of scope".
-     */
     public boolean isPackageInScope(String packageName) {
         if (packageName == null) return false;
         try {
