@@ -1114,7 +1114,6 @@ public class XposedHook {
     // ═════════════════════════════════════════════════════════════════
     // MODULE LOADING
     // ═════════════════════════════════════════════════════════════════
-
     private static boolean loadModule(ModuleInfo info,
                                       Application app,
                                       ClassLoader appLoader,
@@ -1126,6 +1125,7 @@ public class XposedHook {
             String entry = info.xposedInit;
 
             if (info.cachedDexPath == null) {
+                // Built-in module — loaded from the framework classloader.
                 if (entry == null || entry.isEmpty()) {
                     log("Built-in module " + info.packageName
                         + " has no entry point");
@@ -1134,6 +1134,7 @@ public class XposedHook {
                 moduleClass = Class.forName(entry, true,
                     XposedHook.class.getClassLoader());
             } else {
+                // External module — load from its cached dex.
                 String optDir;
                 if (app != null && app.getCacheDir() != null) {
                     optDir = app.getCacheDir().getAbsolutePath();
@@ -1142,11 +1143,21 @@ public class XposedHook {
                     new File(optDir).mkdirs();
                 }
 
-                DexClassLoader loader = new DexClassLoader(
-                    info.cachedDexPath,
-                    optDir,
-                    null,
-                    appLoader);
+                DexLoadingBridge.LoadResult loaded =
+                    DexLoadingBridge.load(
+                        info.cachedDexPath, optDir, appLoader);
+
+                if (loaded == null || loaded.loader == null) {
+                    log("Could not load dex for " + info.packageName
+                        + ": " + (loaded != null ? loaded.detail : "null result"));
+                    return false;
+                }
+
+                log("Dex loaded for " + info.packageName
+                    + " via strategy " + loaded.strategy
+                    + " (" + loaded.detail + ")");
+
+                ClassLoader loader = loaded.loader;
 
                 if (entry == null || entry.isEmpty()) {
                     entry = readXposedInitFromZip(info.cachedDexPath);
@@ -1159,7 +1170,13 @@ public class XposedHook {
                     return false;
                 }
 
-                moduleClass = loader.loadClass(entry);
+                try {
+                    moduleClass = loader.loadClass(entry);
+                } catch (ClassNotFoundException cnfe) {
+                    log("Entry class not found after dex load: "
+                        + entry + " for " + info.packageName);
+                    return false;
+                }
             }
 
             Constructor<?> ctor = moduleClass.getDeclaredConstructor();
@@ -1251,7 +1268,7 @@ public class XposedHook {
         }
     }
 
-    private static String guessEntryPoint(DexClassLoader loader, String pkg) {
+    private static String guessEntryPoint(ClassLoader loader, String pkg) {
         String[] candidates = {
             pkg + ".MainHook",
             pkg + ".XposedMain",
@@ -1270,7 +1287,7 @@ public class XposedHook {
         }
         return null;
     }
-
+              
     // ═════════════════════════════════════════════════════════════════
     // APPLICATION / CONTEXT
     // ═════════════════════════════════════════════════════════════════

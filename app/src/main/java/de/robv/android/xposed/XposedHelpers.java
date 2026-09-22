@@ -2,6 +2,8 @@ package de.robv.android.xposed;
 
 import android.content.Context;
 
+import java.util.Set;
+
 /**
  * Standard Xposed API shim.
  *
@@ -9,9 +11,8 @@ import android.content.Context;
  * com.shizuposed.manager.core.XposedHelpersImpl, which routes hook
  * installation through XposedHookBridge → HookDispatcher.
  *
- * Version and state queries forward to XposedBridge so both call
- * sites (XposedHelpers.getXposedVersion() and
- * XposedBridge.getXposedVersion()) return the same value.
+ * API 96: findAndHookMethod returns IXUnhook, hookAllMethods and
+ * hookAllConstructors return Set<XC_MethodHook.Unhook>.
  */
 public final class XposedHelpers {
 
@@ -31,16 +32,6 @@ public final class XposedHelpers {
     /**
      * Like {@link #findClass(String, ClassLoader)} but returns null
      * instead of throwing when the class cannot be loaded.
-     *
-     * Modules use this to probe for optional classes — classes that
-     * exist on some Android versions or some OEM ROMs but not others
-     * — without wrapping every lookup in a try/catch.
-     *
-     * @param className   fully-qualified name, e.g.
-     *                    "android.provider.Settings$Global"
-     * @param classLoader loader to resolve against; if null, the
-     *                    caller's own classloader is used
-     * @return the Class, or null if it cannot be found
      */
     public static Class<?> findClassIfExists(String className, ClassLoader classLoader) {
         if (className == null) return null;
@@ -48,10 +39,6 @@ public final class XposedHelpers {
             if (classLoader != null) {
                 return Class.forName(className, false, classLoader);
             }
-            // Fall back to the shim's own loader. In practice this is
-            // the same classloader the module was loaded with, so the
-            // lookup succeeds against the same set of classes the
-            // module can see.
             return Class.forName(className, false, XposedHelpers.class.getClassLoader());
         } catch (Throwable t) {
             return null;
@@ -158,26 +145,51 @@ public final class XposedHelpers {
     // HOOK INSTALLATION
     // ═════════════════════════════════════════════════════════════
 
-    public static void findAndHookMethod(Class<?> clazz, String methodName,
-                                         Object... parameterTypesAndCallback) {
-        com.shizuposed.manager.core.XposedHelpersImpl.findAndHookMethod(
-            clazz, null, methodName, parameterTypesAndCallback);
+    public static IXUnhook<XC_MethodHook> findAndHookMethod(
+            Class<?> clazz, String methodName,
+            Object... parameterTypesAndCallback) {
+        try {
+            java.lang.reflect.Method m =
+                com.shizuposed.manager.core.XposedHelpersImpl
+                    .resolveMethod(clazz, methodName, parameterTypesAndCallback);
+            if (m == null) return null;
+            XC_MethodHook cb =
+                com.shizuposed.manager.core.XposedHelpersImpl
+                    .extractCallback(parameterTypesAndCallback);
+            if (cb == null) return null;
+            return XposedBridge.hookMethod(m, cb);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
-    public static void findAndHookMethod(String className, ClassLoader cl, String methodName,
-                                         Object... parameterTypesAndCallback) {
-        com.shizuposed.manager.core.XposedHelpersImpl.findAndHookMethod(
-            className, cl, methodName, parameterTypesAndCallback);
+    public static IXUnhook<XC_MethodHook> findAndHookMethod(
+            String className, ClassLoader cl, String methodName,
+            Object... parameterTypesAndCallback) {
+        try {
+            Class<?> clazz = findClassIfExists(className, cl);
+            if (clazz == null) return null;
+            return findAndHookMethod(clazz, methodName, parameterTypesAndCallback);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
-    public static void hookAllMethods(Class<?> clazz, String methodName,
-                                      XC_MethodHook callback) {
-        com.shizuposed.manager.core.XposedHelpersImpl.hookAllMethods(
-            clazz, methodName, callback);
+    /**
+     * API 94: return a Set of Unhook handles, one per matching
+     * method. An empty set means no methods matched — not an error.
+     */
+    public static Set<XC_MethodHook.Unhook> hookAllMethods(
+            Class<?> clazz, String methodName, XC_MethodHook callback) {
+        return XposedBridge.hookAllMethods(clazz, methodName, callback);
     }
 
-    public static void hookAllConstructors(Class<?> clazz, XC_MethodHook callback) {
-        com.shizuposed.manager.core.XposedHelpersImpl.hookAllConstructors(clazz, callback);
+    /**
+     * API 95: return a Set of Unhook handles, one per constructor.
+     */
+    public static Set<XC_MethodHook.Unhook> hookAllConstructors(
+            Class<?> clazz, XC_MethodHook callback) {
+        return XposedBridge.hookAllConstructors(clazz, callback);
     }
 
     // ═════════════════════════════════════════════════════════════

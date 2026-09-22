@@ -56,6 +56,24 @@ public final class XposedHookBridge {
         }
     }
 
+    public static String getLastInstallBackend(java.lang.reflect.Member member) {
+        try {
+            HookEngine.InstallRecord r = HookEngine.getInstallRecord(member);
+            return r != null ? r.backendName : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    public static Runnable getLastInstallReverse(java.lang.reflect.Member member) {
+        try {
+            HookEngine.InstallRecord r = HookEngine.getInstallRecord(member);
+            return r != null ? r.reverse : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     // ─── default backend ─────────────────────────────────────────────
 
     private static final class LoggingBackend implements HookBackend {

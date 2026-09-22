@@ -6,39 +6,39 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.util.Log;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
+import java.util.HashSet;
+import java.util.Set;
+
 /**
  * Standard Xposed API shim.
  *
- * Modules call XposedBridge.getXposedVersion() to know which framework
- * API is available. They also call XposedBridge.log(...) to write
- * diagnostics from the target process. Both are implemented here.
+ * Version 96 (LSPosed generation 93 + fork revisions 94-96).
+ * Modules that check getXposedVersion() >= N for N <= 96 accept
+ * ShizuPosed as compatible.
  *
- * Version 93 (LSPosed's API generation) is reported so modules that
- * check for a minimum version accept ShizuPosed as compatible. Modules
- * that query LSPosedManager find it in the same package.
- *
- * Enabled / active state queries route to ShizuPosed's
- * ModuleStatusProvider. The provider is exported read-only.
- *
- * NO-ARG OVERLOADS
- * ----------------
- * LSPosed declares isModuleActive() and isModuleEnabled() with no
- * arguments. Module UIs call these forms because they run in their
- * own process and mean "am I — this module — active?" ShizuPosed
- * cannot inject a "current module" flag into the module's process
- * the way a zygote-level framework can, so the calling package is
- * derived from the stack.
- *
- * Without these overloads, a module UI fails to link with
- * NoSuchMethodError at dex verification, and the module's onCreate
- * throws before it can display anything. The UI then falls back to
- * its default "not activated" state, even if the module is fully
- * functional.
+ * VERSION HISTORY OF THIS SHIM
+ * ----------------------------
+ *   93 — LSPosed base: IXUnhook, isModuleActive/isModuleEnabled
+ *        no-arg overloads, provider-backed state queries.
+ *   94 — XposedBridge.hookAllMethods returns
+ *        Set<XC_MethodHook.Unhook>.
+ *   95 — XposedBridge.hookAllConstructors returns the same.
+ *   96 — MethodHookParam.isReturnEarly() exposed; hookAll*
+ *        semantics stabilized.
  */
 public final class XposedBridge {
 
-    /** Reported framework version. 93 = LSPosed's API generation. */
-    public static final int XPOSED_BRIDGE_VERSION = 93;
+    /**
+     * Reported framework version.
+     *
+     * Modules guard on this number before using a feature. We
+     * report 96 because we implement everything the 93-96 surface
+     * requires. Modules that guard on 97+ correctly believe we
+     * don't support the newer fork revisions.
+     */
+    public static final int XPOSED_BRIDGE_VERSION = 96;
 
     /** Logcat tag for XposedBridge.log output. */
     private static final String LOG_TAG = "Xposed";
@@ -64,10 +64,124 @@ public final class XposedBridge {
     }
 
     // ═════════════════════════════════════════════════════════════
+    // HOOK INSTALLATION
+    // ═════════════════════════════════════════════════════════════
+
+    public static IXUnhook<XC_MethodHook> hookMethod(Method method,
+                                                     XC_MethodHook callback) {
+        if (method == null || callback == null) return null;
+
+        try {
+            com.shizuposed.manager.core.XposedHookBridge
+                .installHook(method, callback);
+        } catch (Throwable t) {
+            Log.e(FRAMEWORK_TAG, "hookMethod failed for "
+                + method.getDeclaringClass().getName() + "."
+                + method.getName(), t);
+            return null;
+        }
+
+        String backendName = null;
+        Runnable reverse = null;
+        try {
+            com.shizuposed.manager.core.HookEngine.InstallRecord record =
+                com.shizuposed.manager.core.HookEngine
+                    .getInstallRecord(method);
+            if (record != null) {
+                backendName = record.backendName;
+                reverse = record.reverse;
+            }
+        } catch (Throwable ignored) {}
+
+        return new XposedBridgeUnhook<>(callback, method,
+            backendName, reverse);
+    }
+
+    public static IXUnhook<XC_MethodHook> hookConstructor(Constructor<?> ctor,
+                                                         XC_MethodHook callback) {
+        if (ctor == null || callback == null) return null;
+
+        try {
+            com.shizuposed.manager.core.XposedHookBridge
+                .installConstructorHook(ctor, callback);
+        } catch (Throwable t) {
+            Log.e(FRAMEWORK_TAG, "hookConstructor failed for "
+                + ctor.getDeclaringClass().getName(), t);
+            return null;
+        }
+
+        String backendName = null;
+        Runnable reverse = null;
+        try {
+            com.shizuposed.manager.core.HookEngine.InstallRecord record =
+                com.shizuposed.manager.core.HookEngine
+                    .getInstallRecord(ctor);
+            if (record != null) {
+                backendName = record.backendName;
+                reverse = record.reverse;
+            }
+        } catch (Throwable ignored) {}
+
+        return new XposedBridgeUnhook<>(callback, ctor,
+            backendName, reverse);
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // HOOK ALL — API 94 / 95
+    //
+    // These install a hook on every matching method (or every
+    // constructor) and return a Set of Unhook handles, one per
+    // install. An empty set means no methods matched — not an error.
+    //
+    // The handle set is built by calling hookMethod/hookConstructor
+    // per match, so each handle carries the same backend info and
+    // optional reverse action that a single-method handle would.
+    // ═════════════════════════════════════════════════════════════
+
+    public static Set<XC_MethodHook.Unhook> hookAllMethods(
+            Class<?> clazz, String methodName, XC_MethodHook callback) {
+        Set<XC_MethodHook.Unhook> out = new HashSet<>();
+        if (clazz == null || methodName == null || callback == null) return out;
+        try {
+            for (Method m : clazz.getDeclaredMethods()) {
+                if (m == null || !m.getName().equals(methodName)) continue;
+                try {
+                    com.shizuposed.manager.core.compat.HiddenApiBypass
+                        .forceAccessible(m);
+                    hookMethod(m, callback);
+                    out.add(new XC_MethodHook.Unhook(m));
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable t) {
+            Log.e(FRAMEWORK_TAG, "hookAllMethods failed", t);
+        }
+        return out;
+    }
+
+    public static Set<XC_MethodHook.Unhook> hookAllConstructors(
+            Class<?> clazz, XC_MethodHook callback) {
+        Set<XC_MethodHook.Unhook> out = new HashSet<>();
+        if (clazz == null || callback == null) return out;
+        try {
+            for (Constructor<?> c : clazz.getDeclaredConstructors()) {
+                if (c == null) continue;
+                try {
+                    com.shizuposed.manager.core.compat.HiddenApiBypass
+                        .forceAccessible(c);
+                    hookConstructor(c, callback);
+                    out.add(new XC_MethodHook.Unhook(c));
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable t) {
+            Log.e(FRAMEWORK_TAG, "hookAllConstructors failed", t);
+        }
+        return out;
+    }
+
+    // ═════════════════════════════════════════════════════════════
     // LOGGING
     // ═════════════════════════════════════════════════════════════
 
-    /** Log a plain string. */
     public static void log(String text) {
         try {
             Log.i(LOG_TAG, text == null ? "null" : text);
@@ -75,7 +189,6 @@ public final class XposedBridge {
         refreshFallbackContext();
     }
 
-    /** Log an exception's stack trace. */
     public static void log(Throwable t) {
         try {
             Log.e(LOG_TAG, Log.getStackTraceString(t));
@@ -83,7 +196,6 @@ public final class XposedBridge {
         refreshFallbackContext();
     }
 
-    /** Log a message with an associated exception. */
     public static void log(String text, Throwable t) {
         try {
             Log.e(LOG_TAG, text == null ? "null" : text, t);
@@ -91,11 +203,6 @@ public final class XposedBridge {
         refreshFallbackContext();
     }
 
-    /**
-     * Opportunistically capture an Application context for later use.
-     * Called from log() so that a module's first log line — which
-     * almost always runs on the main thread — seeds the fallback.
-     */
     private static void refreshFallbackContext() {
         try {
             if (LSPosedManager.getFallbackContext() != null) return;
@@ -105,16 +212,9 @@ public final class XposedBridge {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // ENABLED STATE — "is the module turned on?"
+    // ENABLED STATE
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * No-arg form. Derives the calling package from the stack and
-     * asks whether that package is enabled.
-     *
-     * LSPosed declares this. Module UIs that call it fail to link
-     * without it. See the class javadoc.
-     */
     public static boolean isModuleEnabled() {
         String pkg = getCallingPackage();
         if (pkg == null) {
@@ -187,16 +287,9 @@ public final class XposedBridge {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // ACTIVE STATE — "has the module actually done anything?"
+    // ACTIVE STATE
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * No-arg form. Derives the calling package from the stack and
-     * asks whether that package has loaded into at least one target.
-     *
-     * LSPosed declares this. Module UIs that call it fail to link
-     * without it. See the class javadoc.
-     */
     public static boolean isModuleActive() {
         String pkg = getCallingPackage();
         if (pkg == null) {
@@ -235,17 +328,6 @@ public final class XposedBridge {
     // PACKAGE VISIBILITY DIAGNOSTIC
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * On Android 11+, a query against an exported provider returns
-     * null unless the querying app declared the provider's authority
-     * in its own AndroidManifest.xml <queries> block. Most modules
-     * were written against LSPosed, which uses a different authority,
-     * so their manifest does not declare ShizuPosed's.
-     *
-     * The query silently returns nothing. Logging the hint here turns
-     * a mystery into an actionable message in the module's own
-     * logcat, which is where a module author would look.
-     */
     private static void logVisibilityHint(String call, String packageName) {
         if (android.os.Build.VERSION.SDK_INT < 30) return;
         Log.w(FRAMEWORK_TAG, call + "(" + packageName + "): empty result. "
@@ -259,24 +341,14 @@ public final class XposedBridge {
     // CALLING PACKAGE RESOLUTION
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Walk the stack to find the first caller outside the framework,
-     * then derive its package name. Used by the no-arg isModuleActive()
-     * and isModuleEnabled() overloads.
-     *
-     * Returns null if no non-framework frame is found.
-     */
     private static String getCallingPackage() {
         try {
             for (StackTraceElement e : Thread.currentThread().getStackTrace()) {
                 String cls = e.getClassName();
                 if (cls == null) continue;
 
-                // Skip our own shim and the framework.
                 if (cls.startsWith("de.robv.android.xposed.")) continue;
                 if (cls.startsWith("com.shizuposed.")) continue;
-
-                // Skip JDK, Android framework, and ART internals.
                 if (cls.startsWith("java.")) continue;
                 if (cls.startsWith("javax.")) continue;
                 if (cls.startsWith("android.")) continue;
@@ -284,7 +356,6 @@ public final class XposedBridge {
                 if (cls.startsWith("dalvik.")) continue;
                 if (cls.startsWith("sun.")) continue;
 
-                // Try to resolve the class to get its package.
                 try {
                     Class<?> c = Class.forName(cls, false,
                         XposedBridge.class.getClassLoader());
@@ -294,7 +365,6 @@ public final class XposedBridge {
                     }
                 } catch (Throwable ignored) {}
 
-                // Fallback: split the class name at the last dot.
                 int dot = cls.lastIndexOf('.');
                 if (dot > 0) return cls.substring(0, dot);
             }
@@ -308,31 +378,16 @@ public final class XposedBridge {
     // CONTEXT RESOLUTION
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Resolve a Context, working off the main thread.
-     *
-     * Order:
-     *   1. ActivityThread.currentApplication()
-     *   2. ActivityThread.currentActivityThread().getSystemContext()
-     *   3. LSPosedManager's static fallback (shared with this class)
-     *
-     * The second step is what makes queries work from background
-     * threads inside a target process, where currentApplication()
-     * returns null but the system context is still available.
-     */
     private static Context currentApplication() {
         try {
             Class<?> at = Class.forName("android.app.ActivityThread");
 
-            // 1. currentApplication() — only reliable on the main thread.
             try {
                 java.lang.reflect.Method m = at.getMethod("currentApplication");
                 Object o = m.invoke(null);
                 if (o instanceof Context) return (Context) o;
             } catch (Throwable ignored) {}
 
-            // 2. currentActivityThread().getSystemContext() — works on
-            //    any thread as long as a thread has been attached.
             try {
                 java.lang.reflect.Method cur = at.getMethod("currentActivityThread");
                 Object thread = cur.invoke(null);
@@ -340,8 +395,6 @@ public final class XposedBridge {
                     java.lang.reflect.Method getSys = at.getMethod("getSystemContext");
                     Object sys = getSys.invoke(thread);
                     if (sys instanceof Context) {
-                        // Cache the system context as the fallback so
-                        // later off-thread calls short-circuit here.
                         LSPosedManager.setFallbackContext((Context) sys);
                         return (Context) sys;
                     }

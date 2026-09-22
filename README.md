@@ -4,7 +4,7 @@
 
 ShizuPosed runs Xposed-API modules in apps launched through it — no root, no bootloader unlock, no system partition changes. Shizuku invokes `app_process` as the shell UID, a Java runtime bootstraps inside the target's process, and method hooks go in through a multi-backend dispatcher. Modules written for LSPosed and classic Xposed keep working.
 
-Version 5.8.
+Version 5.9.
 
 ---
 
@@ -66,6 +66,7 @@ Target process
   ├── IXposedHookCmdInit         pre-Application dispatch
   ├── HookEngine                 backend selection + fingerprint tracking
   ├── HookDispatcher             per-method backend chain
+  ├── DexLoadingBridge           dex load fallback ladder
   ├── ModuleLoader               dex load + entry invocation
   ├── ResourceHooking            resource + layout hooks
   ├── XStealthModule             built-in privacy module
@@ -93,50 +94,21 @@ The manager never touches the target process directly. Everything passes through
 
 Not every method can be hooked the same way, so the dispatcher tries a fixed order and takes the first backend that succeeds.
 
-Pine AUTO is the primary engine. Pine REPLACEMENT catches methods Pine AUTO rejects. Amiru is a per-method stub engine reached when Pine declines. CallSite is the interpreter-table backend, described below. Native is the original `libshizuposed.so` shared-dispatcher engine. Instrumentation covers the Application and Activity lifecycle only. Proxy handles interface methods. Noop always succeeds and does nothing — so a module that hooks ten methods and finds one it can't hook doesn't lose the other nine.
+Pine AUTO is the primary engine. Pine REPLACEMENT catches methods Pine AUTO rejects. Amiru is a per-method stub engine reached when Pine declines. CallSite patches the ART interpreter dispatch table — used when a target inspects `ArtMethod` entries to detect the other backends. Native is the original `libshizuposed.so` shared-dispatcher engine. Instrumentation covers the Application and Activity lifecycle only. Proxy handles interface methods. Noop always succeeds and does nothing — so a module that hooks ten methods and finds one it can't hook doesn't lose the other nine.
 
-`HookEngine` records the declaring class of every method or constructor it attempts to hook. That record feeds `ApiProtectionCheck`'s fingerprint baselines.
+`HookEngine` records the declaring class of every method or constructor it attempts to hook. That record feeds `ApiProtectionCheck`'s fingerprint baselines, so the framework knows which framework classes it has touched and can pin their method counts.
 
 ---
 
-## The CallSite backend
+## The dex-loading fallback ladder
 
-Pine, Amiru, and Native all hook methods by **modifying the method's `ArtMethod` entry point**. That's the standard technique, and it works on the vast majority of methods. But it has one visible side effect: the entry pointer changes. A target app that reads the entry pointer — which some anti-tampering code does — can see that the method has been hooked.
+Loading a module's dex into a target process can fail for several reasons: the target's cache directory isn't writable, `DexClassLoader` is restricted, the ROM blocks dynamic code loading through certain paths. `DexLoadingBridge` tries three strategies in order:
 
-CallSite is a different technique. Instead of modifying the method, it **patches ART's interpreter dispatch table**. When the interpreter would invoke a flagged method, it routes through a stub that dispatches to Java and then calls the original implementation. The method's `ArtMethod` entry pointer is left untouched. A target that reads it sees the original.
+1. **`InMemoryDexClassLoader`** (Android 8+). Reads the dex into a `ByteBuffer` and loads it without any filesystem write. This is the most reliable path because nothing it does can be blocked by a `noexec` mount or a read-only cache directory.
+2. **`DexClassLoader`.** The classic path. Reads the dex from a file and uses an optimization directory for ART's compiled output.
+3. **`BaseDexClassLoader` injection.** Appends the module's dex to the target's existing classloader by reflection into its `DexPathList`. This is the deepest fallback — used only when both loaders above fail. It doesn't create a new loader; it augments the one the target already has.
 
-### What it covers
-
-Interpreted execution only. ART has three execution modes: interpreted, JIT-compiled, and AOT-compiled. CallSite intercepts the interpreter. Once a method has been JIT-compiled (or was AOT-compiled at build time), the interpreter is bypassed and CallSite has no effect.
-
-In practice, hooks installed early — from `Application.attachBaseContext`, `Application.onCreate`, or a module's `handleLoadPackage` — run before the target's methods have been JIT-compiled. The interpreter path covers them.
-
-### What it doesn't cover
-
-- Methods called from already-compiled code. Intercepting compiled call sites requires inline-cache rewriting, which CallSite doesn't do.
-- Constructors. The frame shape for `<init>` differs from ordinary method invocation and CallSite doesn't decode it.
-- Arguments and `thisObject` for methods called from the JIT-compiled code of their callers.
-- After-hooks. CallSite dispatches before-hooks only.
-
-### How it decides to activate
-
-At load time, the native library:
-
-1. Resolves `libart.so`'s exported C++ accessors for `ArtMethod`. If the symbols are stripped, CallSite reports itself unavailable.
-2. Locates the interpreter dispatch table by scanning the prologue of `art::interpreter::Execute` for the load-address sequence, then validating the candidate against `libart.so`'s address range.
-3. Builds a small trampoline for each invoke type and patches the table slots.
-
-Each step either succeeds or fails cleanly. If any step fails, `isAvailable()` returns false and the dispatcher moves on. The primary backends are unaffected.
-
-### ART families
-
-`AndroidCompat` groups Android releases by ART family — 10–11, 12, 13, 14, 15, 16+ — rather than by SDK number. The interpreter patch, the `ArtMethod` layout, and the symbol names differ across families. Native components check the family, not the version.
-
-The family boundaries are approximate. The user-facing meaning is: **CallSite works on stock Android 10 and newer, and refuses on ROMs where `libart.so` has been stripped of its C++ export symbols.** No version table, no per-version hardcoded offsets.
-
-### Diagnostics
-
-The `CallSiteCallbackRegistry` counts every dispatch. A non-zero count after launching a scoped app confirms the interpreter patch is actually routing calls. A zero count means the patch installed but the frame decoding didn't extract the `ArtMethod` pointer — a version-specific detail that needs per-family work.
+Each strategy logs its outcome. If all three fail, the module is skipped with a specific reason logged, rather than a generic load error.
 
 ---
 
@@ -154,53 +126,90 @@ XStealth is often described as a "Shamiko equivalent" for non-root setups. Usefu
 
 **Developer Options and ADB.** Hooks every settings read path: `Settings.Global` and `Settings.Secure` static getters, the `ForUser` variants, and direct `ContentResolver.query` calls against `content://settings/{global,secure}/<key>`.
 
-**Shizuku and ShizuPosed packages.** Intercepts `PackageManager.getPackageInfo`, `getApplicationInfo`, `getInstalledPackages`, and `getInstalledApplications` — the int overloads and the newer `PackageInfoFlags` / `ApplicationInfoFlags` overloads.
+**Shizuku and ShizuPosed packages.** Intercepts `PackageManager.getPackageInfo`, `getApplicationInfo`, `getInstalledPackages`, and `getInstalledApplications` — the int overloads and the newer `PackageInfoFlags` / `ApplicationInfoFlags` overloads added in Android 13.
 
 **Running processes.** Filters `ActivityManager.getRunningAppProcesses`, `getRunningServices`, and `getRunningTasks`.
 
 **`/proc` entries.** With the native layer active, hidden strings are scrubbed from `/proc/self/maps`, `cmdline`, `status`, and `mountinfo`.
 
-**The shim classes.** `ApiProtectionCheck` refuses `Class.forName` and `ClassLoader.loadClass` for `de.robv.android.xposed.*` when the caller isn't a loaded module or the framework itself. It also filters `getDeclaredMethods` and related reflection walks on shim classes, and hooks `getResource`, `getPackage`, and their variants for shim paths.
+**The shim classes.** `ApiProtectionCheck` refuses `Class.forName` and `ClassLoader.loadClass` for `de.robv.android.xposed.*` when the caller isn't a loaded module or the framework itself. It also filters `getDeclaredMethods`, `getMethods`, `getDeclaredConstructors`, and `getDeclaredFields` on shim classes, and hooks `getResource`, `getResourceAsStream`, `getResources`, and `getPackage` for shim paths.
 
-**Method-count fingerprinting.** `ApiProtectionCheck` pins a baseline for every framework class the framework has hooked, plus a static list of common detection targets. Every later `getDeclaredMethods()` or `getMethods()` against those classes returns the pinned count.
+**Method-count fingerprinting.** `ApiProtectionCheck` pins a baseline for every framework class the framework has actually hooked, plus a static list of common detection targets. Every later `getDeclaredMethods()` or `getMethods()` against those classes returns the pinned count for non-trusted callers.
 
 ### What XStealth doesn't hide
 
-**Hardware attestation.** Play Integrity's `MEETS_STRONG_INTEGRITY` is a cryptographic proof of bootloader and ROM state.
+**Hardware attestation.** Play Integrity's `MEETS_STRONG_INTEGRITY` is a cryptographic proof of bootloader and ROM state. XStealth doesn't touch any of the inputs to that check.
 
-**Root-empowered inspection.** An app that already has root can read `/proc` directly.
+**Root-empowered inspection.** An app that already has root can read `/proc` directly, bypassing both the Java and libc layers.
 
-**Server-side cross-reference.** A server that cross-checks against Play Store inventory notices.
+**Server-side cross-reference.** XStealth can spoof what an app reports locally. A server that cross-checks against Play Store inventory notices.
 
-**Native reads of the settings database.** Raw binder to the settings provider bypasses the Java hooks.
+**Native reads of the settings database.** An app that reads `/data/system/users/0/settings_global.xml` via native code, or talks to the settings provider over raw binder, bypasses the Java hooks.
 
-**`Runtime.exec("settings get ...")`.** A subprocess that reads the real setting isn't affected.
+**`Runtime.exec("settings get ...")`.** A subprocess that reads the real setting isn't affected by hooks in the app's process.
 
-**Method-list reconstruction.** Only method counts are pinned, not method lists.
+**Method-list reconstruction.** `ApiProtectionCheck` pins method *counts*, not method *lists*.
 
-**Exotic reflection.** `Unsafe`, `Class.getDeclaredMethods0`, and similar paths bypass the Java hooks.
+**Exotic reflection.** `Unsafe`, `Class.getDeclaredMethods0` (the JNI-level private method), and similar paths bypass the Java hooks entirely.
 
-**Signals unrelated to ShizuPosed.** Keyboard, accessibility services, overlay permissions, bootloader state, custom ROM, screen recorders, Play Integrity state. A banking app that flags one of these displays the warning it fails on — and it may not be Developer Options.
+**Signals unrelated to ShizuPosed.** XStealth hides ShizuPosed's own footprint. It doesn't hide: what keyboard you have installed, what accessibility services are enabled, what overlay permissions apps hold, what apps you have installed in general, whether the bootloader is unlocked, whether the device is a custom ROM, whether a screen recorder is running, or Play Integrity state. A banking app that flags one of those signals displays the warning it fails on — and it may not be Developer Options.
 
 ---
 
 ## XStealth Next — the aggressive engine
 
-XStealth Next closes the gap for targets that resolve libc syscall stubs directly or go through the generic syscall dispatcher. It finds the libc stubs and inline-patches their prologues with a branch to a per-syscall handler. It also patches the generic `syscall()` dispatcher and covers `fstatat`/`newfstatat`.
+The primary native engine (`libxstealth.so`) interposes libc functions by symbol. XStealth Next closes the gap for targets that resolve the syscall stub directly or go through the generic syscall dispatcher. It finds the libc stubs and inline-patches their prologues with a branch to a per-syscall handler. It also patches the generic `syscall()` dispatcher and covers `fstatat`/`newfstatat` in addition to `stat`/`lstat`.
 
 Each stub's prologue is validated before patching. Unknown shapes are refused rather than corrupted.
 
+Turning Next on renames the module's display in the Modules tab to **XStealth (Next)**. The package name never changes.
+
+### What Next still doesn't catch
+
+A target that emits its own `svc #0` sequence never touches the libc stub. There's no user-space way to intercept raw syscall instructions without `ptrace` or an LSM.
+
 ---
 
-## Dex optimization
+## API surface — version 96
 
-By default, a module's dex goes to the shell side as-is, and the target compiles it on first use. Dex Optimization runs `dex2oat` on the cached dex before pushing, so the target loads a pre-optimized file. The wrapper tries three compiler filters in order — `speed`, `speed-profile`, `quicken` — and uses whichever succeeds first. Off by default.
+ShizuPosed reports Xposed API version **96** (LSPosed generation 93, plus fork revisions 94, 95, and 96). Modules that guard on `getXposedVersion() >= N` for `N` up to 96 accept ShizuPosed as compatible.
+
+What each version level means for the shim:
+
+- **93** — LSPosed base. `IXUnhook`, `isModuleActive` and `isModuleEnabled` with and without arguments, provider-backed state queries.
+- **94** — `XposedBridge.hookAllMethods` and `XposedHelpers.hookAllMethods` return `Set<XC_MethodHook.Unhook>`.
+- **95** — `hookAllConstructors` returns the same.
+- **96** — `MethodHookParam.isReturnEarly()` exposed, distinguishing "result set to `null`" from "result not set."
+
+Modules that guard on 97 or higher correctly believe ShizuPosed doesn't support those fork revisions, and fall back to their earlier code paths.
+
+### `IXUnhook` and `XC_MethodHook.Unhook`
+
+Both forms of the unhook handle exist:
+
+- `IXUnhook<T extends XC_MethodHook>` — returned by `XposedBridge.hookMethod`, `XposedBridge.hookConstructor`, `XposedHelpers.findAndHookMethod`, and `XposedHelpers.findAndHookConstructor`.
+- `XC_MethodHook.Unhook` — the element type of the `Set` returned by `hookAllMethods` and `hookAllConstructors`.
+
+Both support `getHookedMethod()` and `unhook()`. Whether `unhook()` actually reverses the install depends on the backend:
+
+| Backend | `unhook()` behavior |
+|---|---|
+| CallSite | Reversible in principle (flag cleared when wired) |
+| Proxy | Reversible in principle |
+| Noop | Trivially succeeds — nothing was installed |
+| Pine AUTO | Logs that the backend can't reverse |
+| Pine REPLACEMENT | Logs that the backend can't reverse |
+| Amiru | Depends on the native library |
+| Native | Depends on the native library |
+| Instrumentation | Depends on the implementation |
+
+When a backend can't reverse, `unhook()` is a logged no-op. It never throws. Modules that call `unhook()` in a cleanup path see a clear log line rather than a crash.
 
 ---
 
 ## Module loading
 
-Standard Xposed module resolution. The manager scans each installed module's APK for one of four markers:
+Standard Xposed module resolution. The manager scans each installed module's APK for one of four markers and caches the APK as a dex container:
 
 1. `assets/xposed_init` — the canonical marker, contains the entry class.
 2. `assets/xposed_module` — an older convention, same content.
@@ -209,31 +218,53 @@ Standard Xposed module resolution. The manager scans each installed module's APK
 
 A module that ships none of the four markers is not detected.
 
-Once detected, the descriptor and dex go to the shell side. `XposedHook` reads the module JSON, checks the target against the module's scope, and loads the dex with a `DexClassLoader`.
+Once detected, the descriptor and dex go to the shell side. `XposedHook` reads the module JSON, checks the target against the module's scope, and loads the dex through `DexLoadingBridge` — which tries in-memory loading, then `DexClassLoader`, then classloader injection.
+
+Built-in modules skip the dex load. The marker file is the source of truth for activation state.
 
 ### Self-hook modules
 
-Some modules determine their activation state by installing a hook on one of their own UI methods. When you tap **Open module app** in a module's detail sheet, ShizuPosed launches the module's own UI through itself, installing hooks into the module's process before the UI starts.
+Some modules determine their own activation state by installing a hook on one of their own UI methods. Under LSPosed, this works automatically. Under ShizuPosed, when you tap **Open module app** in a module's detail sheet, ShizuPosed launches the module's own UI through itself, installing hooks into the module's process before the UI starts. The self-hook installs, the UI reads it back, and the activation state is reported correctly.
 
 ### Recommended scope
 
-Modules can declare which apps they're *intended* for via `assets/scope.list`. ShizuPosed surfaces those as **recommended**: a chip in the scope editor, a badge on their rows, and a count on the module's row.
+Modules can declare which apps they're *intended* for by shipping an `assets/scope.list` file inside the APK. ShizuPosed reads that file and surfaces the packages as **recommended**: a chip in the scope editor that selects them, a badge on their rows, and a count on the module's row.
+
+Modules without a `scope.list` see no change.
 
 ---
 
 ## Activation state — how "Activated" actually works
 
-Two distinct questions. "Am I enabled?" comes from `XposedBridge.isModuleEnabled(pkg)`. "Am I active?" comes from `XposedBridge.isModuleActive(pkg)`.
+Two distinct questions. "Am I enabled?" comes from `XposedBridge.isModuleEnabled(pkg)`, sourced from the manager's preference store. "Am I active?" comes from `XposedBridge.isModuleActive(pkg)`, sourced from the shell-side marker files.
 
 ### The marker mirror
 
-The shell-side `XposedHook` writes one JSON marker per hooked target to `<shell-base>/hooked/<pkg>.json`. The manager mirrors the markers into its own files directory. `ProcessMonitor` runs one compound shell command every five seconds. `ModuleStatusProvider` reads from the mirror.
+The shell-side `XposedHook` writes one JSON marker per hooked target to `<shell-base>/hooked/<pkg>.json` after installing hooks. The manager mirrors the markers into its own files directory. `ProcessMonitor` runs one compound shell command every five seconds and writes each marker into `<manager files>/.markers/<pkg>.json`. `ModuleStatusProvider` reads from that mirror.
 
-Marker writes are atomic — temp file plus rename — so a concurrent refresh never sees a partial file.
+- **Queries are local file reads.** No Shizuku in the query path.
+- **Activation state survives Shizuku outages.**
+- **The shell cost is bounded.** One command per five seconds.
+
+The marker write is atomic — a temp file followed by a rename — so a concurrent refresh sees either the old marker or the new one, never a truncated body.
+
+### The query chain
+
+```
+Module UI process
+  → XposedBridge.isModuleActive(pkg)
+    → LSPosedManager.isModuleActive(pkg)
+      → ContentResolver.query(content://com.shizuposed.manager.status/active/<pkg>)
+        → ModuleStatusProvider
+          → reads <manager files>/.markers/*.json
+          → returns active=1 or active=0
+```
+
+The provider caches its parsed scan for three seconds, on top of the five-second mirror refresh. Worst-case latency is about eight seconds.
 
 ### The Android 11+ package visibility requirement
 
-Module UIs that query the status provider from their own process must declare the provider's authority in their own `AndroidManifest.xml`:
+On Android 11 and later, a module that queries the status provider from its own UI must declare the provider's authority in the module's own `AndroidManifest.xml`:
 
 ```xml
 <queries>
@@ -241,27 +272,7 @@ Module UIs that query the status provider from their own process must declare th
 </queries>
 ```
 
-Without it, the query returns null on Android 11+. The shim logs a specific warning when this happens.
-
----
-
-## Compatibility shims
-
-The `de.robv.android.xposed.*` package ships every class modules link against.
-
-`XposedHelpers` provides `findAndHookMethod`, `findClass`, `findClassIfExists`, `findFieldIfExists`, `findMethodIfExists`, `findConstructorIfExists`, and reflection helpers.
-
-`XposedBridge` provides `getXposedVersion`, `isModuleEnabled`, `isModuleActive`, `getModuleScope`, and `log(...)`, in both arg and no-arg forms.
-
-`LSPosedManager` provides the LSPosed-compatible manager API.
-
-`XCallback` and `XCallback.Priority` ship as marker types.
-
-`IXposedMod`, `IXposedHookLoadPackage`, `IXposedHookInitPackageResources`, and `IXposedHookCmdInit` are all present. `IXposedHookCmdInit` fires from `XposedHook.main()` before the target's `Application` object exists.
-
-`XC_LayoutInflated` ships as a functional callback type, driven by a global `LayoutInflater.inflate` hook.
-
-The API version reported is **93** (LSPosed's generation).
+Without it, the query returns null regardless of the provider being exported. When the query returns empty on Android 11+, the shim logs a specific warning naming the missing declaration.
 
 ---
 
@@ -302,6 +313,8 @@ boolean enabled = XposedBridge.isModuleEnabled();
 boolean active  = XposedBridge.isModuleActive();
 ```
 
+For the module UI to reach the provider on Android 11+, the module's own `AndroidManifest.xml` needs the `<queries>` declaration above.
+
 ### Resource replacement
 
 ```java
@@ -314,6 +327,8 @@ public class Res implements IXposedHookInitPackageResources {
 }
 ```
 
+Only the programmatic form is supported.
+
 ### Layout hooks
 
 ```java
@@ -324,6 +339,8 @@ resparam.res.hookLayout(R.layout.main, new XC_LayoutInflated() {
     }
 });
 ```
+
+The global `inflate` hook is installed before `Application.onCreate` in bootstrap mode. In post-application mode it's installed later — layouts already inflated are missed.
 
 ---
 
@@ -342,7 +359,7 @@ Install Shizuku (fork recommended) from the link above, then start it via ADB or
 Install the ShizuPosed Manager APK:
 
 ```
-adb install -r ShizuPosed-R-5.8.apk
+adb install -r ShizuPosed-R-5.9.apk
 ```
 
 Or just tap the APK to install it. ADB is not required for the manager itself — only for starting Shizuku.
@@ -357,11 +374,11 @@ Activation isn't retroactive. A module's UI will show "Activated" only after at 
 
 Five tabs.
 
-**Home** shows the Framework Info card, the status card, the counters, and the list of currently hooked processes. The Framework Info card now reports the ART family and CallSite status.
+**Home** shows the Framework Info card, the status card, the counters, and the list of currently hooked processes.
 
 **Modules** lists installed modules with XStealth always at the top. Tapping a module opens its detail sheet.
 
-**Repo** shows every installed module with its README, metadata, and quick links.
+**Repo** shows every installed module with its README, metadata, and quick links. READMEs are read from `assets/README.md`, `assets/readme.md`, or `README.md` at the APK root.
 
 **Logs** shows the manager's own log with search.
 
@@ -383,86 +400,107 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## Changelog
 
-### 5.8
+### 5.9
 
 ```
 NEW
-• CallSite backend. A new HookDispatcher backend that intercepts
-  method calls by patching ART's interpreter dispatch table
-  rather than the method's ArtMethod entry point. Raises the
-  cost of detection for targets that inspect ArtMethod entries.
-  Interpreted execution only; JIT-compiled and AOT-compiled call
-  sites are unaffected.
+• API version 96. XposedBridge.getXposedVersion() now reports
+  96 (LSPosed generation 93 plus fork revisions 94-96). Modules
+  that guard on >= 96 accept ShizuPosed as compatible.
 
-• AndroidCompat ART family tracking. Android releases are now
-  grouped by ART generation (10-11, 12, 13, 14, 15, 16+) in
-  addition to SDK number. Native components check the family
-  rather than the version.
+• IXUnhook interface and XposedBridgeUnhook implementation.
+  XposedBridge.hookMethod and XposedHelpers.findAndHookMethod
+  return an IXUnhook<XC_MethodHook> handle. The handle exposes
+  getHookedMethod(), getCallback(), and unhook(). Whether
+  unhook() reverses the install depends on the backend; when a
+  backend can't reverse, unhook() is a logged no-op.
 
-• Dynamic ART symbol resolution. libcallsite resolves
-  ArtMethod accessors from libart.so at load time instead of
-  hardcoding per-version struct offsets. Works on any Android
-  version where the C++ export symbols are present; fails
-  cleanly when they are stripped.
+• XC_MethodHook.Unhook nested class. XposedBridge.hookAllMethods
+  and XposedBridge.hookAllConstructors now return
+  Set<XC_MethodHook.Unhook>, one handle per installed hook. An
+  empty set means no methods matched.
 
-• Interpreter table discovery. libcallsite locates the
-  interpreter's dispatch table by scanning the prologue of
-  art::interpreter::Execute for the load-address pattern, then
-  validating the candidate against libart.so's range.
+• MethodHookParam.isReturnEarly(). Distinguishes "result
+  explicitly set to null" from "result not set."
 
-• CallSiteCallbackRegistry dispatch counter. Reports how many
-  times any intercepted method has fired. Non-zero after
-  launching a scoped app confirms the patch is routing.
+• DexLoadingBridge. Loading a module's dex into a target now
+  tries three strategies in order: InMemoryDexClassLoader (no
+  filesystem write), DexClassLoader, and BaseDexClassLoader
+  path-list injection. Each strategy logs its outcome. If all
+  three fail, the module is skipped with a specific reason
+  rather than a generic load error.
 
 CHANGED
-• HookEngine.setShellLibsDir() allows XposedHook to tell the
-  engine where the shell-side libs live, so libcallsite.so can
-  be loaded from the correct directory before backends install.
+• HookEngine tracks the declaring class of every method and
+  constructor it attempts to hook, exposed via
+  getHookedClassNames() for ApiProtectionCheck.
 
-• Backend chain order: Pine AUTO, Pine REPLACEMENT, Amiru,
-  CallSite, Native, Instrumentation, Proxy, Noop.
+• HookEngine.InstallRecord records which backend installed each
+  hook, so IXUnhook.unhook() can look up whether a reverse
+  action is available.
 
-• XposedHook logs the presence or absence of libcallsite.so at
-  startup, without loading it — loading happens inside
-  HookEngine.
+• HookDispatcher exposes getLastInstalledBackendName() and
+  getLastInstalledReverse() for HookEngine to consume.
+
+• XposedHelpers.hookAllMethods and hookAllConstructors are thin
+  forwarders to XposedBridge, which builds the handle set.
 
 NOTES
-• The interpreter frame decoding in handler_check is
-  version-specific. The interpreter table location, symbol
-  resolution, and patching are dynamic; extracting the
-  ArtMethod pointer and argument array from the frame requires
-  per-family work.
+• unhook() is a real reverse on backends that support it
+  (CallSite, Proxy, Noop). On Pine, Amiru, Native, and
+  Instrumentation, it logs a warning naming the backend and
+  leaves the hook in place. This is documented behavior, not a
+  bug.
 
-• CallSite doesn't cover constructors, after-hooks, or
-  JIT-compiled call sites. Those remain with Pine, Amiru, and
-  Native.
+• DexLoadingBridge is a load-time fallback ladder, not a
+  hooking backend. It participates in the module load path only;
+  it doesn't register with HookDispatcher.
 
-• CallSite is optional. If libart.so's symbols are stripped
-  (some OEM ROMs), it reports itself unavailable and the
-  dispatcher skips it. The primary backends are unaffected.
+• No changes to the hook backends themselves, the dispatcher
+  chain, or the module format.
 ```
 
 ### 5.7
 
 ```
 NEW
-• Deeper settings hooks (ForUser variants, direct resolver
-  queries).
-• Expanded package checks (Android 13+ flags overloads).
-• RunningProcessCheck hooks getRunningTasks.
-• ApiProtectionCheck expanded reflection coverage and
-  fingerprint baselines.
-• Icon cache.
+• Deeper settings hooks. DevOptionsCheck and AdbCheck now hook
+  Settings.Global.getIntForUser / getStringForUser / getLongForUser
+  in addition to the plain getters, and hook ContentResolver.query
+  directly for content://settings/{global,secure}/<key> URIs.
+
+• Expanded package checks. PackageCheck now hooks the Android
+  13+ PackageInfoFlags and ApplicationInfoFlags overloads.
+
+• RunningProcessCheck now hooks getRunningTasks.
+
+• ApiProtectionCheck expanded. Now hooks ClassLoader.getResource,
+  getResourceAsStream, getResources, and getPackage, plus
+  Package.getPackage. Filters Class.getDeclaredMethods and
+  friends on shim classes.
+
+• Fingerprint baselines. ApiProtectionCheck pins method-count
+  baselines on framework classes ShizuPosed has hooked.
+
+• Icon cache. IconResolver wraps its lookups in an LruCache.
 
 CHANGED
-• XStealth scope removed. Applies to every launch.
+• XStealth scope removed. XStealth applies to every app
+  ShizuPosed launches.
+
+PERFORMANCE
+• Scope editor no longer passes GET_META_DATA to
+  PackageManager.getInstalledApplications.
+• Scope editor no longer calls ModuleLoader.loadModules() on
+  the UI thread.
+• IconResolver caches resolved icons.
 ```
 
 ### 5.6
 
 ```
 NEW
-• XStealth scope (initial).
+• XStealth scope (initial design).
 • ScopeProvider abstraction.
 ```
 
@@ -470,14 +508,15 @@ NEW
 
 ```
 NEW
-• XStealth scope (initial design).
+• XStealth scope (first implementation).
 ```
 
 ### 5.4
 
 ```
 NEW
-• Self-hook module support.
+• Self-hook module support. "Open module app" routes through
+  ShizuPosed when the prerequisites are met.
 ```
 
 ### 5.3
@@ -533,9 +572,21 @@ These are structural, not bugs to be fixed.
 
 **Activation reporting in module UIs.** Module UIs that check their own activation state by hooking one of their own methods will report "not activated" unless their UI is launched through ShizuPosed.
 
-**CallSite coverage.** Interpreted execution only. Constructors and after-hooks aren't covered. JIT-compiled call sites bypass the interpreter and aren't intercepted.
+**What does work:** modules that check activation via `XposedBridge.isModuleActive()`, `LSPosedManager.isModuleActive()`, the status provider, or `XSharedPreferences` report correctly without any extra step. The manager's **Open module app** button routes through ShizuPosed when it can.
 
-**XStealth's practical ceiling.** XStealth covers the common detection paths for Developer Options, ADB, package presence, running processes, `/proc` reads, and reflection walks. It doesn't cover hardware attestation, native reads of the settings database, `Runtime.exec` subprocesses, method-list reconstruction, exotic reflection, kernel-level watchers, or signals unrelated to ShizuPosed.
+**`unhook()` on most backends is a no-op.** Pine, Amiru, Native, and Instrumentation don't expose a reverse. CallSite, Proxy, and Noop do. Modules that rely on unhook() should check whether the handle's backend supports it, or accept the logged no-op.
+
+**Dex loading fallback ladder.** `InMemoryDexClassLoader` requires Android 8+. `BaseDexClassLoader` injection relies on reflection into hidden internals and is version-fragile — it's a fallback, not a primary path.
+
+**XStealth's practical ceiling.** XStealth covers the common detection paths for Developer Options, ADB, package presence, running processes, `/proc` reads, and reflection walks. It doesn't cover:
+
+- Hardware attestation (Play Integrity `MEETS_STRONG_INTEGRITY`).
+- Native reads of the settings database, or raw binder to the settings provider.
+- `Runtime.exec("settings get ...")` subprocesses.
+- Method-list reconstruction on framework classes (only method counts are pinned).
+- Exotic reflection via `Unsafe` or JNI-level private methods.
+- Kernel-level watchers, or inspection from a root process outside the target.
+- Signals unrelated to ShizuPosed: keyboard, accessibility services, overlay permissions, bootloader state, custom ROM, screen recorders, Play Integrity.
 
 A banking app that shows a warning may be failing on any of these, not just the ones XStealth hides.
 
@@ -544,8 +595,6 @@ A banking app that shows a warning may be failing on any of these, not just the 
 **Amiru-specific:** object arguments arrive as `null`, `thisObject` arrives as `null`, after-hooks aren't dispatched, JIT-inlined callers aren't invalidated, constructors aren't hookable, ARM64 only.
 
 **Native engines:** in-process only, object arguments and `thisObject` arrive as `null`, after-hooks aren't dispatched, ARM64 only.
-
-**CallSite-specific:** constructor interception, after-hooks, and argument/`thisObject` extraction from interpreted frames depend on version-specific frame layout. Coverage varies across Android versions.
 
 ---
 

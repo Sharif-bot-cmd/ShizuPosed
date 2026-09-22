@@ -177,6 +177,9 @@ public final class AndroidCompat {
         return isAtLeast(30);
     }
 
+    public static boolean supportsInMemoryDexClassLoader() {
+        return isAtLeast(26);
+    }
     // ═════════════════════════════════════════════════════════════
     // CALL-SITE INTERCEPTION FLAGS
     // ═════════════════════════════════════════════════════════════
