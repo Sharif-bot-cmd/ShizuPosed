@@ -126,7 +126,7 @@ public final class LSPosedManager {
     }
 
     public static String getVersionName() {
-        return "(1020)";
+        return "5.9";
     }
 
     public static String getManagerPackageName() {

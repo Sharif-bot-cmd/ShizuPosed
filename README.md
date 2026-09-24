@@ -346,7 +346,7 @@ The global `inflate` hook is installed before `Application.onCreate` in bootstra
 
 ## Requirements
 
-Android 10 or newer, ARM64. Shizuku 13.1.1 or newer, running and authorized — the recommended build is the fork by **thedjchi** at `github.com/thedjchi/Shizuku`. About 200 MB free storage. No root required. For building: JDK 21 and Android SDK 37. For rebuilding the native libraries: `clang` (Termux `clang` or NDK r25+).
+Android 10 or newer, ARM64. Shizuku 13.1.1 or newer, running and authorized — the recommended build is the fork by **thedjchi** at `github.com/thedjchi/Shizuku`. About 200 MB free storage. No root required. For building: JDK 21, Gradle 9.7, and Android SDK 37. For rebuilding the native libraries: `clang` (Termux `clang` or NDK r25+).
 
 Shevery is also supported, though some of its privileged-API paths have known issues.
 
@@ -366,7 +366,7 @@ Or just tap the APK to install it. ADB is not required for the manager itself �
 
 Open the manager. It requests Shizuku permission on first launch. Add a module from the Modules tab, or use one that auto-detects. Edit the module's scope to choose which apps it applies to. Then tap **Launch App under ShizuPosed** and pick a scoped app.
 
-Activation isn't retroactive. A module's UI will show "Activated" only after at least one scoped app has been launched through ShizuPosed.
+The target must be started through ShizuPosed for hooks to load; launching it normally cannot retroactively install hooks. Activation is not retroactive. A module's UI will show "Activated" only after at least one scoped app has been launched through ShizuPosed.
 
 ---
 

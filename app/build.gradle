@@ -197,7 +197,7 @@ tasks.register('checkCallSite') {
         def so = file('src/main/jniLibs/arm64-v8a/libcallsite.so')
         if (!so.exists()) {
             logger.warn(
-                "libamiru.so not found at ${so.absolutePath}\n" +
+                "libcallsite.so not found at ${so.absolutePath}\n" +
                 "  CallSite will be unavailable and  the dispatcher will fall\n" +
                 "  through to the existing native shim. To build it:\n" +
                 "    clang -shared -fPIC -O2 -Wall -Wextra \\\n" +

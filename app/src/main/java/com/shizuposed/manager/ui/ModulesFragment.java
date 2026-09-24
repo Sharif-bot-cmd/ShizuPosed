@@ -721,7 +721,7 @@ public class ModulesFragment extends Fragment {
         }
 
         ModuleDetailSheet sheet = ModuleDetailSheet.newInstance(module.packageName);
-        sheet.show(getParentFragmentManager(), "module_detail");
+        sheet.show(getChildFragmentManager(), "module_detail");
     }
 
     public void onModuleUpdated(ModuleInfo updated) {
@@ -1016,8 +1016,19 @@ public class ModulesFragment extends Fragment {
         for (ApplicationInfo app : all) {
             if (app == null || app.packageName == null) continue;
             if (managerSelf.equals(app.packageName)) continue;
-            if (selfPackage != null && selfPackage.equals(app.packageName)) continue;
-            if (modulePackages.contains(app.packageName)) continue;
+
+            boolean isSelf = selfPackage != null
+                && selfPackage.equals(app.packageName);
+
+            boolean allowSelf = isSelf
+                && ModuleScanner.hasLauncherActivity(
+                    requireContext(), selfPackage);
+
+            if (modulePackages.contains(app.packageName)
+                    && !(isSelf && allowSelf)) {
+                continue;
+            }
+
             out.add(app);
         }
 
