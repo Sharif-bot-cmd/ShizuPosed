@@ -127,11 +127,32 @@ public final class ReflectionUnsafe {
         return s;
     }
 
+    /**
+     * Probe the known Unsafe class names and accessor patterns. The
+     * order reflects real-world availability:
+     *
+     *   • sun.misc.Unsafe            — present on every Android release
+     *                                  through API 35. First choice.
+     *   • jdk.internal.misc.Unsafe   — the JDK-internal equivalent.
+     *                                  Present but access-restricted on
+     *                                  recent Android; kept as a
+     *                                  fallback in case sun.misc is
+     *                                  removed in a future version.
+     *
+     * For each class we try the known static-field names first
+     * (theUnsafe, THE_ONE), then the getUnsafe() factory. Older
+     * builds only expose one or the other; newer builds often expose
+     * both, and either works.
+     *
+     * Deliberately not probed:
+     *   • dalvik.system.VMRuntime — does not expose an Unsafe instance.
+     *     Including it in the probe would cost three reflective calls
+     *     per process start for a guaranteed miss.
+     */
     private static Object[] tryAllStrategies() {
         String[] classes = {
                 "sun.misc.Unsafe",
                 "jdk.internal.misc.Unsafe",
-                "dalvik.system.VMRuntime", // no Unsafe here, but harmless probe
         };
         String[] fields = { "theUnsafe", "THE_ONE" };
         for (String cn : classes) {

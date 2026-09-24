@@ -145,13 +145,9 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
 
         Button openApp = v.findViewById(R.id.btnOpenModuleApp);
         Button forceStop = v.findViewById(R.id.btnForceStopScoped);
-        Button launchScopedApp = v.findViewById(R.id.btnLaunchScopedApp);
         Button uninstall = v.findViewById(R.id.btnUninstallModule);
 
         if (openApp != null) {
-            // Resolve a launchable activity. This handles modules with
-            // no LAUNCHER entry and modules whose config activity is
-            // not exported. See ModuleActivityResolver.
             resolvedActivity = ModuleActivityResolver.resolve(
                 requireContext(), module.packageName);
 
@@ -159,9 +155,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                 openApp.setEnabled(true);
                 openApp.setText("Open module app");
 
-                // Small hint in the button label if we had to fall
-                // back to a non-launcher path. Harmless on normal
-                // modules, informative on the ones that need it.
                 String reason = resolvedActivity.reason;
                 if ("main-no-launcher".equals(reason)) {
                     openApp.setText("Open module app (no launcher)");
@@ -276,12 +269,24 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
     /**
      * Launch the module's own configuration UI.
      *
-     * Two paths:
-     *   1. Exported activity — start it directly via Context.startActivity.
-     *      Fast, no Shizuku round-trip.
-     *   2. Non-exported activity — the manager cannot start it directly,
-     *      so we go through Shizuku with `am start`. Shell UID has
-     *      permission to start components of other apps.
+     * Three paths, in order of preference:
+     *
+     *   1. Launch through ShizuPosed. This is the default. It runs
+     *      the module's UI inside app_process with hooks installed,
+     *      which is what self-hook-based activation checks need to
+     *      see. Modules like Spoof My Device hook one of their own
+     *      UI methods and use the presence of that hook as the
+     *      activation signal — without this path, they always show
+     *      "Not activated" even when their target hooks are working.
+     *
+     *      Falls through to path 2 if ShizuPosed can't launch the
+     *      module (Shizuku not authorized, module not deployed, etc.).
+     *
+     *   2. Exported activity, launched directly. Fast, no Shizuku
+     *      round-trip. Used as a fallback when path 1 isn't available.
+     *
+     *   3. Non-exported activity, launched via Shizuku's `am start`.
+     *      Shell UID has permission to start components of other apps.
      */
     private void launchModuleActivity() {
         if (!isAdded()) return;
@@ -292,7 +297,12 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             return;
         }
 
-        // Path 1: exported activity, launch directly.
+        // Path 1: launch through ShizuPosed.
+        if (tryLaunchThroughShizuPosed()) {
+            return;
+        }
+
+        // Path 2: exported activity, launch directly.
         if (resolvedActivity.isExported) {
             try {
                 Intent i = new Intent(Intent.ACTION_MAIN);
@@ -309,8 +319,7 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             }
         }
 
-        // Path 2: non-exported activity (or direct start failed).
-        // Route through Shizuku so shell UID can start it.
+        // Path 3: non-exported activity (or direct start failed).
         boolean ok = ModuleActivityLauncher.launch(requireContext(),
             module.packageName);
 
@@ -321,6 +330,67 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             Toast.makeText(requireContext(),
                 "Failed to open module app: " + reason,
                 Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /**
+     * Try to launch the module's own UI through ShizuPosed.
+     *
+     * Returns true if the launch was dispatched successfully, false
+     * if it couldn't be attempted (no ModulesFragment parent, Shizuku
+     * not authorized, module has no APK, etc.).
+     *
+     * When it returns true, the caller must not launch the UI by any
+     * other path — the ShizuPosed service will handle it.
+     */
+    private boolean tryLaunchThroughShizuPosed() {
+        try {
+            // The launch flow lives on ModulesFragment. If we're not
+            // a child of one, we can't use it.
+            Fragment parent = getParentFragment();
+            if (!(parent instanceof ModulesFragment)) {
+                if (logger != null) {
+                    logger.d("tryLaunchThroughShizuPosed: no ModulesFragment parent");
+                }
+                return false;
+            }
+
+            // ShizuPosed can only launch modules whose dex it has
+            // cached on the shell side. Built-in modules (XStealth)
+            // have no cached dex and no APK; skip them.
+            if (module == null
+                    || module.cachedDexPath == null
+                    || module.cachedDexPath.isEmpty()) {
+                if (logger != null) {
+                    logger.d("tryLaunchThroughShizuPosed: no cached dex for "
+                        + (module != null ? module.packageName : "null"));
+                }
+                return false;
+            }
+
+            // Shizuku has to be up.
+            ShizukuHelper sh = ShizukuHelper.getInstance(requireContext());
+            if (sh == null || !sh.isAvailable() || !sh.isAuthorized()) {
+                if (logger != null) {
+                    logger.d("tryLaunchThroughShizuPosed: Shizuku not available");
+                }
+                return false;
+            }
+
+            if (logger != null) {
+                logger.i("Opening " + module.packageName
+                    + " under ShizuPosed (self-hook activation)");
+            }
+
+            ((ModulesFragment) parent).launchUnderShizuPosed(module.packageName);
+            dismissAllowingStateLoss();
+            return true;
+
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.w("tryLaunchThroughShizuPosed failed: " + t.getMessage());
+            }
+            return false;
         }
     }
 

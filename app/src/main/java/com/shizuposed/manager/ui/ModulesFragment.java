@@ -1,8 +1,11 @@
 package com.shizuposed.manager.ui;
 
 import android.app.Activity;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.net.Uri;
@@ -18,7 +21,6 @@ import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.ProgressBar;
 import android.widget.TextView;
@@ -35,8 +37,11 @@ import androidx.fragment.app.Fragment;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
+import com.google.android.material.checkbox.MaterialCheckBox;
+import com.google.android.material.chip.Chip;
 import com.google.android.material.floatingactionbutton.FloatingActionButton;
 import com.google.android.material.snackbar.Snackbar;
+import com.google.android.material.textfield.TextInputEditText;
 import com.shizuposed.manager.R;
 import com.shizuposed.manager.ShizukuHelper;
 import com.shizuposed.manager.adapter.AppSelectionAdapter;
@@ -45,6 +50,8 @@ import com.shizuposed.manager.core.ModuleLoader;
 import com.shizuposed.manager.core.ModuleScanner;
 import com.shizuposed.manager.model.ModuleInfo;
 import com.shizuposed.manager.service.ShizuPosedService;
+import com.shizuposed.manager.stealth.XStealthModule;
+import com.shizuposed.manager.stealth.XStealthPrefs;
 import com.shizuposed.manager.utils.Logger;
 
 import java.io.File;
@@ -60,18 +67,31 @@ import java.util.concurrent.Executors;
 /**
  * ModulesFragment
  *
- * Shows every installed Xposed module — same list as R-3.6. No
- * filtering, no hiding.
+ * Shows every installed Xposed module, with the built-in XStealth
+ * pinned at the top of the list.
  *
- * The only behavior that differs from R-3.6 is inside the scope
- * editor (Select Apps dialog): a module whose APK declares a
- * launcher activity can select its OWN package as a hook target, so
- * it can be launched under ShizuPosed and hook itself. Headless
- * modules do not see their own package, matching R-3.6.
+ * APP LIST CACHING
+ * ----------------
+ * The scope editor needs the installed-app list, which requires
+ * PackageManager.getInstalledApplications(GET_META_DATA | ...).
+ * That call opens every installed APK and reads its manifest, which
+ * costs 300-800ms on a device with 200+ apps. Running it on every
+ * dialog open makes the dialog feel sluggish.
  *
- * The self-scope decision is made LIVE against the PackageManager
- * every time the dialog opens. It does not trust the persisted
- * hasUi flag, which may be stale or wrong.
+ * The fix is a two-layer cache:
+ *
+ *   • A process-wide static list of ApplicationInfo, invalidated
+ *     when the system broadcasts a package add / remove / change /
+ *     replace. A short TTL bounds staleness if a broadcast is
+ *     missed.
+ *
+ *   • An eager warm-up on fragment open, run on a background
+ *     thread, so the first dialog open after the tab appears
+ *     already has a populated cache.
+ *
+ * The scope editor is also async: it opens immediately with a
+ * spinner, and the list populates when the query returns. If the
+ * cache is warm (typical), the populate happens within a frame.
  */
 public class ModulesFragment extends Fragment {
     private RecyclerView moduleRecyclerView;
@@ -94,7 +114,7 @@ public class ModulesFragment extends Fragment {
 
     private TextView tvFilePath;
     private EditText etPackage, etModuleName, etEntry;
-    private CheckBox cbAutoDetect;
+    private MaterialCheckBox cbAutoDetect;
     private Uri selectedApkUri = null;
     private String selectedApkPath = null;
     private String selectedApkName = null;
@@ -106,9 +126,42 @@ public class ModulesFragment extends Fragment {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private ExecutorService scannerExecutor = null;
+    private ExecutorService appListExecutor = null;
 
     private volatile boolean scanInProgress = false;
     private volatile boolean viewReady = false;
+
+    /** Fires when XStealth's master toggle changes in SharedPreferences. */
+    private SharedPreferences.OnSharedPreferenceChangeListener xStealthPrefsListener;
+
+    // ═════════════════════════════════════════════════════════════
+    // APP LIST CACHE
+    //
+    // Process-wide, not per-fragment. Two fragments (Modules tab and
+    // a future Repo tab or settings screen) that both need the list
+    // share the same cache.
+    //
+    // Volatile: reads and writes happen on different threads. The
+    // assignment of a fully-built List is atomic; no other state is
+    // shared.
+    // ═════════════════════════════════════════════════════════════
+
+    private static volatile List<ApplicationInfo> sCachedApps = null;
+    private static volatile long sCachedAppsAt = 0L;
+
+    /** Defensive TTL in case a package-change broadcast is missed. */
+    private static final long APP_CACHE_TTL_MS = 60_000L;
+
+    /** True while a background refresh is in flight. */
+    private static volatile boolean sAppRefreshInFlight = false;
+
+    /**
+     * Receiver that clears the cache when the app set changes.
+     * Registered per-fragment but shared behavior: any instance that
+     * receives the broadcast clears the shared static cache, so a
+     * single registration is enough.
+     */
+    private BroadcastReceiver packageChangeReceiver;
 
     private final ActivityResultLauncher<Intent> filePickerLauncher =
         registerForActivityResult(new ActivityResultContracts.StartActivityForResult(),
@@ -142,6 +195,7 @@ public class ModulesFragment extends Fragment {
     public void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         scannerExecutor = Executors.newSingleThreadExecutor();
+        appListExecutor = Executors.newSingleThreadExecutor();
     }
 
     @Nullable
@@ -158,6 +212,9 @@ public class ModulesFragment extends Fragment {
         initViews(view);
         setupRecyclerView();
         setupListeners();
+        registerXStealthPrefsListener();
+        registerPackageChangeReceiver();
+        warmAppListCache();
         loadModules();
         startBackgroundScan();
     }
@@ -166,6 +223,8 @@ public class ModulesFragment extends Fragment {
     public void onDestroyView() {
         super.onDestroyView();
         viewReady = false;
+        unregisterXStealthPrefsListener();
+        unregisterPackageChangeReceiver();
         dismissAllDialogs();
         addModuleDialog = null;
         selectAppsDialog = null;
@@ -186,6 +245,10 @@ public class ModulesFragment extends Fragment {
             scannerExecutor.shutdownNow();
             scannerExecutor = null;
         }
+        if (appListExecutor != null) {
+            appListExecutor.shutdownNow();
+            appListExecutor = null;
+        }
     }
 
     @Override
@@ -203,6 +266,153 @@ public class ModulesFragment extends Fragment {
         }
         loadModules();
     }
+
+    // ═════════════════════════════════════════════════════════════
+    // APP LIST CACHE
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Return the cached app list if it's fresh, or null.
+     */
+    private static List<ApplicationInfo> getCachedApps() {
+        List<ApplicationInfo> cached = sCachedApps;
+        if (cached == null) return null;
+        if (System.currentTimeMillis() - sCachedAppsAt > APP_CACHE_TTL_MS) return null;
+        return cached;
+    }
+
+    /**
+     * Query PackageManager for the full app list and store it in
+     * the cache. Called on a background thread only.
+     */
+    private List<ApplicationInfo> queryInstalledApps() {
+        if (packageManager == null) return new ArrayList<>();
+        try {
+            List<ApplicationInfo> fresh = packageManager.getInstalledApplications(
+                PackageManager.GET_META_DATA | PackageManager.MATCH_DISABLED_COMPONENTS);
+            if (fresh == null) return new ArrayList<>();
+            sCachedApps = fresh;
+            sCachedAppsAt = System.currentTimeMillis();
+            if (logger != null) {
+                logger.d("App list cached: " + fresh.size() + " packages");
+            }
+            return fresh;
+        } catch (Throwable t) {
+            if (logger != null) logger.w("queryInstalledApps failed: " + t.getMessage());
+            return new ArrayList<>();
+        }
+    }
+
+    /**
+     * Warm the cache on fragment open. Runs on the appListExecutor,
+     * so it doesn't touch the UI thread. If the cache is already
+     * warm, this is a no-op.
+     *
+     * The result is discarded here — the next caller picks it up
+     * from the static cache. This exists purely to shift the query
+     * cost off the first user interaction.
+     */
+    private void warmAppListCache() {
+        if (getCachedApps() != null) return;
+        if (sAppRefreshInFlight) return;
+        if (appListExecutor == null || appListExecutor.isShutdown()) return;
+
+        sAppRefreshInFlight = true;
+        appListExecutor.execute(() -> {
+            try {
+                queryInstalledApps();
+            } finally {
+                sAppRefreshInFlight = false;
+            }
+        });
+    }
+
+    /**
+     * Register a receiver that clears the cache when the installed
+     * app set changes. ACTION_PACKAGE_REPLACED handles updates that
+     * don't change the package name but do change metadata.
+     */
+    private void registerPackageChangeReceiver() {
+        if (!isAdded() || getContext() == null) return;
+        try {
+            packageChangeReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    if (intent == null || intent.getData() == null) return;
+                    sCachedApps = null;
+                    sCachedAppsAt = 0L;
+                    if (logger != null) {
+                        logger.d("App cache invalidated: "
+                            + intent.getAction() + " " + intent.getData());
+                    }
+                }
+            };
+            IntentFilter filter = new IntentFilter();
+            filter.addAction(Intent.ACTION_PACKAGE_ADDED);
+            filter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+            filter.addAction(Intent.ACTION_PACKAGE_CHANGED);
+            filter.addAction(Intent.ACTION_PACKAGE_REPLACED);
+            filter.addDataScheme("package");
+
+            Context ctx = requireContext().getApplicationContext();
+            if (Build.VERSION.SDK_INT >= 33) {
+                ctx.registerReceiver(packageChangeReceiver, filter,
+                    Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                ctx.registerReceiver(packageChangeReceiver, filter);
+            }
+        } catch (Throwable t) {
+            if (logger != null) logger.w("registerPackageChangeReceiver failed: "
+                + t.getMessage());
+            packageChangeReceiver = null;
+        }
+    }
+
+    private void unregisterPackageChangeReceiver() {
+        if (packageChangeReceiver == null) return;
+        try {
+            requireContext().getApplicationContext()
+                .unregisterReceiver(packageChangeReceiver);
+        } catch (Throwable ignored) {}
+        packageChangeReceiver = null;
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // XSTEALTH STATE SYNC
+    // ═════════════════════════════════════════════════════════════
+
+    private void registerXStealthPrefsListener() {
+        if (!isAdded() || getContext() == null) return;
+        try {
+            xStealthPrefsListener = (sharedPreferences, key) -> {
+                if (key == null) return;
+                if (!"enabled".equals(key)) return;
+                if (!viewReady) return;
+                if (logger != null) logger.d("XStealth prefs changed, reloading rows");
+                loadModules();
+            };
+            requireContext()
+                .getSharedPreferences("xstealth", Context.MODE_PRIVATE)
+                .registerOnSharedPreferenceChangeListener(xStealthPrefsListener);
+        } catch (Throwable t) {
+            if (logger != null) logger.w("registerXStealthPrefsListener failed: "
+                + t.getMessage());
+        }
+    }
+
+    private void unregisterXStealthPrefsListener() {
+        if (xStealthPrefsListener == null) return;
+        try {
+            requireContext()
+                .getSharedPreferences("xstealth", Context.MODE_PRIVATE)
+                .unregisterOnSharedPreferenceChangeListener(xStealthPrefsListener);
+        } catch (Throwable ignored) {}
+        xStealthPrefsListener = null;
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // VIEW SETUP
+    // ═════════════════════════════════════════════════════════════
 
     private void initViews(View view) {
         moduleRecyclerView = view.findViewById(R.id.moduleRecyclerView);
@@ -248,6 +458,10 @@ public class ModulesFragment extends Fragment {
         if (selectAppsDialog != null && selectAppsDialog.isShowing()) selectAppsDialog.dismiss();
         if (confirmDialog != null && confirmDialog.isShowing()) confirmDialog.dismiss();
     }
+
+    // ═════════════════════════════════════════════════════════════
+    // BACKGROUND SCAN
+    // ═════════════════════════════════════════════════════════════
 
     private void startBackgroundScan() {
         if (!viewReady || scanInProgress) return;
@@ -300,6 +514,10 @@ public class ModulesFragment extends Fragment {
         });
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // MODULE LIST
+    // ═════════════════════════════════════════════════════════════
+
     private void loadModules() {
         if (!viewReady) return;
         if (moduleLoader == null) {
@@ -327,6 +545,7 @@ public class ModulesFragment extends Fragment {
                 }
             }
 
+            moveXStealthToTop(modules);
             moduleAdapter.updateData(modules);
 
             if (tvEmptyState != null) {
@@ -342,6 +561,20 @@ public class ModulesFragment extends Fragment {
             if (logger != null) logger.e("loadModules error: " + e.getMessage());
         }
         showLoading(false);
+    }
+
+    private void moveXStealthToTop(List<ModuleInfo> list) {
+        if (list == null || list.isEmpty()) return;
+        for (int i = 0; i < list.size(); i++) {
+            ModuleInfo m = list.get(i);
+            if (m != null && XStealthModule.PACKAGE.equals(m.packageName)) {
+                if (i != 0) {
+                    ModuleInfo x = list.remove(i);
+                    list.add(0, x);
+                }
+                return;
+            }
+        }
     }
 
     private void filterModules(String query) {
@@ -374,6 +607,10 @@ public class ModulesFragment extends Fragment {
         }
         loadModules();
     }
+
+    // ═════════════════════════════════════════════════════════════
+    // PROVIDER + BROADCAST
+    // ═════════════════════════════════════════════════════════════
 
     public void requestModuleRepush(String reason) {
         if (!isAdded() || getContext() == null) return;
@@ -431,12 +668,22 @@ public class ModulesFragment extends Fragment {
         broadcastModuleStateChange(module);
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // TOGGLE
+    // ═════════════════════════════════════════════════════════════
+
     private void toggleModule(ModuleInfo module, boolean enable) {
+        if (module == null) return;
+
+        if (XStealthModule.PACKAGE.equals(module.packageName)) {
+            return;
+        }
+
         long now = System.currentTimeMillis();
         if (now - lastToggleTime < TOGGLE_DEBOUNCE) return;
         lastToggleTime = now;
 
-        if (moduleLoader == null || module == null) return;
+        if (moduleLoader == null) return;
         try {
             module.enabled = enable;
             moduleLoader.saveModule(module);
@@ -459,9 +706,20 @@ public class ModulesFragment extends Fragment {
         }
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // DETAIL SHEET
+    // ═════════════════════════════════════════════════════════════
+
     private void showModuleDetail(ModuleInfo module) {
         if (module == null || module.packageName == null) return;
         if (!isAdded()) return;
+
+        if (XStealthModule.PACKAGE.equals(module.packageName)) {
+            XStealthDetailSheet.newInstance()
+                .show(getParentFragmentManager(), "xstealth_detail");
+            return;
+        }
+
         ModuleDetailSheet sheet = ModuleDetailSheet.newInstance(module.packageName);
         sheet.show(getChildFragmentManager(), "module_detail");
     }
@@ -506,6 +764,10 @@ public class ModulesFragment extends Fragment {
         notifyProviderChanged(packageName, false);
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // LAUNCH
+    // ═════════════════════════════════════════════════════════════
+
     public void launchUnderShizuPosed(String packageName) {
         if (packageName == null) return;
         if (!isAdded()) return;
@@ -530,13 +792,279 @@ public class ModulesFragment extends Fragment {
         }
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // SCOPE EDITOR
+    // ═════════════════════════════════════════════════════════════
     public void openScopeEditor(ModuleInfo module) {
         if (module == null || !isAdded() || !viewReady) return;
+        if (XStealthModule.PACKAGE.equals(module.packageName)) return;
         showSelectAppsDialog(module);
     }
 
+    public void showSelectAppsDialog(ModuleInfo module) {
+        if (module == null || !isAdded() || getContext() == null) return;
+        if (XStealthModule.PACKAGE.equals(module.packageName)) return;
+
+        if (selectAppsDialog != null && selectAppsDialog.isShowing()) {
+            selectAppsDialog.dismiss();
+        }
+
+        View dialogView = LayoutInflater.from(requireContext())
+            .inflate(R.layout.dialog_select_apps, null);
+
+        RecyclerView appRecyclerView = dialogView.findViewById(R.id.appRecyclerView);
+        ProgressBar dialogSpinner = dialogView.findViewById(R.id.appListSpinner);
+        TextInputEditText etSearchApps = dialogView.findViewById(R.id.etSearchApps);
+        Chip chipSelectAll = dialogView.findViewById(R.id.chipSelectAll);
+        Chip chipClearAll = dialogView.findViewById(R.id.chipClearAll);
+        Chip chipSelectSystem = dialogView.findViewById(R.id.chipSelectSystem);
+        com.google.android.material.button.MaterialButton btnApply =
+            dialogView.findViewById(R.id.btnApply);
+        TextView tvSelectedCount = dialogView.findViewById(R.id.tvSelectedCount);
+        MaterialCheckBox cbHideSystem = dialogView.findViewById(R.id.cbHideSystem);
+
+        // ── Selection state is initialized from the module and
+        //    survives the async list load.
+        Set<String> currentSelection = new HashSet<>();
+        if (module.hookedApps != null) currentSelection.addAll(module.hookedApps);
+
+        AppSelectionAdapter adapter = new AppSelectionAdapter(requireContext());
+
+        if (tvSelectedCount != null) {
+            tvSelectedCount.setText(currentSelection.size() + " selected");
+            adapter.setOnSelectionChangedListener(count ->
+                tvSelectedCount.setText(count + " selected"));
+        }
+        adapter.setSelectedApps(currentSelection);
+
+        if (appRecyclerView != null) {
+            appRecyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
+            appRecyclerView.setAdapter(adapter);
+            appRecyclerView.setVisibility(View.GONE);
+        }
+        if (dialogSpinner != null) {
+            dialogSpinner.setVisibility(View.VISIBLE);
+        }
+
+        // ── Search, hide-system, chip state. These work on the
+        //    filtered list once it's populated. Until then they're
+        //    inert — the adapters are empty so nothing happens.
+        final List<ApplicationInfo> source = new ArrayList<>();
+        final List<ApplicationInfo> userApps = new ArrayList<>();
+        final List<ApplicationInfo> allAppsRef = new ArrayList<>();
+
+        final Runnable reapply = () -> {
+            if (etSearchApps == null) return;
+            String query = etSearchApps.getText().toString().toLowerCase().trim();
+            List<ApplicationInfo> filtered = new ArrayList<>();
+            for (ApplicationInfo app : source) {
+                if (query.isEmpty()) { filtered.add(app); continue; }
+                String label = app.loadLabel(packageManager).toString().toLowerCase();
+                if (label.contains(query) || app.packageName.toLowerCase().contains(query)) {
+                    filtered.add(app);
+                }
+            }
+            adapter.setApps(filtered);
+        };
+
+        if (cbHideSystem != null) {
+            cbHideSystem.setChecked(true);
+            cbHideSystem.setOnCheckedChangeListener((v, checked) -> {
+                source.clear();
+                source.addAll(checked ? userApps : allAppsRef);
+                reapply.run();
+            });
+        }
+
+        if (etSearchApps != null) {
+            etSearchApps.addTextChangedListener(new TextWatcher() {
+                @Override public void beforeTextChanged(CharSequence s, int i, int c, int a) {}
+                @Override public void onTextChanged(CharSequence s, int i, int b, int c) { reapply.run(); }
+                @Override public void afterTextChanged(Editable s) {}
+            });
+        }
+
+        Chip chipRecommended = dialogView.findViewById(R.id.chipRecommended);
+        if (chipRecommended != null) {
+            final Set<String> recommended = (module.recommendedApps != null)
+                ? new HashSet<>(module.recommendedApps)
+                : new HashSet<>();
+            adapter.setRecommendedApps(recommended);
+            chipRecommended.setVisibility(
+                recommended.isEmpty() ? View.GONE : View.VISIBLE);
+            chipRecommended.setOnClickListener(v -> {
+                adapter.selectRecommended();
+                Toast.makeText(requireContext(),
+                    "Selected " + recommended.size() + " recommended app"
+                        + (recommended.size() != 1 ? "s" : ""),
+                    Toast.LENGTH_SHORT).show();
+            });
+        }
+
+        if (chipSelectAll != null) chipSelectAll.setOnClickListener(v -> adapter.selectAll());
+        if (chipClearAll != null) chipClearAll.setOnClickListener(v -> adapter.clearAll());
+        if (chipSelectSystem != null) {
+            chipSelectSystem.setOnClickListener(v -> {
+                if (cbHideSystem != null && cbHideSystem.isChecked()) {
+                    cbHideSystem.setChecked(false);
+                }
+                adapter.selectSystemApps();
+            });
+        }
+        if (btnApply != null) btnApply.setVisibility(View.GONE);
+
+        // ── Async populate. The dialog is already built; the list
+        //    appears when this completes.
+        final String selfPkg = module.packageName;
+        if (appListExecutor != null && !appListExecutor.isShutdown()) {
+            appListExecutor.execute(() -> {
+                // Use the cache if warm, otherwise query.
+                List<ApplicationInfo> all = getCachedApps();
+                if (all == null) {
+                    all = queryInstalledApps();
+                }
+                List<ApplicationInfo> filtered = filterForScopeEditor(all, selfPkg);
+
+                // Split into user and system.
+                List<ApplicationInfo> users = new ArrayList<>();
+                for (ApplicationInfo app : filtered) {
+                    if ((app.flags & ApplicationInfo.FLAG_SYSTEM) == 0) users.add(app);
+                }
+
+                final List<ApplicationInfo> finalAll = filtered;
+                final List<ApplicationInfo> finalUsers = users;
+
+                mainHandler.post(() -> {
+                    if (!isAdded()) return;
+                    if (selectAppsDialog == null || !selectAppsDialog.isShowing()) return;
+
+                    allAppsRef.clear();
+                    allAppsRef.addAll(finalAll);
+                    userApps.clear();
+                    userApps.addAll(finalUsers);
+
+                    // Respect the current hide-system toggle state.
+                    boolean hideSystem = cbHideSystem == null || cbHideSystem.isChecked();
+                    source.clear();
+                    source.addAll(hideSystem ? finalUsers : finalAll);
+                    reapply.run();
+
+                    if (dialogSpinner != null) dialogSpinner.setVisibility(View.GONE);
+                    if (appRecyclerView != null) appRecyclerView.setVisibility(View.VISIBLE);
+                });
+            });
+        } else {
+            if (dialogSpinner != null) dialogSpinner.setVisibility(View.GONE);
+            if (appRecyclerView != null) appRecyclerView.setVisibility(View.VISIBLE);
+        }
+
+        final ModuleInfo moduleFinal = module;
+
+        selectAppsDialog = new AlertDialog.Builder(requireContext())
+            .setTitle("Select Apps for " + module.name)
+            .setView(dialogView)
+            .setPositiveButton("Apply", (d, w) -> {
+                if (moduleLoader == null) return;
+                Set<String> selected = adapter.getSelectedApps();
+                moduleFinal.hookedApps = selected;
+                moduleLoader.saveModule(moduleFinal);
+                updateModuleRow(moduleFinal);
+                int count = selected.size();
+                String msg = count + " app" + (count != 1 ? "s" : "") + " selected";
+                if (isAdded()) Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show();
+                if (logger != null) logger.i(msg + " for " + moduleFinal.name);
+                requestModuleRepush("selectApps " + moduleFinal.packageName + " -> " + count);
+                announceModuleStateChange(moduleFinal);
+            })
+            .setNegativeButton("Cancel", null)
+            .setOnDismissListener(dialog -> selectAppsDialog = null)
+            .create();
+
+        selectAppsDialog.setCanceledOnTouchOutside(false);
+        selectAppsDialog.show();
+    }
+
+    /**
+     * Filter the full app list down to what the scope editor should
+     * show. Removes the manager itself, the module being scoped, and
+     * every other installed module.
+     */
+    private List<ApplicationInfo> filterForScopeEditor(List<ApplicationInfo> all,
+                                                       String selfPackage) {
+        List<ApplicationInfo> out = new ArrayList<>();
+        if (all == null) return out;
+
+        String managerSelf;
+        try {
+            managerSelf = requireContext().getPackageName();
+        } catch (Throwable t) {
+            managerSelf = "com.shizuposed.manager";
+        }
+
+        Set<String> modulePackages = new HashSet<>();
+        try {
+            if (moduleLoader != null) {
+                for (ModuleInfo m : moduleLoader.getCachedModules()) {
+                    if (m != null && m.packageName != null)
+                        modulePackages.add(m.packageName);
+                }
+            }
+        } catch (Throwable t) {
+            if (logger != null) logger.w("Could not read module list: " + t.getMessage());
+        }
+
+        for (ApplicationInfo app : all) {
+            if (app == null || app.packageName == null) continue;
+            if (managerSelf.equals(app.packageName)) continue;
+
+            boolean isSelf = selfPackage != null
+                && selfPackage.equals(app.packageName);
+
+            boolean allowSelf = isSelf
+                && ModuleScanner.hasLauncherActivity(
+                    requireContext(), selfPackage);
+
+            if (modulePackages.contains(app.packageName)
+                    && !(isSelf && allowSelf)) {
+                continue;
+            }
+
+            out.add(app);
+        }
+
+        try {
+            out.sort((a, b) -> a.loadLabel(packageManager).toString()
+                    .compareToIgnoreCase(b.loadLabel(packageManager).toString()));
+        } catch (Throwable ignored) {}
+
+        return out;
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // UNINSTALL
+    // ═════════════════════════════════════════════════════════════
+
     public void uninstallModule(ModuleInfo module) {
         if (module == null || !isAdded() || !viewReady) return;
+
+        if (XStealthModule.PACKAGE.equals(module.packageName)) {
+            confirmDialog = new AlertDialog.Builder(requireContext())
+                .setTitle("XStealth is built-in")
+                .setMessage("XStealth ships with ShizuPosed and cannot be removed. "
+                    + "Disable it instead?")
+                .setPositiveButton("Disable", (dialog, which) -> {
+                    XStealthPrefs.setEnabled(requireContext(), false);
+                    if (isAdded()) Toast.makeText(requireContext(),
+                        "XStealth disabled", Toast.LENGTH_SHORT).show();
+                    loadModules();
+                    requestModuleRepush("disable xstealth");
+                })
+                .setNegativeButton("Cancel", null)
+                .create();
+            confirmDialog.show();
+            return;
+        }
+
         confirmDialog = new AlertDialog.Builder(requireContext())
             .setTitle("Uninstall Module")
             .setMessage("Remove " + (module.name != null ? module.name : module.packageName)
@@ -565,200 +1093,9 @@ public class ModulesFragment extends Fragment {
         confirmDialog.show();
     }
 
-    public void showSelectAppsDialog(ModuleInfo module) {
-        if (module == null || !isAdded() || getContext() == null) return;
-        if (selectAppsDialog != null && selectAppsDialog.isShowing()) {
-            selectAppsDialog.dismiss();
-        }
-
-        View dialogView = LayoutInflater.from(requireContext())
-            .inflate(R.layout.dialog_select_apps, null);
-
-        RecyclerView appRecyclerView = dialogView.findViewById(R.id.appRecyclerView);
-        EditText etSearchApps = dialogView.findViewById(R.id.etSearchApps);
-        Button btnSelectAll = dialogView.findViewById(R.id.btnSelectAll);
-        Button btnClearAll = dialogView.findViewById(R.id.btnClearAll);
-        Button btnSelectSystem = dialogView.findViewById(R.id.btnSelectSystem);
-        Button btnApply = dialogView.findViewById(R.id.btnApply);
-        TextView tvSelectedCount = dialogView.findViewById(R.id.tvSelectedCount);
-        CheckBox cbHideSystem = dialogView.findViewById(R.id.cbHideSystem);
-
-        // Pass the module's package to getInstalledApps(). The list it
-        // returns includes this module's own entry if and only if the
-        // module has a launcher activity.
-        List<ApplicationInfo> allApps = getInstalledApps(module.packageName);
-
-        List<ApplicationInfo> userApps = new ArrayList<>();
-        for (ApplicationInfo app : allApps) {
-            if ((app.flags & ApplicationInfo.FLAG_SYSTEM) == 0) userApps.add(app);
-        }
-
-        final List<ApplicationInfo> source = new ArrayList<>(userApps);
-
-        Set<String> currentSelection = new HashSet<>();
-        if (module.hookedApps != null) currentSelection.addAll(module.hookedApps);
-
-        AppSelectionAdapter adapter = new AppSelectionAdapter(requireContext());
-
-        if (tvSelectedCount != null) {
-            tvSelectedCount.setText(currentSelection.size() + " selected");
-            adapter.setOnSelectionChangedListener(count ->
-                tvSelectedCount.setText(count + " selected"));
-        }
-        adapter.setSelectedApps(currentSelection);
-
-        if (appRecyclerView != null) {
-            appRecyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
-            appRecyclerView.setAdapter(adapter);
-        }
-
-        final Runnable reapply = () -> {
-            if (etSearchApps == null) return;
-            String query = etSearchApps.getText().toString().toLowerCase().trim();
-            List<ApplicationInfo> filtered = new ArrayList<>();
-            for (ApplicationInfo app : source) {
-                if (query.isEmpty()) { filtered.add(app); continue; }
-                String label = app.loadLabel(packageManager).toString().toLowerCase();
-                if (label.contains(query) || app.packageName.toLowerCase().contains(query)) {
-                    filtered.add(app);
-                }
-            }
-            adapter.setApps(filtered);
-        };
-
-        if (cbHideSystem != null) {
-            cbHideSystem.setChecked(true);
-            cbHideSystem.setOnCheckedChangeListener((v, checked) -> {
-                source.clear();
-                source.addAll(checked ? userApps : allApps);
-                reapply.run();
-            });
-        } else {
-            source.clear();
-            source.addAll(allApps);
-        }
-
-        if (etSearchApps != null) {
-            etSearchApps.addTextChangedListener(new TextWatcher() {
-                @Override public void beforeTextChanged(CharSequence s, int i, int c, int a) {}
-                @Override public void onTextChanged(CharSequence s, int i, int b, int c) { reapply.run(); }
-                @Override public void afterTextChanged(Editable s) {}
-            });
-        }
-
-        reapply.run();
-
-        if (btnSelectAll != null) btnSelectAll.setOnClickListener(v -> adapter.selectAll());
-        if (btnClearAll != null) btnClearAll.setOnClickListener(v -> adapter.clearAll());
-        if (btnSelectSystem != null) {
-            btnSelectSystem.setOnClickListener(v -> {
-                if (cbHideSystem != null && cbHideSystem.isChecked()) {
-                    cbHideSystem.setChecked(false);
-                }
-                adapter.selectSystemApps();
-            });
-        }
-        if (btnApply != null) btnApply.setVisibility(View.GONE);
-
-        selectAppsDialog = new AlertDialog.Builder(requireContext())
-            .setTitle("Select Apps for " + module.name)
-            .setView(dialogView)
-            .setPositiveButton("Apply", (d, w) -> {
-                if (moduleLoader == null) return;
-                Set<String> selected = adapter.getSelectedApps();
-                module.hookedApps = selected;
-                moduleLoader.saveModule(module);
-                updateModuleRow(module);
-                int count = selected.size();
-                String msg = count + " app" + (count != 1 ? "s" : "") + " selected";
-                if (isAdded()) Toast.makeText(requireContext(), msg, Toast.LENGTH_SHORT).show();
-                if (logger != null) logger.i(msg + " for " + module.name);
-                requestModuleRepush("selectApps " + module.packageName + " -> " + count);
-                announceModuleStateChange(module);
-            })
-            .setNegativeButton("Cancel", null)
-            .setOnDismissListener(dialog -> selectAppsDialog = null)
-            .create();
-
-        selectAppsDialog.setCanceledOnTouchOutside(false);
-        selectAppsDialog.show();
-    }
-
-    /**
-     * Returns the list of apps to display in the scope editor.
-     *
-     * Self-scope rule:
-     *   • Every non-module installed app is included.
-     *   • The module whose scope is being edited is INCLUDED if and
-     *     only if the PackageManager reports it has a launcher
-     *     activity. This is checked LIVE at dialog-open time; the
-     *     persisted hasUi flag is not trusted.
-     *   • Every other module package stays excluded.
-     *   • The manager itself (ShizuPosed) is never included.
-     */
-    private List<ApplicationInfo> getInstalledApps(String selfPackage) {
-        if (packageManager == null) return new ArrayList<>();
-        try {
-            if (moduleLoader != null) {
-                try { moduleLoader.loadModules(); } catch (Throwable ignored) {}
-            }
-
-            List<ApplicationInfo> all = packageManager.getInstalledApplications(
-                PackageManager.GET_META_DATA | PackageManager.MATCH_DISABLED_COMPONENTS);
-            if (all == null) return new ArrayList<>();
-
-            String managerSelf = requireContext().getPackageName();
-
-            Set<String> modulePackages = new HashSet<>();
-            try {
-                if (moduleLoader != null) {
-                    for (ModuleInfo m : moduleLoader.getCachedModules()) {
-                        if (m != null && m.packageName != null) modulePackages.add(m.packageName);
-                    }
-                }
-            } catch (Throwable t) {
-                if (logger != null) logger.w("Could not read module list: " + t.getMessage());
-            }
-
-            // Live check against PackageManager. Do not trust the
-            // persisted hasUi flag — it may be stale or missing.
-            boolean allowSelf = selfPackage != null
-                && ModuleScanner.hasLauncherActivity(requireContext(), selfPackage);
-
-            if (logger != null) {
-                logger.i("getInstalledApps: selfPackage=" + selfPackage
-                    + " allowSelf=" + allowSelf
-                    + " modulePackages=" + modulePackages.size());
-            }
-
-            List<ApplicationInfo> filtered = new ArrayList<>(all.size());
-            for (ApplicationInfo app : all) {
-                if (app == null || app.packageName == null) continue;
-
-                if (managerSelf.equals(app.packageName)) continue;
-
-                boolean isModulePkg = modulePackages.contains(app.packageName);
-                boolean isSelf = app.packageName.equals(selfPackage);
-
-                // Show this app if:
-                //   • it's not a module at all, OR
-                //   • it's this module AND this module has a launcher activity
-                if (isModulePkg && !(isSelf && allowSelf)) continue;
-
-                filtered.add(app);
-            }
-
-            try {
-                filtered.sort((a, b) -> a.loadLabel(packageManager).toString()
-                        .compareToIgnoreCase(b.loadLabel(packageManager).toString()));
-            } catch (Throwable ignored) {}
-
-            return filtered;
-        } catch (Exception e) {
-            if (logger != null) logger.e("Failed to get installed apps: " + e.getMessage());
-            return new ArrayList<>();
-        }
-    }
+    // ═════════════════════════════════════════════════════════════
+    // ADD MODULE
+    // ═════════════════════════════════════════════════════════════
 
     private void showAddModuleDialog() {
         if (!isAdded() || !viewReady) return;

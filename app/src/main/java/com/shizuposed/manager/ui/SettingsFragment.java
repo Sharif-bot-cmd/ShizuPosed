@@ -2,6 +2,7 @@ package com.shizuposed.manager.ui;
 
 import android.content.ComponentName;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
@@ -11,7 +12,6 @@ import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.CompoundButton;
 import android.widget.EditText;
-import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -19,6 +19,7 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.fragment.app.Fragment;
 
+import com.google.android.material.materialswitch.MaterialSwitch;
 import com.shizuposed.manager.R;
 import com.shizuposed.manager.ShizukuHelper;
 import com.shizuposed.manager.ShizuPosedManagerApp;
@@ -30,8 +31,17 @@ import java.io.File;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+/**
+ * SettingsFragment
+ *
+ * App settings. The XStealth master toggle no longer lives here —
+ * it moved to the XStealth detail sheet, which is reached by
+ * tapping the XStealth row in the Modules tab. Settings keeps the
+ * runtime toggles (auto-start, debug, log-to-file), cache
+ * management, and config export.
+ */
 public class SettingsFragment extends Fragment {
-    private Switch swAutoStart, swDebugMode, swLogToFile;
+    private MaterialSwitch swAutoStart, swDebugMode, swLogToFile;
     private EditText etScanInterval, etHookDelay;
     private Button btnClearCache, btnExportConfig;
     private TextView tvVersion, tvShizukuStatus, tvServiceStatus;
@@ -42,8 +52,6 @@ public class SettingsFragment extends Fragment {
     private ExecutorService executor = Executors.newSingleThreadExecutor();
 
     private volatile boolean viewReady = false;
-
-    // ── Named listeners (kept as fields so loadSettings can detach) ──
 
     private final CompoundButton.OnCheckedChangeListener autoStartListener =
         (buttonView, isChecked) -> {
@@ -78,10 +86,6 @@ public class SettingsFragment extends Fragment {
                 isChecked ? "Logging to file enabled" : "Logging to file disabled",
                 Toast.LENGTH_SHORT).show();
         };
-
-    // ═════════════════════════════════════════════════════════════
-    // LIFECYCLE
-    // ═════════════════════════════════════════════════════════════
 
     @Override
     public void onAttach(@NonNull Context context) {
@@ -121,10 +125,16 @@ public class SettingsFragment extends Fragment {
     public void onDestroyView() {
         super.onDestroyView();
         viewReady = false;
-        swAutoStart = null; swDebugMode = null; swLogToFile = null;
-        etScanInterval = null; etHookDelay = null;
-        btnClearCache = null; btnExportConfig = null;
-        tvVersion = null; tvShizukuStatus = null; tvServiceStatus = null;
+        swAutoStart = null;
+        swDebugMode = null;
+        swLogToFile = null;
+        etScanInterval = null;
+        etHookDelay = null;
+        btnClearCache = null;
+        btnExportConfig = null;
+        tvVersion = null;
+        tvShizukuStatus = null;
+        tvServiceStatus = null;
     }
 
     @Override
@@ -135,8 +145,6 @@ public class SettingsFragment extends Fragment {
             executor = null;
         }
     }
-
-    // ── Init ──
 
     private void initViews(View view) {
         swAutoStart = view.findViewById(R.id.swAutoStart);
@@ -150,7 +158,7 @@ public class SettingsFragment extends Fragment {
         tvShizukuStatus = view.findViewById(R.id.tvShizukuStatus);
         tvServiceStatus = view.findViewById(R.id.tvServiceStatus);
 
-        if (tvVersion != null) tvVersion.setText("4.0");
+        if (tvVersion != null) tvVersion.setText("5.9");
     }
 
     private void setupListeners() {
@@ -160,8 +168,6 @@ public class SettingsFragment extends Fragment {
         if (swDebugMode != null) swDebugMode.setOnCheckedChangeListener(debugModeListener);
         if (swLogToFile != null) swLogToFile.setOnCheckedChangeListener(logToFileListener);
     }
-
-    // ── Boot receiver ──
 
     private void enableBootReceiver() {
         if (!isAdded()) return;
@@ -193,41 +199,18 @@ public class SettingsFragment extends Fragment {
         }
     }
 
-    /**
-     * Called when the user toggles Auto Start ON.
-     *
-     * This does NOT start the service directly. Direct starts bypassed
-     * the authorization gate and produced "Service start requested from
-     * Settings toggle" noise even when Shizuku wasn't authorized.
-     *
-     * Instead, we delegate to the Application's gated autoStartService(),
-     * which is a no-op unless Shizuku is authorized AND the service isn't
-     * already running. If Shizuku isn't authorized yet, the grant path
-     * will fire autoStartService() the moment permission arrives — so
-     * the user sees the intended behavior without any extra calls.
-     */
     private void maybeStartServiceIfAuthorized() {
         if (!isAdded()) return;
         try {
             ShizuPosedManagerApp app = ShizuPosedManagerApp.getInstance();
-            if (app == null) {
-                if (logger != null) logger.d("Auto-start toggle: app not ready yet");
-                return;
-            }
-            if (!app.isShizukuAuthorized()) {
-                if (logger != null) logger.i("Auto-start toggle: Shizuku not authorized — "
-                        + "service will start automatically once granted");
-                return;
-            }
-            // Delegates to the gated path. No direct startForegroundService().
+            if (app == null) return;
+            if (!app.isShizukuAuthorized()) return;
             app.autoStartService();
         } catch (Throwable t) {
             if (logger != null) logger.w("maybeStartServiceIfAuthorized failed: "
                 + t.getClass().getSimpleName() + ": " + t.getMessage());
         }
     }
-
-    // ── Load / save ──
 
     private void loadSettings() {
         if (prefs == null || !viewReady) return;
@@ -240,6 +223,7 @@ public class SettingsFragment extends Fragment {
         swAutoStart.setChecked(prefs.getBoolean("auto_start", false));
         swDebugMode.setChecked(prefs.getBoolean("debug_mode", false));
         swLogToFile.setChecked(prefs.getBoolean("log_to_file", true));
+
         if (etScanInterval != null) {
             etScanInterval.setText(prefs.getString("scan_interval", "1"));
         }
@@ -261,8 +245,6 @@ public class SettingsFragment extends Fragment {
         if (prefs == null) return;
         prefs.edit().putBoolean(key, value).apply();
     }
-
-    // ── Status ──
 
     private void updateRealStatus() {
         if (!viewReady || !isAdded() || getActivity() == null) return;
@@ -315,8 +297,6 @@ public class SettingsFragment extends Fragment {
             }
         });
     }
-
-    // ── Cache / export ──
 
     private void clearCacheSafe() {
         if (!isAdded() || executor == null) return;
@@ -406,6 +386,32 @@ public class SettingsFragment extends Fragment {
             config.append("hook_delay=").append(prefs.getString("hook_delay", "5")).append("\n");
             config.append("boot_receiver_enabled=")
                   .append(prefs.getBoolean("boot_receiver_enabled", false)).append("\n");
+
+            config.append("\n## XStealth\n");
+            config.append("xstealth_enabled=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isEnabled(requireContext()))
+                  .append("\n");
+            config.append("xstealth_next_enabled=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isNextEnabled(requireContext()))
+                  .append("\n");
+            config.append("xstealth_hide_dev_options=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isHideDevOptions(requireContext()))
+                  .append("\n");
+            config.append("xstealth_hide_adb=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isHideAdb(requireContext()))
+                  .append("\n");
+            config.append("xstealth_hide_shizuku_package=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isHideShizukuPackage(requireContext()))
+                  .append("\n");
+            config.append("xstealth_hide_shizuposed_package=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isHideShizuPosedPackage(requireContext()))
+                  .append("\n");
+            config.append("xstealth_hide_running_processes=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isHideRunningProcesses(requireContext()))
+                  .append("\n");
+            config.append("xstealth_hide_procfs=")
+                  .append(com.shizuposed.manager.stealth.XStealthPrefs.isHideProcFs(requireContext()))
+                  .append("\n");
 
             String fileName = "shizuposed_config_"
                 + new java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.getDefault())

@@ -10,6 +10,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.view.Menu;
 import android.view.MenuItem;
+import android.view.View;
 import android.widget.Toast;
 
 import androidx.activity.result.ActivityResultLauncher;
@@ -21,6 +22,7 @@ import androidx.appcompat.widget.Toolbar;
 import androidx.core.content.ContextCompat;
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.fragment.app.Fragment;
 import androidx.viewpager2.widget.ViewPager2;
@@ -38,8 +40,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class MainActivity extends AppCompatActivity {
-    private static final String VERSION_LABEL = "4.0";
-
+    private static final String VERSION_LABEL = "5.9";
     private ViewPager2 viewPager;
     private BottomNavigationView bottomNavigation;
     private Toolbar toolbar;
@@ -70,24 +71,23 @@ public class MainActivity extends AppCompatActivity {
                 }
 
                 shizukuChecked = false;
-                // Refresh Shizuku status whether or not permissions were
-                // granted. The two concerns are independent; a denied
-                // notification permission must not block the toolbar
-                // from reflecting a successful Shizuku grant.
                 refreshShizukuStatus();
             });
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+
         setContentView(R.layout.activity_main);
-        applySystemBarInsets();
 
         app = ShizuPosedManagerApp.getInstance();
         app.setMainActivity(this);
         logger = Logger.getInstance(this);
 
         initViews();
+        applyWindowInsets();
         setupToolbar();
         setupViewPager();
         setupBottomNavigation();
@@ -96,33 +96,28 @@ public class MainActivity extends AppCompatActivity {
         checkAndRequestPermissions();
     }
 
-    private void applySystemBarInsets() {
-        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.activityRoot),
-                (view, insets) -> {
-                    Insets systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
-                    view.setPadding(
-                            systemBars.left,
-                            systemBars.top,
-                            systemBars.right,
-                            systemBars.bottom);
-                    return insets;
-                });
-        ViewCompat.requestApplyInsets(findViewById(R.id.activityRoot));
+    // ═════════════════════════════════════════════════════════════
+    // EDGE-TO-EDGE INSETS
+    // ═════════════════════════════════════════════════════════════
+
+    private void applyWindowInsets() {
+        View root = findViewById(android.R.id.content);
+        if (root == null) return;
+
+        ViewCompat.setOnApplyWindowInsetsListener(root, (v, insets) -> {
+            Insets bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars()
+                    | WindowInsetsCompat.Type.displayCutout());
+
+            v.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+            return WindowInsetsCompat.CONSUMED;
+        });
     }
 
     // ═════════════════════════════════════════════════════════════
     // PERMISSIONS + INIT
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Request runtime permissions if needed, then refresh Shizuku
-     * status. The two concerns are independent:
-     *
-     *   - Runtime permissions (POST_NOTIFICATIONS on API 33+) affect
-     *     whether the foreground service can post notifications.
-     *   - Shizuku permission affects whether privileged operations
-     *     can run at all.
-     */
     private void checkAndRequestPermissions() {
         List<String> permissionsNeeded = new ArrayList<>();
 
@@ -141,16 +136,12 @@ public class MainActivity extends AppCompatActivity {
             logger.i("✅ All permissions already granted");
         }
 
-        // Always schedule a Shizuku status refresh.
         mainHandler.postDelayed(() -> {
             if (isFinishing() || isDestroyed()) return;
             refreshShizukuStatus();
         }, 300);
     }
 
-    /**
-     * Called by the Application when ShizukuHelper reports the grant.
-     */
     public void onShizukuPermissionGranted() {
         runOnUiThread(() -> {
             shizukuChecked = true;
@@ -305,8 +296,17 @@ public class MainActivity extends AppCompatActivity {
 
     private void initViews() {
         viewPager = findViewById(R.id.viewPager);
-        bottomNavigation = findViewById(R.id.bottomNavigation);
         toolbar = findViewById(R.id.toolbar);
+
+        // The layout names the concrete BottomNavigationView subclass.
+        // The previous version named the abstract NavigationBarView
+        // base, which the inflater cannot instantiate regardless of
+        // R8 — that was the source of the NoSuchMethodException in
+        // the 5.0 crash. ProGuard rules now also pin the constructors
+        // of both the base and the concrete class, so even if the
+        // layout tag is ever changed back by mistake, the reflective
+        // lookup still succeeds.
+        bottomNavigation = findViewById(R.id.bottomNavigation);
     }
 
     private void setupToolbar() {
@@ -324,6 +324,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setupBottomNavigation() {
+        if (bottomNavigation == null) return;
+
         bottomNavigation.setOnItemSelectedListener(item -> {
             int itemId = item.getItemId();
             if (itemId == R.id.nav_home)     { viewPager.setCurrentItem(0); return true; }
@@ -341,10 +343,6 @@ public class MainActivity extends AppCompatActivity {
 
     private void startServices() {
         try {
-            // ── Authorization gate ─────────────────────────────
-            // Do not start the service unless Shizuku is authorized.
-            // The Application's autoStartService() will fire later, when
-            // the grant arrives — the user doesn't need to do anything.
             ShizukuHelper helper = ShizukuHelper.getInstance(this);
             boolean authorized = helper.isAvailable() && helper.isAuthorized();
             if (!authorized) {
@@ -389,7 +387,6 @@ public class MainActivity extends AppCompatActivity {
         MenuItem startItem = menu.findItem(R.id.action_start_service);
         MenuItem stopItem  = menu.findItem(R.id.action_stop_service);
 
-        // Only offer "Start" when authorized AND not already running.
         if (startItem != null) startItem.setVisible(authorized && !running);
         if (stopItem != null)  stopItem.setVisible(running);
 

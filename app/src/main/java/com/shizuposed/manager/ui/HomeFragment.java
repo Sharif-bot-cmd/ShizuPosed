@@ -23,10 +23,8 @@ import androidx.fragment.app.Fragment;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
-import com.google.android.material.color.MaterialColors;
 import com.shizuposed.manager.R;
 import com.shizuposed.manager.ShizuPosedManagerApp;
-import com.shizuposed.manager.ShizukuHelper;
 import com.shizuposed.manager.adapter.HookedProcessAdapter;
 import com.shizuposed.manager.core.ModuleLoader;
 import com.shizuposed.manager.core.ProcessMonitor;
@@ -55,6 +53,7 @@ public class HomeFragment extends Fragment {
     private TextView tvShellPackage, tvShellUid;
     private TextView tvSystemVersion, tvDevice, tvSystemAbi;
     private TextView tvAppProcessStatus;
+    private TextView tvFrameworkApiProtection, tvFrameworkDexOptimize;
 
     private Logger logger;
     private ProcessMonitor processMonitor;
@@ -122,6 +121,7 @@ public class HomeFragment extends Fragment {
         tvShellPackage = null; tvShellUid = null;
         tvSystemVersion = null; tvDevice = null; tvSystemAbi = null;
         tvAppProcessStatus = null;
+        tvFrameworkApiProtection = null; tvFrameworkDexOptimize = null;
     }
 
     @Override
@@ -169,6 +169,8 @@ public class HomeFragment extends Fragment {
         tvDevice           = view.findViewById(R.id.tvDevice);
         tvSystemAbi        = view.findViewById(R.id.tvSystemAbi);
         tvAppProcessStatus = view.findViewById(R.id.tvAppProcessStatus);
+        tvFrameworkApiProtection = view.findViewById(R.id.tvFrameworkApiProtection);
+        tvFrameworkDexOptimize   = view.findViewById(R.id.tvFrameworkDexOptimize);
     }
 
     private void populateFrameworkInfo() {
@@ -205,6 +207,9 @@ public class HomeFragment extends Fragment {
         } catch (Throwable ignored) {}
         tvSystemAbi.setText(abi);
 
+        // ─── XStealth-related rows ─────────────────────────────
+        populateXStealthStatus();
+
         if (logger != null) {
             logger.d("Framework info: " + frameworkVersion
                 + ", API " + XposedBridge.getXposedVersion()
@@ -212,6 +217,51 @@ public class HomeFragment extends Fragment {
                 + ", " + systemVersion
                 + ", " + device
                 + ", ABI " + abi);
+        }
+    }
+
+    /**
+     * Update the API Protection and Dex Optimization rows in the
+     * Framework Info card. Both read from XStealthPrefs so they stay
+     * in sync with the toggles in the XStealth detail sheet.
+     */
+    private void populateXStealthStatus() {
+        if (!viewReady) return;
+        Context ctx = requireContext();
+
+        // API Protection row. Only meaningful when the XStealth master
+        // toggle is on, since nothing installs the check otherwise.
+        if (tvFrameworkApiProtection != null) {
+            boolean master = com.shizuposed.manager.stealth.XStealthPrefs
+                .isEnabled(ctx);
+            boolean on = master && com.shizuposed.manager.stealth.XStealthPrefs
+                .isApiProtectionEnabled(ctx);
+
+            String label;
+            int colorRes;
+            if (!master) {
+                label = "Inactive";
+                colorRes = android.R.color.darker_gray;
+            } else if (on) {
+                label = "Active";
+                colorRes = android.R.color.holo_green_light;
+            } else {
+                label = "Disabled";
+                colorRes = android.R.color.darker_gray;
+            }
+            tvFrameworkApiProtection.setText(label);
+            tvFrameworkApiProtection.setTextColor(ctx.getColor(colorRes));
+        }
+
+        // Dex Optimization row. Independent of the master toggle — it
+        // runs on the manager side, not inside the target process.
+        if (tvFrameworkDexOptimize != null) {
+            boolean on = com.shizuposed.manager.stealth.XStealthPrefs
+                .isDexOptimizeEnabled(ctx);
+            tvFrameworkDexOptimize.setText(on ? "Enabled" : "Disabled");
+            tvFrameworkDexOptimize.setTextColor(ctx.getColor(
+                on ? android.R.color.holo_green_light
+                   : android.R.color.darker_gray));
         }
     }
 
@@ -296,6 +346,10 @@ public class HomeFragment extends Fragment {
             processAdapter.updateData(hookedProcesses);
         }
 
+        // ─── ADD THIS LINE HERE ─────────────────────────────────
+        populateXStealthStatus();
+        // ────────────────────────────────────────────────────────
+
         logger.d("Updated real data - Scoped: " + getScopedAppCount()
             + ", Active modules: " + getEnabledModuleCount()
             + ", Apps: " + getTotalInstalledApps()
@@ -332,27 +386,23 @@ public class HomeFragment extends Fragment {
 
         if (!shizukuAuthorized) {
             tvStatus.setText("No Shizuku Permission");
-            setStatusCardColors(com.google.android.material.R.attr.colorSurfaceVariant,
-                com.google.android.material.R.attr.colorOnErrorContainer);
+            tvStatus.setTextColor(requireContext().getColor(android.R.color.holo_red_light));
+            cardStatus.setCardBackgroundColor(
+                requireContext().getColor(android.R.color.holo_red_light));
             btnStartService.setEnabled(false);
         } else if (serviceRunning) {
             tvStatus.setText("Running ✅");
-            setStatusCardColors(com.google.android.material.R.attr.colorSurfaceVariant,
-                com.google.android.material.R.attr.colorOnSecondaryContainer);
+            tvStatus.setTextColor(requireContext().getColor(android.R.color.holo_green_light));
+            cardStatus.setCardBackgroundColor(
+                requireContext().getColor(android.R.color.holo_green_light));
             btnStartService.setEnabled(false);
         } else {
             tvStatus.setText("Stopped ⚠️");
-            setStatusCardColors(com.google.android.material.R.attr.colorSurfaceVariant,
-                com.google.android.material.R.attr.colorOnPrimaryContainer);
+            tvStatus.setTextColor(requireContext().getColor(android.R.color.holo_orange_light));
+            cardStatus.setCardBackgroundColor(
+                requireContext().getColor(android.R.color.holo_orange_light));
             btnStartService.setEnabled(true);
         }
-    }
-
-    private void setStatusCardColors(int backgroundAttribute, int textAttribute) {
-        int background = MaterialColors.getColor(cardStatus, backgroundAttribute);
-        int text = MaterialColors.getColor(cardStatus, textAttribute);
-        cardStatus.setCardBackgroundColor(background);
-        tvStatus.setTextColor(text);
     }
 
     private int getTotalInstalledApps() {

@@ -24,6 +24,15 @@ import android.os.Build;
  *      sun.misc.Unsafe still exists, whether the ArtMethod layout
  *      changed — all of it can live in one place instead of being
  *      scattered across the codebase.
+ *
+ * ART FAMILY
+ * ----------
+ * Some native components (libcallsite.so especially) need to know
+ * which ART generation they're on, not just the SDK number. The
+ * layout of ArtMethod, the names of interpreter entry symbols, and
+ * the shape of the dispatch table all changed across releases. The
+ * ART_FAMILY constants below group SDK levels into the generations
+ * that share a layout.
  */
 public final class AndroidCompat {
 
@@ -40,6 +49,37 @@ public final class AndroidCompat {
 
     /** Codename string, or "REL" if released. */
     public static final String CODENAME;
+
+    // ═════════════════════════════════════════════════════════════
+    // ART FAMILY
+    //
+    // Grouping of Android releases by ArtMethod layout and
+    // interpreter dispatch shape. Native components use these
+    // instead of the raw SDK number when the actual relevant
+    // difference is the ART generation, not the OS version.
+    //
+    // The boundaries are approximate. When ART changes mid-family
+    // (as it did between 13 and 14 for the interpreter), a new
+    // family is defined.
+    // ═════════════════════════════════════════════════════════════
+
+    /** Unknown / unmapped. */
+    public static final int ART_UNKNOWN = 0;
+    /** Android 10–11 (SDK 29–30). Pre-consolidated ArtMethod. */
+    public static final int ART_10_11 = 1;
+    /** Android 12 (SDK 31). Interim layout. */
+    public static final int ART_12 = 2;
+    /** Android 13 (SDK 33). Consolidated layout, old interpreter. */
+    public static final int ART_13 = 3;
+    /** Android 14 (SDK 34). New interpreter, exposed accessors. */
+    public static final int ART_14 = 4;
+    /** Android 15 (SDK 35). Minor changes to the interpreter. */
+    public static final int ART_15 = 5;
+    /** Android 16+ (SDK 36+). */
+    public static final int ART_16_PLUS = 6;
+
+    /** The ART family this process is running on. */
+    public static final int ART_FAMILY;
 
     static {
         int raw;
@@ -62,13 +102,38 @@ public final class AndroidCompat {
         IS_PRE_RELEASE = preRelease;
         CODENAME = codename;
 
+        ART_FAMILY = computeArtFamily(SDK);
+
         CompatLog.d(TAG, "Effective SDK = " + SDK
                 + " (raw=" + RAW_SDK
                 + ", codename=" + CODENAME
-                + ", preRelease=" + IS_PRE_RELEASE + ")");
+                + ", preRelease=" + IS_PRE_RELEASE
+                + ", artFamily=" + artFamilyName() + ")");
     }
 
     private AndroidCompat() {}
+
+    private static int computeArtFamily(int sdk) {
+        if (sdk >= 36) return ART_16_PLUS;
+        if (sdk >= 35) return ART_15;
+        if (sdk >= 34) return ART_14;
+        if (sdk >= 33) return ART_13;
+        if (sdk >= 31) return ART_12;
+        if (sdk >= 29) return ART_10_11;
+        return ART_UNKNOWN;
+    }
+
+    public static String artFamilyName() {
+        switch (ART_FAMILY) {
+            case ART_10_11:   return "10-11";
+            case ART_12:      return "12";
+            case ART_13:      return "13";
+            case ART_14:      return "14";
+            case ART_15:      return "15";
+            case ART_16_PLUS: return "16+";
+            default:          return "unknown";
+        }
+    }
 
     // ═════════════════════════════════════════════════════════════
     // VERSION CHECKS
@@ -84,65 +149,82 @@ public final class AndroidCompat {
     // FEATURE FLAGS
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * True if sun.misc.Unsafe is *known* to be available on this
-     * Android generation. This is a generation-level fact; the runtime
-     * probe is {@link ReflectionUnsafe#isAvailable()}.
-     */
     public static boolean mayHaveReflectiveUnsafe() {
-        // sun.misc.Unsafe has shipped on every Android release so far.
-        // We don't gate on SDK; ReflectionUnsafe probes at runtime and
-        // degrades gracefully. This method exists so callers can ask
-        // the question without depending on the probe's side effects.
         return true;
     }
 
-    /** True if hidden-API enforcement is a factor (API 28+). */
     public static boolean hasHiddenApiEnforcement() {
         return isAtLeast(28);
     }
 
-    /**
-     * True if the AccessibleObject.override field exists, so the
-     * classic Unsafe-flip strategy can work. Removed in API 31.
-     */
     public static boolean hasAccessibleObjectOverrideField() {
         return isBetween(28, 30);
     }
 
-    /**
-     * True if VMRuntime.setHiddenApiExemptions is available, so the
-     * modern process-wide bypass can be used. Added in API 28.
-     */
     public static boolean hasVMRuntimeHiddenApiExemptions() {
         return isAtLeast(28);
     }
 
-    /**
-     * True if the pre-Application startup path via app_process is
-     * available. Always true in practice; kept as a flag so a future
-     * sandbox that blocks the technique can be detected here.
-     */
     public static boolean supportsAppProcessLaunch() {
         return true;
     }
 
-    /**
-     * True if Pine's REPLACEMENT hook mode is likely to work.
-     * REPLACEMENT requires the ART Instrumentation::Replace path,
-     * which stabilised in API 28.
-     */
     public static boolean supportsReplacementHookMode() {
         return isAtLeast(28);
     }
 
-    /**
-     * True if the ArtMethod layout is the consolidated post-Android-11
-     * layout, where access flags live in a separate field rather than
-     * packed into the method pointer.
-     */
     public static boolean hasConsolidatedArtMethodLayout() {
-        return isAtLeast(30); // Android 11
+        return isAtLeast(30);
+    }
+
+    public static boolean supportsInMemoryDexClassLoader() {
+        return isAtLeast(26);
+    }
+    // ═════════════════════════════════════════════════════════════
+    // CALL-SITE INTERCEPTION FLAGS
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * True if the ART generation is one where the interpreter
+     * dispatch table is reachable through an exported
+     * interpreter::Execute symbol. This is the precondition for
+     * CallSiteBackend to work at all.
+     *
+     * All observed Android versions from 10 to 16 satisfy this.
+     * The flag exists so a future version that removes the
+     * symbols can be detected here instead of failing silently.
+     */
+    public static boolean supportsInterpreterSymbolAnchor() {
+        return isAtLeast(29);
+    }
+
+    /**
+     * True if the ART generation has the consolidated access_flags_
+     * field on ArtMethod, accessible through GetAccessFlags() and
+     * SetAccessFlags() rather than through raw struct offsets.
+     */
+    public static boolean hasArtMethodAccessorSymbols() {
+        return isAtLeast(30);
+    }
+
+    /**
+     * True if the interpreter dispatch uses a per-invoke-type table
+     * rather than the older per-method handler scheme. This is the
+     * shape CallSiteBackend's patching logic assumes.
+     */
+    public static boolean hasInterpreterHandlerTable() {
+        return isAtLeast(30);
+    }
+
+    /**
+     * True if the ART generation is known to strip its C++ export
+     * symbols on some OEM ROMs. When this is true, CallSiteBackend
+     * should also try the fallback layout probe.
+     */
+    public static boolean artMayHaveStrippedSymbols() {
+        // OEM ROMs on 13-15 are the main offenders. Stock AOSP
+        // is fine on all versions.
+        return isAtLeast(33);
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -152,8 +234,9 @@ public final class AndroidCompat {
     public static String describe() {
         if (IS_PRE_RELEASE) {
             return "Android SDK " + SDK
-                    + " (pre-release " + CODENAME + ", raw=" + RAW_SDK + ")";
+                    + " (pre-release " + CODENAME + ", raw=" + RAW_SDK
+                    + ", ART " + artFamilyName() + ")";
         }
-        return "Android SDK " + SDK;
+        return "Android SDK " + SDK + " (ART " + artFamilyName() + ")";
     }
 }

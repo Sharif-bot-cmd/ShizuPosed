@@ -12,8 +12,10 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import com.shizuposed.manager.ShizukuHelper;
+import com.shizuposed.manager.core.MarkerCache;
 import com.shizuposed.manager.core.ModuleLoader;
 import com.shizuposed.manager.model.ModuleInfo;
+import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.utils.Logger;
 import com.shizuposed.manager.utils.ShellUtils;
 
@@ -33,33 +35,24 @@ import java.util.Map;
  * their own app processes) ask questions about their state in
  * ShizuPosed.
  *
- * Modules query:
- *   content://com.shizuposed.manager.status/module/<packageName>
- *       — is the module enabled in the manager?
- *   content://com.shizuposed.manager.status/modules
- *       — list every enabled module package
- *   content://com.shizuposed.manager.status/info
- *       — framework name, version, enabled module count
- *   content://com.shizuposed.manager.status/active/<packageName>
- *       — has the module loaded into at least one target process?
- *   content://com.shizuposed.manager.status/scope/<packageName>
- *       — which packages has the module loaded into?
- *
  * The "active" and "scope" endpoints read the shell-side hooked
- * markers written by XposedHook, so they reflect what the framework
- * has actually done, not just what the user configured.
+ * markers written by XposedHook. Since R-5.4 those markers are read
+ * from a local mirror maintained by MarkerCache, not queried from
+ * ShizuPosed's shell process directly. This makes activation queries
+ * fast, and immune to Shizuku being killed or restarted between a
+ * marker write and a module UI query.
  *
  * MARKER SCAN CACHING
  * -------------------
- * Reading the markers requires a Shizuku round-trip (ls + cat per
- * file). Module UIs frequently poll isModuleActive on every screen
- * refresh, and the manager's Modules tab refreshes on resume.
- * Without caching, a single screen refresh with 5 modules and 30
- * hooked targets causes 150+ shell commands.
+ * The local mirror is refreshed by ProcessMonitor every 5 seconds.
+ * On top of that, the provider caches the parsed scan for
+ * MARKER_CACHE_TTL_MS so that repeated queries within a short window
+ * do not re-read the same files.
  *
- * The scan is therefore cached for MARKER_CACHE_TTL_MS. Fresh reads
- * happen only when the cache is older than the TTL or was never
- * populated.
+ * If the mirror is empty when a query arrives — which happens on a
+ * cold start before the monitor has run — the provider asks
+ * MarkerCache to refresh once, synchronously. If Shizuku is not
+ * available, the query returns an empty result rather than blocking.
  */
 public class ModuleStatusProvider extends ContentProvider {
 
@@ -70,9 +63,6 @@ public class ModuleStatusProvider extends ContentProvider {
     public static final Uri INFO_URI    = Uri.parse("content://" + AUTHORITY + "/info");
 
     private static final String TAG = "ShizuPosedProvider";
-
-    private static final String HOOKED_DIR =
-        "/data/user/0/com.android.shell/files/.syscall_cache/hooked";
 
     /** How long a marker scan stays valid. */
     private static final long MARKER_CACHE_TTL_MS = 3000L;
@@ -91,7 +81,7 @@ public class ModuleStatusProvider extends ContentProvider {
 
     private Logger logger;
 
-    // ── Marker cache ────────────────────────────────────────────
+    // ── In-memory cache of the parsed mirror ────────────────────
     // Key: target package name. Value: the marker JSON body.
     private volatile Map<String, String> markerCache =
         Collections.emptyMap();
@@ -146,23 +136,18 @@ public class ModuleStatusProvider extends ContentProvider {
         String path = uri.getPath() == null ? "" : uri.getPath();
         String[] segments = path.split("/");
 
-        // content://.../module/<pkg>
         if (segments.length >= 3 && "module".equals(segments[1])) {
             return queryModule(segments[2]);
         }
-        // content://.../active/<pkg>
         if (segments.length >= 3 && "active".equals(segments[1])) {
             return queryModuleActive(segments[2]);
         }
-        // content://.../scope/<pkg>
         if (segments.length >= 3 && "scope".equals(segments[1])) {
             return queryModuleScope(segments[2]);
         }
-        // content://.../modules
         if (segments.length >= 2 && "modules".equals(segments[1])) {
             return queryModules();
         }
-        // content://.../info
         if (segments.length >= 2 && "info".equals(segments[1])) {
             return queryInfo();
         }
@@ -228,12 +213,9 @@ public class ModuleStatusProvider extends ContentProvider {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // ACTIVE / SCOPE — read the shell-side hooked markers
+    // ACTIVE / SCOPE — read the local marker mirror
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Has the module loaded into at least one target process?
-     */
     private Cursor queryModuleActive(String modulePkg) {
         boolean active = false;
         try {
@@ -258,9 +240,6 @@ public class ModuleStatusProvider extends ContentProvider {
         return c;
     }
 
-    /**
-     * Which packages has the module loaded into?
-     */
     private Cursor queryModuleScope(String modulePkg) {
         MatrixCursor c = new MatrixCursor(new String[]{"package"});
         try {
@@ -276,12 +255,6 @@ public class ModuleStatusProvider extends ContentProvider {
         return c;
     }
 
-    /**
-     * Parse a marker JSON body and check whether modulePkg is in
-     * its moduleList array. Explicit parse, no substring matching,
-     * so JSON escaping and field ordering cannot cause false
-     * negatives.
-     */
     private boolean markerContainsModule(String markerJson, String modulePkg) {
         if (markerJson == null || modulePkg == null) return false;
         try {
@@ -298,10 +271,15 @@ public class ModuleStatusProvider extends ContentProvider {
     }
 
     /**
-     * Return the marker set, refreshing from Shizuku if the cache
-     * is older than MARKER_CACHE_TTL_MS. Concurrent callers share
-     * one scan.
+     * Return the parsed marker set. Reads from the local mirror via
+     * MarkerCache — never queries Shizuku directly.
+     *
+     * If the mirror is empty (cold start, or ProcessMonitor has not
+     * run its first refresh), asks MarkerCache to refresh once,
+     * synchronously. If Shizuku is unavailable, the refresh is a
+     * no-op and we return the empty map.
      */
+    // ── FIX: no more Shizuku in the query path.
     private Map<String, String> getMarkers() {
         long now = System.currentTimeMillis();
         Map<String, String> cached = markerCache;
@@ -309,11 +287,10 @@ public class ModuleStatusProvider extends ContentProvider {
             return cached;
         }
         synchronized (markerLock) {
-            // Re-check under lock — another thread may have refreshed.
             if (System.currentTimeMillis() - markerCacheAt < MARKER_CACHE_TTL_MS) {
                 return markerCache;
             }
-            Map<String, String> fresh = scanMarkers();
+            Map<String, String> fresh = readLocalMirror();
             markerCache = fresh;
             markerCacheAt = System.currentTimeMillis();
             return fresh;
@@ -321,50 +298,37 @@ public class ModuleStatusProvider extends ContentProvider {
     }
 
     /**
-     * Perform the actual ls + cat scan under the shell's hooked dir.
-     * Returns an empty map on any failure; callers treat that as
-     * "no markers".
+     * Read the local mirror. If empty, ask MarkerCache to refresh
+     * once from the shell side, then read again.
+     *
+     * Never throws. A failure to refresh is not a failure to answer:
+     * we return whatever the mirror currently holds, which may be an
+     * older but still valid snapshot.
      */
-    private Map<String, String> scanMarkers() {
+    private Map<String, String> readLocalMirror() {
         Map<String, String> out = new HashMap<>();
         try {
             if (getContext() == null) return out;
 
-            ShizukuHelper sh = ShizukuHelper.getInstance(getContext());
-            if (!sh.isAvailable() || !sh.isAuthorized()) {
-                Log.w(TAG, "scanMarkers: Shizuku unavailable or unauthorized");
-                return out;
+            out = MarkerCache.read(getContext());
+
+            if (out.isEmpty()) {
+                // Cold cache. Ask for one synchronous refresh. The
+                // refresh is a no-op if Shizuku is unavailable, in
+                // which case out stays empty and we return that.
+                int n = MarkerCache.refresh(getContext());
+                if (n > 0) {
+                    out = MarkerCache.read(getContext());
+                }
+                if (logger != null) {
+                    logger.i("readLocalMirror: cold cache, refresh returned "
+                        + n + ", mirrored " + out.size() + " marker(s)");
+                }
+            } else if (logger != null) {
+                logger.d("readLocalMirror: " + out.size() + " marker(s) from cache");
             }
-
-            ShellUtils.CommandResult ls = sh.executeCommand(
-                "ls " + HOOKED_DIR + " 2>/dev/null; true");
-            if (ls == null || ls.stdout == null) {
-                Log.w(TAG, "scanMarkers: ls returned no output");
-                return out;
-            }
-
-            for (String line : ls.stdout) {
-                String name = line == null ? null : line.trim();
-                if (name == null || name.isEmpty()) continue;
-                if (!name.endsWith(".json")) continue;
-
-                String pkg = name.substring(0, name.length() - 5);
-                if (pkg.isEmpty()) continue;
-
-                ShellUtils.CommandResult cat = sh.executeCommand(
-                    "cat " + HOOKED_DIR + "/" + name);
-                if (cat == null || cat.stdout == null) continue;
-
-                StringBuilder body = new StringBuilder();
-                for (String l : cat.stdout) if (l != null) body.append(l);
-                if (body.length() == 0) continue;
-
-                out.put(pkg, body.toString());
-            }
-
-            Log.i(TAG, "scanMarkers: " + out.size() + " marker(s)");
         } catch (Throwable t) {
-            Log.e(TAG, "scanMarkers failed", t);
+            Log.e(TAG, "readLocalMirror failed", t);
         }
         return out;
     }
@@ -381,10 +345,6 @@ public class ModuleStatusProvider extends ContentProvider {
         Bundle b = new Bundle();
         try {
             String path = method == null ? "" : method;
-            // Support calls of the form:
-            //   call("active", pkg, null)
-            //   call("scope",  pkg, null)
-            //   call("enabled", pkg, null)
             if ("active".equals(path) && arg != null) {
                 Cursor c = queryModuleActive(arg);
                 if (c != null && c.moveToFirst()) {

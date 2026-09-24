@@ -27,6 +27,11 @@ import java.lang.reflect.Modifier;
  *
  * Callers invoke forceAccessible(member) before reading a hidden
  * member. It never throws; it returns false if all strategies fail.
+ *
+ * Version-specific strategies are gated on AndroidCompat flags so a
+ * reader can tell at a glance which Android generations each branch
+ * applies to. The gates are advisory — if a future ROM reintroduces a
+ * removed mechanism, removing the gate is a one-line change.
  */
 public final class HiddenApiBypass {
 
@@ -64,7 +69,9 @@ public final class HiddenApiBypass {
         }
 
         // Strategy 1: process-wide hidden-API exemption.
-        if (s == STRATEGY_NONE || s == STRATEGY_VMRUNTIME) {
+        // Gated on API 28+, where setHiddenApiExemptions was introduced.
+        if ((s == STRATEGY_NONE || s == STRATEGY_VMRUNTIME)
+                && AndroidCompat.hasVMRuntimeHiddenApiExemptions()) {
             if (applyVmRuntimeExemptions()) {
                 bestStrategy = STRATEGY_VMRUNTIME;
                 if (trySetAccessible(member)) return true;
@@ -72,13 +79,19 @@ public final class HiddenApiBypass {
         }
 
         // Strategy 2: plain setAccessible.
+        // This is the strategy that works in app_process running as
+        // shell uid, where hidden-API enforcement is not applied.
         if (trySetAccessible(member)) {
             if (bestStrategy == STRATEGY_NONE) bestStrategy = STRATEGY_SETACCESSIBLE;
             return true;
         }
 
-        // Strategy 3: flip the override flag via Unsafe (API 28-30).
-        if (s == STRATEGY_NONE || s == STRATEGY_OVERRIDE) {
+        // Strategy 3: flip the override flag via Unsafe.
+        // Gated on API 28-30, where AccessibleObject still carries the
+        // boolean field. Removed in API 31, so no point attempting the
+        // reflection probe on later versions.
+        if ((s == STRATEGY_NONE || s == STRATEGY_OVERRIDE)
+                && AndroidCompat.hasAccessibleObjectOverrideField()) {
             if (flipOverride(member)) {
                 bestStrategy = STRATEGY_OVERRIDE;
                 return true;
@@ -176,6 +189,29 @@ public final class HiddenApiBypass {
             if (forceAccessible(ctor)) return ctor;
         } catch (Throwable ignored) {}
         return null;
+    }
+
+    private static volatile boolean sExemptionsApplied = false;
+
+    private static void applyExemptionsOnce() {
+        if (sExemptionsApplied) return;
+        synchronized (HiddenApiBypass.class) {
+            if (sExemptionsApplied) return;
+            sExemptionsApplied = true;
+            try {
+                Class<?> vmRuntime = Class.forName("dalvik.system.VMRuntime");
+                Method getRuntime = vmRuntime.getDeclaredMethod("getRuntime");
+                getRuntime.setAccessible(true);
+                Object runtime = getRuntime.invoke(null);
+                Method setExemptions = vmRuntime.getDeclaredMethod(
+                    "setHiddenApiExemptions", String[].class);
+                setExemptions.setAccessible(true);
+                // Exempt everything. The alternative is exempting
+                // only the specific members we need, which is more
+                // precise but requires naming them all.
+                setExemptions.invoke(runtime, (Object) new String[]{"L"});
+            } catch (Throwable ignored) {}
+        }
     }
 
     // ═════════════════════════════════════════════════════════════

@@ -27,6 +27,26 @@ public class ModuleInfo implements Serializable {
     public boolean hookAllApps;             // If true, hook all apps
     public boolean hookSystemApps;          // If true, hook system apps
 
+    // ============================================================
+    // RECOMMENDED SCOPE
+    //
+    // Package names the module declares as its recommended scope,
+    // read from assets/scope.list in the module APK. This is the
+    // LSPosed convention: the module author lists the packages the
+    // module is designed for, and the scope editor surfaces them
+    // with a badge and a "Recommended" quick-select chip.
+    //
+    // Distinct from hookedApps, which is the user's actual
+    // selection. A package can be recommended without being
+    // selected, and selected without being recommended.
+    //
+    // Empty when the module declares no scope.list. Never null.
+    // Set by ModuleLoader.readRecommendedScope() at install/load
+    // time, and preserved across ModuleScanner re-registration.
+    // ============================================================
+    // ── CHANGE: new field.
+    public Set<String> recommendedApps;
+
     public boolean hasXposedInit;
     public boolean hasNativeInit;
 
@@ -54,6 +74,8 @@ public class ModuleInfo implements Serializable {
         this.hookAllApps = false;
         this.hookSystemApps = false;
         this.hasUi = false;
+        // ── CHANGE: initialize recommended set so it is never null.
+        this.recommendedApps = new HashSet<>();
     }
 
     public ModuleInfo(String packageName, String name) {
@@ -109,6 +131,41 @@ public class ModuleInfo implements Serializable {
         return hookedApps != null ? hookedApps.size() : 0;
     }
 
+    // ============================================================
+    // RECOMMENDED SCOPE HELPERS
+    // ============================================================
+
+    /**
+     * Is this package in the module's recommended scope?
+     * Null-safe on both the set and the argument.
+     */
+    // ── CHANGE: new helper.
+    public boolean isRecommended(String packageName) {
+        return packageName != null
+            && recommendedApps != null
+            && recommendedApps.contains(packageName);
+    }
+
+    /**
+     * How many packages the module recommends. Zero when the
+     * module declares no scope.list.
+     */
+    // ── CHANGE: new helper.
+    public int getRecommendedAppCount() {
+        return recommendedApps != null ? recommendedApps.size() : 0;
+    }
+
+    /**
+     * Does this module declare a recommended scope at all? Used by
+     * the scope editor to decide whether to show the Recommended
+     * chip. An always-visible chip that does nothing is worse than
+     * no chip.
+     */
+    // ── CHANGE: new helper.
+    public boolean hasRecommendedScope() {
+        return recommendedApps != null && !recommendedApps.isEmpty();
+    }
+
     @Override
     public String toString() {
         return "ModuleInfo{" +
@@ -118,6 +175,7 @@ public class ModuleInfo implements Serializable {
                 ", xposedInit='" + xposedInit + '\'' +
                 ", enabled=" + enabled +
                 ", hookedApps=" + (hookedApps != null ? hookedApps.size() : 0) +
+                ", recommendedApps=" + (recommendedApps != null ? recommendedApps.size() : 0) +
                 ", hookAllApps=" + hookAllApps +
                 ", hasXposedInit=" + hasXposedInit +
                 ", hasUi=" + hasUi +

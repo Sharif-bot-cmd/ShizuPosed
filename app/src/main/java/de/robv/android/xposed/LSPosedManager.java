@@ -28,6 +28,15 @@ import android.util.Log;
  * not from the manager's module list, so it reflects what the
  * framework has actually done.
  *
+ * NO-ARG OVERLOADS
+ * ----------------
+ * LSPosed declares isModuleActive() and isModuleEnabled() with no
+ * arguments. Module UIs call these forms because they run in their
+ * own process and mean "am I — this module — active?" ShizuPosed
+ * cannot inject a "current module" flag into the module's process
+ * the way a zygote-level framework can, so the calling package is
+ * derived from the stack.
+ *
  * CONTEXT RESOLUTION
  * ------------------
  * ActivityThread.currentApplication() reliably returns the
@@ -47,10 +56,10 @@ import android.util.Log;
 public final class LSPosedManager {
 
     /** Framework name reported to modules. */
-    public static final String FRAMEWORK_NAME = "ShizuPosed";
+    public static final String FRAMEWORK_NAME = "5.9";
 
     /** Reported API version. Matches XposedBridge.XPOSED_BRIDGE_VERSION. */
-    public static final int API_VERSION = 93;
+    public static final int API_VERSION = 96;
 
     /** Authority of ShizuPosed's ModuleStatusProvider. */
     private static final String PROVIDER_AUTHORITY = "com.shizuposed.manager.status";
@@ -117,7 +126,7 @@ public final class LSPosedManager {
     }
 
     public static String getVersionName() {
-        return "4.0";
+        return "5.9";
     }
 
     public static String getManagerPackageName() {
@@ -127,6 +136,20 @@ public final class LSPosedManager {
     // ═════════════════════════════════════════════════════════════
     // ENABLED STATE
     // ═════════════════════════════════════════════════════════════
+
+    /**
+     * No-arg form. Derives the calling package from the stack.
+     * LSPosed declares this form.
+     */
+    public static boolean isModuleEnabled() {
+        String pkg = getCallingPackage();
+        if (pkg == null) {
+            Log.w(LOG_TAG, "isModuleEnabled(): cannot determine "
+                + "calling package from stack");
+            return false;
+        }
+        return isModuleEnabled(pkg);
+    }
 
     public static boolean isModuleEnabled(String packageName) {
         Context ctx = currentApplication();
@@ -147,6 +170,7 @@ public final class LSPosedManager {
                     int vIdx = c.getColumnIndex("value");
                     if (vIdx != -1) return "1".equals(c.getString(vIdx));
                 }
+                logVisibilityHint("isModuleEnabled", packageName);
             }
         } catch (Throwable t) {
             Log.e(LOG_TAG, "isModuleEnabled(" + packageName + ") failed", t);
@@ -192,17 +216,26 @@ public final class LSPosedManager {
     // ═════════════════════════════════════════════════════════════
 
     /**
+     * No-arg form. Derives the calling package from the stack.
+     * LSPosed declares this form. Module UIs that call it fail to
+     * link without it.
+     */
+    public static boolean isModuleActive() {
+        String pkg = getCallingPackage();
+        if (pkg == null) {
+            Log.w(LOG_TAG, "isModuleActive(): cannot determine "
+                + "calling package from stack");
+            return false;
+        }
+        return isModuleActive(pkg);
+    }
+
+    /**
      * Has the module loaded into at least one target process?
      *
      * Reads the shell-side hooked markers via
      * content://.../active/<pkg>. Returns false if no marker lists
      * this module's package name.
-     *
-     * Modules that display "Activated" in their own UI rely on this.
-     * If the module has never been launched under ShizuPosed for any
-     * target in its scope, this returns false even though the module
-     * is enabled. That's the correct answer — the module hasn't
-     * actually done anything yet.
      */
     public static boolean isModuleActive(String modulePackage) {
         Context ctx = currentApplication();
@@ -227,6 +260,7 @@ public final class LSPosedManager {
                     int vIdx = c.getColumnIndex("value");
                     if (vIdx != -1) return "1".equals(c.getString(vIdx));
                 }
+                logVisibilityHint("isModuleActive", modulePackage);
             }
         } catch (Throwable t) {
             Log.e(LOG_TAG, "isModuleActive(" + modulePackage + ") failed", t);
@@ -236,9 +270,6 @@ public final class LSPosedManager {
 
     /**
      * Packages the module has loaded into.
-     *
-     * Returns every target package whose shell-side hooked marker
-     * lists this module in its moduleList.
      */
     public static String[] getModuleScope(String modulePackage) {
         Context ctx = currentApplication();
@@ -278,6 +309,60 @@ public final class LSPosedManager {
     }
 
     // ═════════════════════════════════════════════════════════════
+    // PACKAGE VISIBILITY DIAGNOSTIC
+    // ═════════════════════════════════════════════════════════════
+
+    private static void logVisibilityHint(String call, String packageName) {
+        if (android.os.Build.VERSION.SDK_INT < 30) return;
+        Log.w(LOG_TAG, call + "(" + packageName + "): empty result. "
+            + "If this is Android 11+, the module's AndroidManifest.xml "
+            + "must declare: <queries><provider android:authorities=\""
+            + PROVIDER_AUTHORITY + "\" /></queries>. "
+            + "Without it, the provider is invisible to this app.");
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // CALLING PACKAGE RESOLUTION
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Walk the stack to find the first caller outside the framework,
+     * then derive its package name. Used by the no-arg overloads.
+     */
+    private static String getCallingPackage() {
+        try {
+            for (StackTraceElement e : Thread.currentThread().getStackTrace()) {
+                String cls = e.getClassName();
+                if (cls == null) continue;
+
+                if (cls.startsWith("de.robv.android.xposed.")) continue;
+                if (cls.startsWith("com.shizuposed.")) continue;
+                if (cls.startsWith("java.")) continue;
+                if (cls.startsWith("javax.")) continue;
+                if (cls.startsWith("android.")) continue;
+                if (cls.startsWith("com.android.")) continue;
+                if (cls.startsWith("dalvik.")) continue;
+                if (cls.startsWith("sun.")) continue;
+
+                try {
+                    Class<?> c = Class.forName(cls, false,
+                        LSPosedManager.class.getClassLoader());
+                    Package p = c.getPackage();
+                    if (p != null && p.getName() != null) {
+                        return p.getName();
+                    }
+                } catch (Throwable ignored) {}
+
+                int dot = cls.lastIndexOf('.');
+                if (dot > 0) return cls.substring(0, dot);
+            }
+        } catch (Throwable t) {
+            Log.e(LOG_TAG, "getCallingPackage failed", t);
+        }
+        return null;
+    }
+
+    // ═════════════════════════════════════════════════════════════
     // CONTEXT RESOLUTION
     // ═════════════════════════════════════════════════════════════
 
@@ -290,13 +375,11 @@ public final class LSPosedManager {
      *   3. sFallbackContext
      */
     private static Context currentApplication() {
-        // Fast path: cached fallback
         Context fb = sFallbackContext;
 
         try {
             Class<?> at = Class.forName("android.app.ActivityThread");
 
-            // 1. currentApplication()
             try {
                 java.lang.reflect.Method m = at.getMethod("currentApplication");
                 Object o = m.invoke(null);
@@ -307,7 +390,6 @@ public final class LSPosedManager {
                 }
             } catch (Throwable ignored) {}
 
-            // 2. currentActivityThread().getSystemContext()
             try {
                 java.lang.reflect.Method cur = at.getMethod("currentActivityThread");
                 Object thread = cur.invoke(null);
