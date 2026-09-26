@@ -70,28 +70,29 @@ import java.util.concurrent.Executors;
  * Shows every installed Xposed module, with the built-in XStealth
  * pinned at the top of the list.
  *
+ * ROW INTERACTION MODEL (post-redesign)
+ * -------------------------------------
+ *   • Tapping the row body   → opens the scope editor (or the
+ *                              detail sheet for XStealth).
+ *   • Tapping the switch     → toggles the module.
+ *   • Tapping the icon or
+ *     long-pressing the row  → opens the detail sheet.
+ *
+ * The old "Select Apps" button was removed from the row. The row
+ * body is now the affordance.
+ *
  * APP LIST CACHING
  * ----------------
  * The scope editor needs the installed-app list, which requires
  * PackageManager.getInstalledApplications(GET_META_DATA | ...).
  * That call opens every installed APK and reads its manifest, which
- * costs 300-800ms on a device with 200+ apps. Running it on every
- * dialog open makes the dialog feel sluggish.
+ * costs 300-800ms on a device with 200+ apps.
  *
- * The fix is a two-layer cache:
- *
- *   • A process-wide static list of ApplicationInfo, invalidated
- *     when the system broadcasts a package add / remove / change /
- *     replace. A short TTL bounds staleness if a broadcast is
- *     missed.
- *
- *   • An eager warm-up on fragment open, run on a background
- *     thread, so the first dialog open after the tab appears
- *     already has a populated cache.
- *
+ * A process-wide static cache, invalidated on package add / remove
+ * / change / replace broadcasts, plus an eager warm-up on fragment
+ * open, shifts the query cost off the first user interaction.
  * The scope editor is also async: it opens immediately with a
- * spinner, and the list populates when the query returns. If the
- * cache is warm (typical), the populate happens within a frame.
+ * spinner, and the list populates when the query returns.
  */
 public class ModulesFragment extends Fragment {
     private RecyclerView moduleRecyclerView;
@@ -136,31 +137,14 @@ public class ModulesFragment extends Fragment {
 
     // ═════════════════════════════════════════════════════════════
     // APP LIST CACHE
-    //
-    // Process-wide, not per-fragment. Two fragments (Modules tab and
-    // a future Repo tab or settings screen) that both need the list
-    // share the same cache.
-    //
-    // Volatile: reads and writes happen on different threads. The
-    // assignment of a fully-built List is atomic; no other state is
-    // shared.
     // ═════════════════════════════════════════════════════════════
 
     private static volatile List<ApplicationInfo> sCachedApps = null;
     private static volatile long sCachedAppsAt = 0L;
 
-    /** Defensive TTL in case a package-change broadcast is missed. */
     private static final long APP_CACHE_TTL_MS = 60_000L;
-
-    /** True while a background refresh is in flight. */
     private static volatile boolean sAppRefreshInFlight = false;
 
-    /**
-     * Receiver that clears the cache when the app set changes.
-     * Registered per-fragment but shared behavior: any instance that
-     * receives the broadcast clears the shared static cache, so a
-     * single registration is enough.
-     */
     private BroadcastReceiver packageChangeReceiver;
 
     private final ActivityResultLauncher<Intent> filePickerLauncher =
@@ -271,9 +255,6 @@ public class ModulesFragment extends Fragment {
     // APP LIST CACHE
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Return the cached app list if it's fresh, or null.
-     */
     private static List<ApplicationInfo> getCachedApps() {
         List<ApplicationInfo> cached = sCachedApps;
         if (cached == null) return null;
@@ -281,10 +262,6 @@ public class ModulesFragment extends Fragment {
         return cached;
     }
 
-    /**
-     * Query PackageManager for the full app list and store it in
-     * the cache. Called on a background thread only.
-     */
     private List<ApplicationInfo> queryInstalledApps() {
         if (packageManager == null) return new ArrayList<>();
         try {
@@ -303,15 +280,6 @@ public class ModulesFragment extends Fragment {
         }
     }
 
-    /**
-     * Warm the cache on fragment open. Runs on the appListExecutor,
-     * so it doesn't touch the UI thread. If the cache is already
-     * warm, this is a no-op.
-     *
-     * The result is discarded here — the next caller picks it up
-     * from the static cache. This exists purely to shift the query
-     * cost off the first user interaction.
-     */
     private void warmAppListCache() {
         if (getCachedApps() != null) return;
         if (sAppRefreshInFlight) return;
@@ -327,11 +295,6 @@ public class ModulesFragment extends Fragment {
         });
     }
 
-    /**
-     * Register a receiver that clears the cache when the installed
-     * app set changes. ACTION_PACKAGE_REPLACED handles updates that
-     * don't change the package name but do change metadata.
-     */
     private void registerPackageChangeReceiver() {
         if (!isAdded() || getContext() == null) return;
         try {
@@ -422,14 +385,56 @@ public class ModulesFragment extends Fragment {
         tvEmptyState = view.findViewById(R.id.tvEmptyState);
     }
 
+    /**
+     * Row interaction model:
+     *   onToggle       — switch tapped, toggles the module.
+     *   onDetail       — icon tapped or long-press, opens the sheet.
+     *   onUninstall    — long-press, uninstalls.
+     *   onEditScope    — row body tapped. Opens the scope editor
+     *                    for normal modules, or the detail sheet
+     *                    for XStealth (which has no scope).
+     */
     private void setupRecyclerView() {
         if (moduleRecyclerView == null) return;
         moduleAdapter = new ModuleAdapter(modules, requireContext());
         moduleAdapter.setOnModuleActionListener(new ModuleAdapter.OnModuleActionListener() {
-            @Override public void onToggle(ModuleInfo module, boolean enable) { toggleModule(module, enable); }
-            @Override public void onDetail(ModuleInfo module) { showModuleDetail(module); }
-            @Override public void onUninstall(ModuleInfo module) { uninstallModule(module); }
-            @Override public void onSelectApps(ModuleInfo module) { showSelectAppsDialog(module); }
+            @Override
+            public void onToggle(ModuleInfo module, boolean enable) {
+                toggleModule(module, enable);
+            }
+
+            @Override
+            public void onDetail(ModuleInfo module) {
+                showModuleDetail(module);
+            }
+
+            @Override
+            public void onUninstall(ModuleInfo module) {
+                uninstallModule(module);
+            }
+
+            @Override
+            public void onEditScope(ModuleInfo module) {
+                if (XStealthModule.PACKAGE.equals(module.packageName)) {
+                    showModuleDetail(module);
+                } else {
+                    showSelectAppsDialog(module);
+                }
+            }
+
+            @Override
+            public void onOpenModuleApp(ModuleInfo module) {
+                if (module == null || module.packageName == null) return;
+                // XStealth has no launchable UI.
+                if (XStealthModule.PACKAGE.equals(module.packageName)) {
+                    showModuleDetail(module);
+                    return;
+                }
+                // Route through ShizuPosed so the module's own
+                // process gets hooks and self-hook activation
+                // checks fire.
+                launchUnderShizuPosed(module.packageName);
+            }
         });
         moduleRecyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
         moduleRecyclerView.setAdapter(moduleAdapter);
@@ -795,6 +800,7 @@ public class ModulesFragment extends Fragment {
     // ═════════════════════════════════════════════════════════════
     // SCOPE EDITOR
     // ═════════════════════════════════════════════════════════════
+
     public void openScopeEditor(ModuleInfo module) {
         if (module == null || !isAdded() || !viewReady) return;
         if (XStealthModule.PACKAGE.equals(module.packageName)) return;
@@ -823,8 +829,6 @@ public class ModulesFragment extends Fragment {
         TextView tvSelectedCount = dialogView.findViewById(R.id.tvSelectedCount);
         MaterialCheckBox cbHideSystem = dialogView.findViewById(R.id.cbHideSystem);
 
-        // ── Selection state is initialized from the module and
-        //    survives the async list load.
         Set<String> currentSelection = new HashSet<>();
         if (module.hookedApps != null) currentSelection.addAll(module.hookedApps);
 
@@ -846,9 +850,6 @@ public class ModulesFragment extends Fragment {
             dialogSpinner.setVisibility(View.VISIBLE);
         }
 
-        // ── Search, hide-system, chip state. These work on the
-        //    filtered list once it's populated. Until then they're
-        //    inert — the adapters are empty so nothing happens.
         final List<ApplicationInfo> source = new ArrayList<>();
         final List<ApplicationInfo> userApps = new ArrayList<>();
         final List<ApplicationInfo> allAppsRef = new ArrayList<>();
@@ -913,19 +914,15 @@ public class ModulesFragment extends Fragment {
         }
         if (btnApply != null) btnApply.setVisibility(View.GONE);
 
-        // ── Async populate. The dialog is already built; the list
-        //    appears when this completes.
         final String selfPkg = module.packageName;
         if (appListExecutor != null && !appListExecutor.isShutdown()) {
             appListExecutor.execute(() -> {
-                // Use the cache if warm, otherwise query.
                 List<ApplicationInfo> all = getCachedApps();
                 if (all == null) {
                     all = queryInstalledApps();
                 }
                 List<ApplicationInfo> filtered = filterForScopeEditor(all, selfPkg);
 
-                // Split into user and system.
                 List<ApplicationInfo> users = new ArrayList<>();
                 for (ApplicationInfo app : filtered) {
                     if ((app.flags & ApplicationInfo.FLAG_SYSTEM) == 0) users.add(app);
@@ -943,7 +940,6 @@ public class ModulesFragment extends Fragment {
                     userApps.clear();
                     userApps.addAll(finalUsers);
 
-                    // Respect the current hide-system toggle state.
                     boolean hideSystem = cbHideSystem == null || cbHideSystem.isChecked();
                     source.clear();
                     source.addAll(hideSystem ? finalUsers : finalAll);
@@ -984,11 +980,6 @@ public class ModulesFragment extends Fragment {
         selectAppsDialog.show();
     }
 
-    /**
-     * Filter the full app list down to what the scope editor should
-     * show. Removes the manager itself, the module being scoped, and
-     * every other installed module.
-     */
     private List<ApplicationInfo> filterForScopeEditor(List<ApplicationInfo> all,
                                                        String selfPackage) {
         List<ApplicationInfo> out = new ArrayList<>();

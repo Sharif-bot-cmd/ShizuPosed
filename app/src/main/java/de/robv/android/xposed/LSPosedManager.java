@@ -56,10 +56,10 @@ import android.util.Log;
 public final class LSPosedManager {
 
     /** Framework name reported to modules. */
-    public static final String FRAMEWORK_NAME = "5.8";
+    public static final String FRAMEWORK_NAME = "6.4";
 
     /** Reported API version. Matches XposedBridge.XPOSED_BRIDGE_VERSION. */
-    public static final int API_VERSION = 93;
+    public static final int API_VERSION = 96;
 
     /** Authority of ShizuPosed's ModuleStatusProvider. */
     private static final String PROVIDER_AUTHORITY = "com.shizuposed.manager.status";
@@ -126,7 +126,7 @@ public final class LSPosedManager {
     }
 
     public static String getVersionName() {
-        return "(950)";
+        return "(1078)";
     }
 
     public static String getManagerPackageName() {

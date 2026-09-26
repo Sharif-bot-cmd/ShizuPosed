@@ -40,10 +40,7 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
     private PackageManager pm;
     private ModuleLoader moduleLoader;
 
-    // Set in onViewCreated, cleared in onDestroyView.
     private volatile boolean viewReady = false;
-
-    // Resolved once in bindActions. Null if the module has no launchable UI.
     private ModuleActivityResolver.Result resolvedActivity;
 
     public static ModuleDetailSheet newInstance(String packageName) {
@@ -186,7 +183,8 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                     if (removed) {
                         try {
                             if (isAdded()) {
-                                Intent i = new Intent(requireContext(), ShizuPosedService.class);
+                                Intent i = new Intent(requireContext(),
+                                    ShizuPosedService.class);
                                 i.setAction(ShizuPosedService.ACTION_REPUSH_MODULES);
                                 requireContext().startForegroundService(i);
                             }
@@ -212,22 +210,22 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
      *
      * Three paths, in order of preference:
      *
-     *   1. Launch through ShizuPosed. This is the default. It runs
-     *      the module's UI inside app_process with hooks installed,
-     *      which is what self-hook-based activation checks need to
-     *      see. Modules like Spoof My Device hook one of their own
-     *      UI methods and use the presence of that hook as the
-     *      activation signal — without this path, they always show
-     *      "Not activated" even when their target hooks are working.
-     *
-     *      Falls through to path 2 if ShizuPosed can't launch the
-     *      module (Shizuku not authorized, module not deployed, etc.).
+     *   1. Launch through ShizuPosed. This runs the module's UI
+     *      inside app_process with hooks installed, which is what
+     *      self-hook-based activation checks need to see. Modules
+     *      hook one of their own UI methods and use the presence
+     *      of that hook as the activation signal. Without this
+     *      path, they always show "Disabled" even when their
+     *      target hooks work.
      *
      *   2. Exported activity, launched directly. Fast, no Shizuku
-     *      round-trip. Used as a fallback when path 1 isn't available.
+     *      round-trip. Used as a fallback when path 1 isn't
+     *      available. The module's UI will open, but its own
+     *      process has no hooks — self-hook checks return the
+     *      original value. The user is warned.
      *
      *   3. Non-exported activity, launched via Shizuku's `am start`.
-     *      Shell UID has permission to start components of other apps.
+     *      Same caveat as path 2.
      */
     private void launchModuleActivity() {
         if (!isAdded()) return;
@@ -238,33 +236,51 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             return;
         }
 
-        // Path 1: launch through ShizuPosed.
+        // Path 1: launch through ShizuPosed. This is the one that
+        // installs the self-hook for modules that check their own
+        // activation state.
         if (tryLaunchThroughShizuPosed()) {
             return;
         }
 
-        // Path 2: exported activity, launch directly.
+        // Path 2: exported activity, direct launch.
+        boolean launched = false;
         if (resolvedActivity.isExported) {
             try {
                 Intent i = new Intent(Intent.ACTION_MAIN);
                 i.setComponent(resolvedActivity.component);
                 i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                 startActivity(i);
-                return;
+                launched = true;
             } catch (Throwable t) {
                 if (logger != null) {
                     logger.w("direct start failed for "
                         + module.packageName + ": " + t.getMessage());
                 }
-                // fall through to Shizuku
             }
         }
 
-        // Path 3: non-exported activity (or direct start failed).
-        boolean ok = ModuleActivityLauncher.launch(requireContext(),
-            module.packageName);
+        // Path 3: non-exported activity via Shizuku.
+        if (!launched) {
+            launched = ModuleActivityLauncher.launch(requireContext(),
+                module.packageName);
+        }
 
-        if (!ok) {
+        if (launched) {
+            // Warn the user. The UI opened, but without ShizuPosed
+            // in its process, self-hook activation checks don't
+            // fire. A module that checks MainActivity.isXposedEnabled
+            // will show "Disabled" even though it's working.
+            Toast.makeText(requireContext(),
+                "Opened directly. If the module UI reports "
+                + "\"Disabled\" or \"Not Activated,\" close it and "
+                + "make sure Shizuku is running, then try again.",
+                Toast.LENGTH_LONG).show();
+            if (logger != null) {
+                logger.i("Direct launch for " + module.packageName
+                    + " — self-hook not installed");
+            }
+        } else {
             String reason = resolvedActivity.isExported
                 ? "startActivity threw, and am start was unavailable"
                 : "activity is not exported and Shizuku could not start it";
@@ -277,17 +293,12 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
     /**
      * Try to launch the module's own UI through ShizuPosed.
      *
-     * Returns true if the launch was dispatched successfully, false
-     * if it couldn't be attempted (no ModulesFragment parent, Shizuku
-     * not authorized, module has no APK, etc.).
-     *
-     * When it returns true, the caller must not launch the UI by any
-     * other path — the ShizuPosed service will handle it.
+     * Returns true if the launch was dispatched successfully. When
+     * it returns true, the caller must not launch the UI by any
+     * other path.
      */
     private boolean tryLaunchThroughShizuPosed() {
         try {
-            // The launch flow lives on ModulesFragment. If we're not
-            // a child of one, we can't use it.
             Fragment parent = getParentFragment();
             if (!(parent instanceof ModulesFragment)) {
                 if (logger != null) {
@@ -296,9 +307,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                 return false;
             }
 
-            // ShizuPosed can only launch modules whose dex it has
-            // cached on the shell side. Built-in modules (XStealth)
-            // have no cached dex and no APK; skip them.
             if (module == null
                     || module.cachedDexPath == null
                     || module.cachedDexPath.isEmpty()) {
@@ -309,7 +317,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                 return false;
             }
 
-            // Shizuku has to be up.
             ShizukuHelper sh = ShizukuHelper.getInstance(requireContext());
             if (sh == null || !sh.isAvailable() || !sh.isAuthorized()) {
                 if (logger != null) {

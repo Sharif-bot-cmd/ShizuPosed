@@ -6,6 +6,7 @@ import com.shizuposed.manager.ShizukuHelper;
 import com.shizuposed.manager.ShizuPosedManagerApp;
 import com.shizuposed.manager.model.HookedProcess;
 import com.shizuposed.manager.model.ModuleInfo;
+import com.shizuposed.manager.runtime.RuntimePrefs;
 import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.utils.Logger;
 import com.shizuposed.manager.utils.ShellUtils;
@@ -39,8 +40,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * round-trip per query. Refreshing here means the provider's queries
  * stay fast and independent of Shizuku's state at query time.
  *
- * The refresh is a single compound shell command per cycle, not one
- * per marker and not one per query.
+ * SCAN INTERVAL
+ * -------------
+ * The interval between scan cycles is read from RuntimePrefs at
+ * startMonitoring() time. It defaults to 5 seconds and can be tuned
+ * from the Settings tab. A change takes effect on the next service
+ * start, since the scheduler is created once per startMonitoring()
+ * call.
+ *
+ * The marker mirror refresh runs at the same interval, bounded by
+ * MARKER_REFRESH_INTERVAL_MS so a very fast scan interval doesn't
+ * hammer the shell.
  */
 public class ProcessMonitor {
     private static ProcessMonitor instance;
@@ -58,15 +68,15 @@ public class ProcessMonitor {
     private volatile Boolean shellScanAvailable = null;
 
     /** Timestamp of the last marker mirror refresh, in millis. */
-    // ── FIX: track the last refresh so we don't hammer the mirror.
     private volatile long lastMarkerRefresh = 0L;
 
     /**
-     * How often the marker mirror is refreshed. The provider's own
-     * in-memory TTL is 3 seconds, so a 5-second refresh keeps the
-     * mirror at most one provider-TTL stale.
+     * Minimum interval between marker mirror refreshes. The provider's
+     * own in-memory TTL is 3 seconds, so a 5-second refresh keeps the
+     * mirror at most one provider-TTL stale. This does NOT follow the
+     * scan interval — the mirror refresh is capped at this rate even
+     * if the scan runs faster.
      */
-    // ── FIX: refresh interval.
     private static final long MARKER_REFRESH_INTERVAL_MS = 5000L;
 
     // Shell-side paths (mirror what XposedHook uses)
@@ -125,11 +135,15 @@ public class ProcessMonitor {
             logger.d("ProcessMonitor already running");
             return;
         }
-        logger.i("ProcessMonitor started - monitoring for new apps");
 
-        // ── FIX: prime the marker mirror so the first provider query
-        // after startup finds a populated cache instead of paying the
-        // cold-start cost on the query thread.
+        // ── Read the configured scan interval. Defaults to 5 s.
+        //    Bounded by RuntimePrefs to [2 s, 30 s].
+        int intervalMs = RuntimePrefs.getScanIntervalMs(context);
+        logger.i("ProcessMonitor started - scan interval " + intervalMs + "ms");
+
+        // ── Prime the marker mirror so the first provider query
+        //    after startup finds a populated cache instead of
+        //    paying the cold-start cost on the query thread.
         try {
             MarkerCache.refresh(context);
             lastMarkerRefresh = System.currentTimeMillis();
@@ -146,7 +160,7 @@ public class ProcessMonitor {
         });
         scanTask = scheduler.scheduleWithFixedDelay(
             this::scanExistingProcesses,
-            5, 5, TimeUnit.SECONDS
+            intervalMs, intervalMs, TimeUnit.MILLISECONDS
         );
     }
 
@@ -171,15 +185,9 @@ public class ProcessMonitor {
     private void scanExistingProcesses() {
         if (!isRunning.get()) return;
 
-        // ── FIX: refresh the marker mirror once per cycle, before the
-        // /proc sweep. The refresh is a single compound shell command
-        // that mirrors every hooked marker into the manager's filesDir.
-        // ModuleStatusProvider reads from that mirror, so this is what
-        // keeps activation state fresh without querying Shizuku from
-        // the provider.
-        //
-        // Placed at the top so even if the /proc scan is slow or
-        // throws, the mirror is already up to date.
+        // ── Refresh the marker mirror once per MARKER_REFRESH_INTERVAL_MS.
+        //    This is decoupled from the scan interval: a fast scan
+        //    interval doesn't hammer the shell with mirror refreshes.
         try {
             long now = System.currentTimeMillis();
             if (now - lastMarkerRefresh >= MARKER_REFRESH_INTERVAL_MS) {
@@ -232,19 +240,7 @@ public class ProcessMonitor {
                 }
             }
 
-            // ── Marker promotion.
-            //
-            // The old path called pollHookedMarkers(), which issued
-            // ls + cat per marker through Shizuku on every scan. That
-            // is now redundant: MarkerCache.refresh() at the top of
-            // this method has already mirrored the markers locally,
-            // and promoteFromMirror() reads the mirror to promote
-            // matching HookedProcess entries.
-            //
-            // The old pollHookedMarkers() is left in place for one
-            // release as a fallback in case the mirror is unavailable
-            // (e.g. filesDir is full). It is a no-op when the mirror
-            // is populated.
+            // ── Marker promotion. Reads the local mirror, no Shizuku.
             promoteFromMirror();
 
             // Prune tracked pids that no longer exist in /proc
@@ -272,17 +268,6 @@ public class ProcessMonitor {
     // MARKER PROMOTION FROM LOCAL MIRROR
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Read the local marker mirror and promote any tracked process
-     * whose package appears in a marker to "Hooked".
-     *
-     * This replaces the per-scan pollHookedMarkers() path that went
-     * through Shizuku. Reading the mirror is a local file scan; no
-     * IPC, no authorization dependency.
-     *
-     * Called at the end of each scanExistingProcesses() cycle.
-     */
-    // ── FIX: new method.
     private void promoteFromMirror() {
         try {
             Map<String, String> markers = MarkerCache.read(context);
@@ -308,12 +293,9 @@ public class ProcessMonitor {
                     }
                 }
 
-                // Already hooked? Skip.
                 if (target != null && target.isHooked()) continue;
 
                 if (target == null) {
-                    // Marker exists for a process we aren't tracking
-                    // yet. Register it so the Home tab can show it.
                     target = new HookedProcess();
                     target.setProcessName(pkg);
                     target.setPid(pid > 0 ? pid : -1);
@@ -332,85 +314,6 @@ public class ProcessMonitor {
             }
         } catch (Throwable t) {
             logger.d("promoteFromMirror: " + t.getMessage());
-        }
-    }
-
-    // ═════════════════════════════════════════════════════════════
-    // HOOKED MARKER POLLING (legacy, Shizuku-based)
-    //
-    // Kept for one release as a fallback. MarkerCache.refresh()
-    // supersedes this. If the mirror is unavailable (filesDir full,
-    // cache dir uncreatable), this path still works.
-    // ═════════════════════════════════════════════════════════════
-
-    private void pollHookedMarkers() {
-        try {
-            ShizukuHelper sh = ShizukuHelper.getInstance(context);
-            if (!sh.isAvailable() || !sh.isAuthorized()) return;
-
-            ShellUtils.CommandResult ls = sh.executeCommand("ls " + HOOKED_DIR + " 2>/dev/null; true");
-            if (ls.stdout == null) return;
-            if (!ls.isSuccess() || ls.stdout == null) return;
-
-            for (String line : ls.stdout) {
-                if (line == null) continue;
-                String name = line.trim();
-                if (name.isEmpty() || !name.endsWith(".json")) continue;
-
-                String pkg = name.substring(0, name.length() - 5);
-
-                boolean alreadyHooked = false;
-                for (HookedProcess p : hookedProcesses.values()) {
-                    if (pkg.equals(p.getProcessName()) && p.isHooked()) {
-                        alreadyHooked = true;
-                        break;
-                    }
-                }
-                if (alreadyHooked) continue;
-
-                ShellUtils.CommandResult cat = sh.executeCommand(
-                    "cat " + HOOKED_DIR + "/" + name);
-                if (!cat.isSuccess() || cat.stdout == null) continue;
-
-                StringBuilder body = new StringBuilder();
-                for (String l : cat.stdout) {
-                    if (l != null) body.append(l);
-                }
-
-                int pid     = extractInt(body.toString(), "pid");
-                int uid     = extractInt(body.toString(), "uid");
-                int modules = extractInt(body.toString(), "modules");
-
-                HookedProcess target = null;
-                if (pid > 0) target = hookedProcesses.get(pid);
-                if (target == null) {
-                    for (HookedProcess p : hookedProcesses.values()) {
-                        if (pkg.equals(p.getProcessName())) {
-                            target = p;
-                            break;
-                        }
-                    }
-                }
-
-                if (target == null) {
-                    target = new HookedProcess();
-                    target.setProcessName(pkg);
-                    target.setPid(pid > 0 ? pid : -1);
-                    target.setUid(uid);
-                }
-
-                target.setHooked(true);
-                target.setHookedAt(System.currentTimeMillis());
-
-                if (target.getPid() > 0) {
-                    hookedProcesses.put(target.getPid(), target);
-                }
-
-                logger.i("Hook confirmed by target: " + pkg
-                    + " (pid=" + pid + ", modules=" + modules + ")");
-            }
-        } catch (Throwable t) {
-            logger.d("pollHookedMarkers: " + t.getMessage());
         }
     }
 
@@ -654,7 +557,8 @@ public class ProcessMonitor {
     public boolean isPackageInScope(String packageName) {
         if (packageName == null) return false;
         try {
-            List<ModuleInfo> enabled = ModuleLoader.getInstance(context).getEnabledModules();
+            List<ModuleInfo> enabled =
+                ModuleLoader.getInstance(context).getEnabledModules();
             for (ModuleInfo m : enabled) {
                 if (m.hookedApps != null && m.hookedApps.contains(packageName)) {
                     return true;

@@ -191,6 +191,29 @@ public final class HiddenApiBypass {
         return null;
     }
 
+    private static volatile boolean sExemptionsApplied = false;
+
+    private static void applyExemptionsOnce() {
+        if (sExemptionsApplied) return;
+        synchronized (HiddenApiBypass.class) {
+            if (sExemptionsApplied) return;
+            sExemptionsApplied = true;
+            try {
+                Class<?> vmRuntime = Class.forName("dalvik.system.VMRuntime");
+                Method getRuntime = vmRuntime.getDeclaredMethod("getRuntime");
+                getRuntime.setAccessible(true);
+                Object runtime = getRuntime.invoke(null);
+                Method setExemptions = vmRuntime.getDeclaredMethod(
+                    "setHiddenApiExemptions", String[].class);
+                setExemptions.setAccessible(true);
+                // Exempt everything. The alternative is exempting
+                // only the specific members we need, which is more
+                // precise but requires naming them all.
+                setExemptions.invoke(runtime, (Object) new String[]{"L"});
+            } catch (Throwable ignored) {}
+        }
+    }
+
     // ═════════════════════════════════════════════════════════════
     // STRATEGIES
     // ═════════════════════════════════════════════════════════════

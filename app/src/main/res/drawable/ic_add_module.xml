@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="?attr/colorOnPrimaryContainer">
+
+    <!--
+        Rounded plus. Used by the Add Module FAB in the Modules tab.
+
+        Drawn with rounded line caps and joins so the arms read as
+        a single smooth shape rather than a plain rectangle cross.
+        The 2.5-unit stroke is thicker than a default Material plus,
+        which makes the icon feel heavier and better suited to a
+        floating action button.
+    -->
+
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#000000"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 12,5
+                          L 12,19
+                          M 5,12
+                          L 19,12" />
+</vector>

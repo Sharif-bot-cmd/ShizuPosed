@@ -17,28 +17,6 @@ import de.robv.android.xposed.XC_MethodHook;
  * HookDispatcher
  *
  * Sits between XposedHookBridge and the actual hook backends.
- *
- * Dispatch model:
- *   - At init, backends are probed in registration order. The first
- *     that reports itself available becomes the "primary" — this is
- *     used for logging and for ordering the fallthrough, not as an
- *     exclusive winner.
- *   - At hook time, every backend is tried in registration order
- *     (primary first) until one returns true. A backend that returns
- *     false is saying "this method isn't mine" and the dispatcher
- *     moves on silently. A backend that throws is logged at WARN and
- *     the dispatcher continues.
- *   - If every backend returns false, the hook is dropped. The caller
- *     gets no exception. This matches Xposed's findAndHookMethod
- *     contract: if the method exists, the call succeeds, even if no
- *     backend could actually install.
- *
- * NoopBackend must be registered last. It returns true for every
- * hook, so anything after it is unreachable.
- *
- * Per-backend counters (installed / declined / failed) are exposed for
- * diagnostics. They're the fastest way to tell which backend is
- * actually carrying a given app's hooks.
  */
 public final class HookDispatcher {
 
@@ -91,6 +69,8 @@ public final class HookDispatcher {
 
     private volatile Backend primary;
     private volatile boolean initialized = false;
+    private volatile Backend lastInstalledBackend;
+    private volatile Runnable lastInstalledReverse;
 
     private static volatile HookDispatcher instance;
 
@@ -108,6 +88,15 @@ public final class HookDispatcher {
             }
         }
         return local;
+    }
+
+    public String getLastInstalledBackendName() {
+        Backend b = lastInstalledBackend;
+        return b != null ? b.name() : null;
+    }
+
+    public Runnable getLastInstalledReverse() {
+        return lastInstalledReverse;
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -162,37 +151,21 @@ public final class HookDispatcher {
     // DISPATCH
     // ─────────────────────────────────────────────────────────────
 
-    /**
-     * Try each backend in registration order until one succeeds.
-     * Never throws — returns true on success, false if all declined
-     * or failed.
-     *
-     * "Success" is defined as "the backend returned true." A backend
-     * that accepts a hook and silently does nothing (NoopBackend) is
-     * indistinguishable from a real one at this layer. That's by
-     * design: findAndHookMethod must not throw when a module hooks a
-     * method no engine can reach.
-     */
     public boolean installHook(Method original, XC_MethodHook callback) {
         if (original == null || callback == null) return false;
 
         ensureInitialized();
 
-        // Try primary first if it wasn't the first registered.
         Backend p = primary;
         if (p != null && backends.indexOf(p) != 0) {
             if (tryHook(p, original, callback, true)) return true;
         }
 
-        // Then walk the list in registration order, skipping the
-        // primary if we already tried it.
         for (Backend b : backends) {
             if (b == p) continue;
             if (tryHook(b, original, callback, false)) return true;
         }
 
-        // If the primary wasn't first in the list, we skipped it above;
-        // make sure we don't leave it untried when it was also last.
         if (p != null && backends.indexOf(p) == 0) {
             if (tryHook(p, original, callback, true)) return true;
         }
@@ -211,16 +184,16 @@ public final class HookDispatcher {
 
         Backend p = primary;
         if (p != null && backends.indexOf(p) != 0) {
-            if (tryCtorHook(p, original, callback)) return true;
+            if (tryCtorHook(p, original, callback, true)) return true;
         }
 
         for (Backend b : backends) {
             if (b == p) continue;
-            if (tryCtorHook(b, original, callback)) return true;
+            if (tryCtorHook(b, original, callback, false)) return true;
         }
 
         if (p != null && backends.indexOf(p) == 0) {
-            if (tryCtorHook(p, original, callback)) return true;
+            if (tryCtorHook(p, original, callback, true)) return true;
         }
 
         log("All backends declined ctor "
@@ -238,6 +211,9 @@ public final class HookDispatcher {
         try {
             if (b.hook(original, callback)) {
                 if (s != null) s.installed.incrementAndGet();
+                lastInstalledBackend = b;
+                lastInstalledReverse = null;
+
                 if (!isPrimary) {
                     log("Fallback backend " + b.name() + " hooked "
                             + original.getDeclaringClass().getName()
@@ -262,14 +238,25 @@ public final class HookDispatcher {
     }
 
     private boolean tryCtorHook(Backend b, Constructor<?> original,
-                                XC_MethodHook callback) {
+                                XC_MethodHook callback, boolean isPrimary) {
         BackendStats s = stats.get(b);
         try {
             if (b.hookConstructor(original, callback)) {
                 if (s != null) s.ctorInstalled.incrementAndGet();
+                lastInstalledBackend = b;
+                lastInstalledReverse = null;
+
+                if (!isPrimary) {
+                    log("Fallback backend " + b.name() + " hooked ctor "
+                            + original.getDeclaringClass().getName());
+                }
                 return true;
             }
             if (s != null) s.ctorDeclined.incrementAndGet();
+            if (isPrimary) {
+                log("Primary " + b.name() + " declined ctor "
+                        + original.getDeclaringClass().getName());
+            }
             return false;
         } catch (Throwable t) {
             if (s != null) s.ctorFailed.incrementAndGet();
@@ -292,10 +279,6 @@ public final class HookDispatcher {
         return backend == null ? null : stats.get(backend);
     }
 
-    /**
-     * Human-readable summary of every backend's counters. Useful for
-     * a diagnostics screen or a single log line at shutdown.
-     */
     public String describeStats() {
         StringBuilder sb = new StringBuilder();
         sb.append("HookDispatcher stats (primary=")
@@ -309,7 +292,6 @@ public final class HookDispatcher {
         return sb.toString();
     }
 
-    /** Called at shutdown to release backend resources. */
     public void shutdown() {
         for (Backend b : backends) {
             try { b.shutdown(); }
@@ -320,7 +302,6 @@ public final class HookDispatcher {
 
     private void ensureInitialized() {
         if (!initialized) {
-            // initialize() is synchronized and idempotent.
             initialize();
         }
     }

@@ -13,9 +13,7 @@
         android:orientation="vertical"
         android:paddingBottom="32dp">
 
-        <!-- ═══════════════════════════════════════════════════════
-             App Info Card
-             ═══════════════════════════════════════════════════════ -->
+        <!-- App Info Card -->
         <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -35,7 +33,7 @@
                 <ImageView
                     android:layout_width="56dp"
                     android:layout_height="56dp"
-                    android:src="@drawable/ic_launcher"
+                    android:src="@mipmap/ic_launcher"
                     android:contentDescription="App icon" />
 
                 <LinearLayout
@@ -56,17 +54,13 @@
                         android:id="@+id/tvVersion"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="4.2"
+                        android:text="5.9"
                         android:textColor="?attr/colorOnSurfaceVariant" />
-
                 </LinearLayout>
-
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
-        <!-- ═══════════════════════════════════════════════════════
-             Status Card
-             ═══════════════════════════════════════════════════════ -->
+        <!-- Status Card -->
         <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -130,13 +124,10 @@
                         android:text="Stopped"
                         android:textColor="?attr/colorOnSurfaceVariant" />
                 </LinearLayout>
-
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
-        <!-- ═══════════════════════════════════════════════════════
-             Settings Card
-             ═══════════════════════════════════════════════════════ -->
+        <!-- Settings Card -->
         <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -233,7 +224,7 @@
                     android:layout_height="wrap_content"
                     android:orientation="horizontal"
                     android:gravity="center_vertical"
-                    android:layout_marginBottom="12dp">
+                    android:layout_marginBottom="16dp">
 
                     <LinearLayout
                         android:layout_width="0dp"
@@ -260,65 +251,99 @@
                         android:layout_height="wrap_content" />
                 </LinearLayout>
 
+                <!-- Divider -->
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:background="?attr/colorOutlineVariant"
+                    android:layout_marginBottom="16dp" />
+
                 <!-- Scan Interval -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="horizontal"
-                    android:gravity="center_vertical"
-                    android:layout_marginBottom="12dp">
+                    android:layout_marginBottom="4dp">
 
                     <TextView
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
                         android:layout_weight="1"
-                        android:text="Scan Interval (ms)"
+                        android:text="Scan interval"
+                        android:textSize="16sp"
                         android:textColor="?attr/colorOnSurface" />
 
-                    <EditText
-                        android:id="@+id/etScanInterval"
-                        android:layout_width="80dp"
+                    <TextView
+                        android:id="@+id/tvScanIntervalValue"
+                        android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="1"
-                        android:inputType="number"
-                        android:textAlignment="center"
-                        android:padding="8dp"
-                        android:background="@android:drawable/editbox_background"
-                        android:importantForAutofill="no" />
+                        android:text="5 s"
+                        android:textSize="14sp"
+                        android:textColor="?attr/colorPrimary" />
                 </LinearLayout>
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="How often the framework re-scans for running processes. Lower is faster but uses more battery. Applies on next service start."
+                    android:textSize="12sp"
+                    android:textColor="?attr/colorOnSurfaceVariant"
+                    android:layout_marginBottom="8dp" />
+
+                <com.google.android.material.slider.Slider
+                    android:id="@+id/sliderScanInterval"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:valueFrom="2"
+                    android:valueTo="30"
+                    android:stepSize="1"
+                    android:value="5"
+                    android:layout_marginBottom="16dp" />
 
                 <!-- Hook Delay -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="horizontal"
-                    android:gravity="center_vertical">
+                    android:layout_marginBottom="4dp">
 
                     <TextView
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
                         android:layout_weight="1"
-                        android:text="Hook Delay (ms)"
+                        android:text="Hook delay"
+                        android:textSize="16sp"
                         android:textColor="?attr/colorOnSurface" />
 
-                    <EditText
-                        android:id="@+id/etHookDelay"
-                        android:layout_width="80dp"
+                    <TextView
+                        android:id="@+id/tvHookDelayValue"
+                        android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="5"
-                        android:inputType="number"
-                        android:textAlignment="center"
-                        android:padding="8dp"
-                        android:background="@android:drawable/editbox_background"
-                        android:importantForAutofill="no" />
+                        android:text="0 ms"
+                        android:textSize="14sp"
+                        android:textColor="?attr/colorPrimary" />
                 </LinearLayout>
 
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="A small pause between framework start and hook install. Helps on ROMs where the framework races the app's own initialization. Higher adds launch latency. Applies on next launch."
+                    android:textSize="12sp"
+                    android:textColor="?attr/colorOnSurfaceVariant"
+                    android:layout_marginBottom="8dp" />
+
+                <com.google.android.material.slider.Slider
+                    android:id="@+id/sliderHookDelay"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:valueFrom="0"
+                    android:valueTo="2000"
+                    android:stepSize="100"
+                    android:value="0" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
-        <!-- ═══════════════════════════════════════════════════════
-             Actions
-             ═══════════════════════════════════════════════════════ -->
+        <!-- Actions -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -338,8 +363,6 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="Export Config" />
-
         </LinearLayout>
-
     </LinearLayout>
 </ScrollView>

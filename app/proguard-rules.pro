@@ -48,6 +48,9 @@
 -keep class com.shizuposed.manager.core.ModuleScanner { *; }
 -keep class com.shizuposed.manager.core.ProcessMonitor { *; }
 -keep class com.shizuposed.manager.core.ResourceHooking { *; }
+-keep class com.shizuposed.manager.core.MarkerCache { *; }
+-keep class com.shizuposed.manager.core.DexLoadingBridge { *; }
+-keep class com.shizuposed.manager.core.DexLoadingBridge$* { *; }
 
 -keep class com.shizuposed.manager.core.NativeBridge { *; }
 
@@ -58,29 +61,30 @@
                                 long[]);
 }
 
-# ── XStealth (built-in module, loaded by Class.forName) ─────
+# ── Runtime timing preferences ──────────────────────────────
 #
-# The shell-side XposedHook resolves XStealthModule by its
-# fully-qualified name, and the manager's ModuleLoader writes
-# that same string into the synthetic module descriptor. The
-# class name and its public entry method must survive R8.
+# RuntimePrefs stores scan interval and hook delay. Read from
+# ProcessMonitor and ShizuPosedService. Called only from Java
+# in the manager process; not reflected on, not looked up by
+# name. Safe to obfuscate, but kept for log readability since
+# its methods appear in the diagnostic logs ("scan interval
+# applied", "hook delay configured"). The whole class is small
+# and its members are named in log strings.
+-keep,allowobfuscation class com.shizuposed.manager.runtime.** { *; }
+
+# ── XStealth (built-in module, loaded by Class.forName) ─────
 -keep class com.shizuposed.manager.stealth.** { *; }
 -keep class com.shizuposed.manager.stealth.checks.** { *; }
 -keepclassmembers class com.shizuposed.manager.stealth.** {
     public static ** *(...);
 }
 
-# XStealthModule's ENTRY constant must match the string in the
-# built-in module descriptor. Keeping the class whole covers the
-# constant.
 -keepclassmembers class com.shizuposed.manager.stealth.XStealthModule {
     public static final java.lang.String PACKAGE;
     public static final java.lang.String ENTRY;
     public static boolean isActive();
 }
 
-# XStealthStatusWriter is called by ShizuPosedService after
-# every module push.
 -keep class com.shizuposed.manager.stealth.XStealthStatusWriter { *; }
 
 # libxstealth.so JNI surface.
@@ -105,11 +109,6 @@
     public static java.lang.String describe();
 }
 
-# ApiProtectionCheck hooks ClassLoader.loadClass and
-# Class.forName. It is called by name from XStealthModule, and
-# its XC_MethodHook subclasses are reflected on by Pine when the
-# hooks fire. The class must not be renamed or its hooks will
-# silently fail to install.
 -keep class com.shizuposed.manager.stealth.checks.ApiProtectionCheck { *; }
 -keepclassmembers class com.shizuposed.manager.stealth.checks.ApiProtectionCheck {
     public static void install(de.robv.android.xposed.callbacks.XC_LoadPackage$LoadPackageParam);
@@ -244,6 +243,12 @@
     public <init>(android.content.Context, android.util.AttributeSet, int);
 }
 
+-keep class com.google.android.material.button.MaterialButtonToggleGroup {
+    public <init>(android.content.Context);
+    public <init>(android.content.Context, android.util.AttributeSet);
+    public <init>(android.content.Context, android.util.AttributeSet, int);
+}
+
 -keep class com.google.android.material.chip.Chip {
     public <init>(android.content.Context);
     public <init>(android.content.Context, android.util.AttributeSet);
@@ -268,19 +273,60 @@
     public <init>(android.content.Context, android.util.AttributeSet, int);
 }
 
+-keep class com.google.android.material.tabs.TabLayout {
+    public <init>(android.content.Context);
+    public <init>(android.content.Context, android.util.AttributeSet);
+    public <init>(android.content.Context, android.util.AttributeSet, int);
+}
+
+-keep class com.google.android.material.tabs.TabItem {
+    public <init>(android.content.Context);
+    public <init>(android.content.Context, android.util.AttributeSet);
+    public <init>(android.content.Context, android.util.AttributeSet, int);
+}
+
+-keep class com.google.android.material.slider.Slider {
+    public <init>(android.content.Context);
+    public <init>(android.content.Context, android.util.AttributeSet);
+    public <init>(android.content.Context, android.util.AttributeSet, int);
+}
+
+-keep class com.google.android.material.bottomsheet.BottomSheetDialogFragment {
+    public <init>();
+}
+
 # ViewBinding classes are referenced by name from generated code.
 -keep class com.shizuposed.manager.databinding.** { *; }
 
 # ── Fragments instantiated by class name ────────────────────
+#
+# Fragments are instantiated by the ViewPager2 adapter via
+# `new HomeFragment()` in Java. R8 could rename them since the
+# reference is a class literal, but the FragmentManager stores
+# fragments by class name in its saved state. Keeping them
+# preserves the ability to restore state after process death.
 -keep class com.shizuposed.manager.ui.** { *; }
 
 # ── Adapters ────────────────────────────────────────────────
+#
+# Adapters are held by fragments as fields and never loaded by
+# name. Kept for consistency with the previous ruleset and
+# because ViewHolder inner classes are referenced from the
+# inflated layout's view IDs (via findViewById, not reflection).
 -keep public class com.shizuposed.manager.adapter.** {
     public *;
 }
 -keepclassmembers class com.shizuposed.manager.adapter.** {
     <init>(...);
 }
+
+# ── Status icons ────────────────────────────────────────────
+#
+# ic_status_check and ic_status_cross are vector drawables
+# referenced from the Home layout XML. Vector drawables are
+# loaded by resource ID, not by class name, so they need no
+# ProGuard rule. This comment is here to say so explicitly, so
+# nobody adds a rule for them "just in case."
 
 # ── Enum values ─────────────────────────────────────────────
 -keepclassmembers enum * {
@@ -327,6 +373,7 @@
 
 -keep,allowobfuscation class com.shizuposed.manager.utils.FileUtils { *; }
 -keep,allowobfuscation class com.shizuposed.manager.utils.ShellUtils { *; }
+-keep,allowobfuscation class com.shizuposed.manager.utils.MarkdownRenderer { *; }
 -keep,allowobfuscation class com.shizuposed.manager.receiver.BootReceiver { *; }
 -keep,allowobfuscation class com.shizuposed.manager.status.ModuleStatusProvider { *; }
 -keep,allowobfuscation class com.shizuposed.manager.service.ShizuPosedService { *; }
@@ -424,3 +471,17 @@
 #   rule. It keeps every Material class whole, which defeats
 #   most of the point of minification. The explicit per-widget
 #   constructor keeps above are the surgical version.
+
+# -keep class com.google.android.material.slider.** { *; }
+#   The Slider class is the only one from the Material slider
+#   package used in any layout. A package-wide keep would pull
+#   in the rest of the package unnecessarily. The explicit
+#   Slider constructor keep above is sufficient.
+
+# RuntimePrefs keep-whole:
+#   RuntimePrefs is reflected on by nothing. Its methods are
+#   called from ProcessMonitor and ShizuPosedService as direct
+#   Java calls. The keep rule above uses allowobfuscation, so
+#   R8 will rename the class and its members; only the
+#   interface it exposes to the two callers matters at compile
+#   time, and R8 resolves those call sites statically.

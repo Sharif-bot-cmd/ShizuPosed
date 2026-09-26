@@ -46,36 +46,27 @@ import java.util.zip.ZipFile;
  * ---------------
  * loadModules() clears and repopulates the cache in place. Multiple
  * callers invoke it — the Modules fragment, the Repo fragment, the
- * service's worker thread. If one caller is mid-load while another
- * reads getCachedModules(), the reader sees a partial or empty map.
+ * service's worker thread. A ReentrantReadWriteLock protects every
+ * read and write of the cache, so a reader never observes a
+ * partially-populated state.
  *
- * ModuleScanner reads the cache to decide which modules are already
- * registered. A partial cache makes it think freshly-registered
- * modules are new, which surfaces as a spurious "N modules detected"
- * notification on app open.
- *
- * The fix is a ReentrantReadWriteLock. loadModules() holds the write
- * lock while it clears and repopulates. Every reader holds the read
- * lock. Readers never observe a load in progress, and two loads never
- * interleave.
+ * APKPATH RESOLUTION
+ * ------------------
+ * installModule() always resolves the module's APK path through
+ * PackageManager, regardless of what the caller passes. A module
+ * added manually from a file picker carries a temporary cache path
+ * that gets deleted after install; if that path were written to
+ * the JSON, the scanner's purge pass would remove the module on
+ * the next scan because the file no longer exists and the package
+ * check might not match. Resolving through PackageManager gives the
+ * durable installed path instead.
  *
  * XStealth
  * --------
  * XStealth is a built-in module: it has no APK, no cached dex, and
  * no JSON descriptor on disk. It's synthesized into the module list
  * on every loadModules() call, with its enabled state and scope
- * read from XStealthPrefs. Because it has no on-disk representation,
- * installModule/saveModule/uninstallModule all refuse to touch it.
- *
- * RECOMMENDED SCOPE
- * -----------------
- * recommendedApps is always sourced from the APK, never trusted from
- * the JSON descriptor alone. installModule() and loadModules() both
- * call readRecommendedScope() so a module that adds or changes its
- * scope.list in an update picks up the change without a re-install.
- * When the APK read yields an empty set, the JSON's existing value
- * is preserved — a transient zip read failure must not wipe a
- * previously-known scope.
+ * read from XStealthPrefs.
  */
 public class ModuleLoader {
     private static final String TAG = "ModuleLoader";
@@ -91,17 +82,6 @@ public class ModuleLoader {
 
     private final ConcurrentHashMap<String, ModuleInfo> loadedModules = new ConcurrentHashMap<>();
 
-    // ── FIX: cache coherence lock.
-    //
-    // loadModules() takes the write lock and holds it across the
-    // clear + repopulate sequence. Every reader takes the read lock
-    // for the duration of its read. This guarantees that no reader
-    // observes a partially-populated cache, and that two concurrent
-    // loads do not interleave their clear/repopulate passes.
-    //
-    // Fairness is left off (default). Read-heavy workloads benefit;
-    // a write waiting on a read will eventually get its turn because
-    // ReentrantReadWriteLock does not starve writers indefinitely.
     private final ReentrantReadWriteLock cacheLock = new ReentrantReadWriteLock();
 
     private ModuleLoader(Context context) {
@@ -182,11 +162,6 @@ public class ModuleLoader {
     // ═════════════════════════════════════════════════════════════════
 
     public List<ModuleInfo> loadModules() {
-        // ── FIX: hold the write lock across the whole clear +
-        // repopulate sequence. A reader that calls getCachedModules()
-        // during this method blocks until the load completes, so it
-        // sees either the old cache or the new one — never a partial
-        // or empty intermediate state.
         cacheLock.writeLock().lock();
         try {
             List<ModuleInfo> modules = new ArrayList<>();
@@ -218,12 +193,8 @@ public class ModuleLoader {
                             ModuleInfo module = gson.fromJson(json, ModuleInfo.class);
                             if (module == null || module.packageName == null) continue;
 
-                            // Never trust a JSON that claims to be XStealth.
-                            // The built-in entry below is the only source.
                             if (XStealthModule.PACKAGE.equals(module.packageName)) continue;
 
-                            // Defensive: Gson leaves the field null if the
-                            // JSON has no recommendedApps key.
                             if (module.recommendedApps == null) {
                                 module.recommendedApps = new HashSet<>();
                             }
@@ -244,11 +215,6 @@ public class ModuleLoader {
                                 }
                             }
 
-                            // Refresh recommended scope from the APK on
-                            // every load. Cheap — one zip entry read. Only
-                            // overwrites the JSON value when the APK read
-                            // produced a non-empty set, so a transient read
-                            // failure cannot wipe a previously-known scope.
                             if (module.apkPath != null) {
                                 try {
                                     Set<String> fresh = readRecommendedScope(module.apkPath);
@@ -308,7 +274,6 @@ public class ModuleLoader {
                     }
                 }
 
-                // Synthesize the built-in XStealth entry from XStealthPrefs.
                 registerXStealth(modules);
 
                 if (modules.isEmpty()) {
@@ -326,7 +291,6 @@ public class ModuleLoader {
     }
 
     public List<ModuleInfo> getCachedModules() {
-        // ── FIX: read lock. Blocks while a load is in progress.
         cacheLock.readLock().lock();
         try {
             return new ArrayList<>(loadedModules.values());
@@ -335,12 +299,6 @@ public class ModuleLoader {
         }
     }
 
-    /**
-     * Build the synthetic XStealth ModuleInfo from current prefs.
-     * Appended to the list and inserted into the cache. Always
-     * present, regardless of whether the toggle is on — the row
-     * needs to exist so users can turn it on.
-     */
     private void registerXStealth(List<ModuleInfo> out) {
         try {
             ModuleInfo x = new ModuleInfo();
@@ -386,7 +344,8 @@ public class ModuleLoader {
 
             try {
                 PackageManager pm = context.getPackageManager();
-                android.content.pm.PackageInfo pkgInfo = pm.getPackageInfo(module.packageName, 0);
+                android.content.pm.PackageInfo pkgInfo =
+                    pm.getPackageInfo(module.packageName, 0);
                 if (pkgInfo != null) {
                     module.version = pkgInfo.versionName;
                     if (module.name == null || module.name.isEmpty()) {
@@ -396,9 +355,32 @@ public class ModuleLoader {
             } catch (PackageManager.NameNotFoundException ignored) {
             }
 
-            if (module.apkPath == null || !new File(module.apkPath).exists()) {
-                String fromPm = findModuleApkPath(module.packageName);
-                if (fromPm != null) module.apkPath = fromPm;
+            // ── APKPATH RESOLUTION ─────────────────────────────────
+            // Always prefer the installed APK path. A manually-added
+            // module carries a transient cache path that gets deleted
+            // after this method returns. If that path were written to
+            // the JSON, the scanner's purge pass would remove the
+            // module on the next scan because the file no longer
+            // exists and the package-installed check might not match
+            // (the module's package is often the target app's package,
+            // not the module APK's own package, in manual-add cases).
+            //
+            // findModuleApkPath() queries PackageManager for the
+            // module's sourceDir, which is the durable installed path.
+            String installedApkPath = findModuleApkPath(module.packageName);
+            if (installedApkPath != null && !installedApkPath.isEmpty()) {
+                module.apkPath = installedApkPath;
+            } else if (module.apkPath == null
+                    || !new File(module.apkPath).exists()) {
+                // No installed package and no valid caller-provided
+                // path. Leave the field as-is; the module may be
+                // registered by a subsequent scan when the APK is
+                // found through a different path.
+                if (logger != null) {
+                    logger.w("installModule: no resolvable apkPath for "
+                        + module.packageName + " (caller path="
+                        + module.apkPath + ")");
+                }
             }
 
             try {
@@ -430,6 +412,10 @@ public class ModuleLoader {
                 module.recommendedApps = new HashSet<>();
             }
 
+            // Refresh the timestamp so the scanner's purge grace
+            // period protects a freshly-added module.
+            module.lastUpdated = System.currentTimeMillis();
+
             File moduleFile = new File(moduleDir, module.packageName + ".json");
             String json = gson.toJson(module);
             FileUtils.writeFile(moduleFile, json);
@@ -440,7 +426,6 @@ public class ModuleLoader {
                 return false;
             }
 
-            // ── FIX: write lock for the cache mutation.
             cacheLock.writeLock().lock();
             try {
                 loadedModules.put(module.packageName, module);
@@ -451,6 +436,7 @@ public class ModuleLoader {
             logger.i("Installed module: " + module.packageName
                 + " (dex=" + module.cachedDexPath + ", entry=" + module.xposedInit
                 + ", hasUi=" + module.hasUi
+                + ", apkPath=" + module.apkPath
                 + ", recommended=" + module.getRecommendedAppCount() + ")");
             return true;
         } catch (Exception e) {
@@ -484,11 +470,12 @@ public class ModuleLoader {
                 module.recommendedApps = new HashSet<>();
             }
 
+            module.lastUpdated = System.currentTimeMillis();
+
             File moduleFile = new File(moduleDir, module.packageName + ".json");
             String json = gson.toJson(module);
             FileUtils.writeFile(moduleFile, json);
 
-            // ── FIX: write lock.
             cacheLock.writeLock().lock();
             try {
                 loadedModules.put(module.packageName, module);
@@ -518,7 +505,6 @@ public class ModuleLoader {
                 logger.i("Deleted module file: " + moduleFile.getAbsolutePath());
             }
 
-            // ── FIX: write lock.
             ModuleInfo removed;
             cacheLock.writeLock().lock();
             try {
@@ -554,7 +540,6 @@ public class ModuleLoader {
     // ═════════════════════════════════════════════════════════════════
 
     public ModuleInfo getModule(String packageName) {
-        // ── FIX: read lock.
         cacheLock.readLock().lock();
         try {
             return loadedModules.get(packageName);
@@ -564,7 +549,6 @@ public class ModuleLoader {
     }
 
     public boolean isModuleEnabled(String packageName) {
-        // ── FIX: read lock.
         cacheLock.readLock().lock();
         try {
             ModuleInfo m = loadedModules.get(packageName);
@@ -575,7 +559,6 @@ public class ModuleLoader {
     }
 
     public List<ModuleInfo> getEnabledModules() {
-        // ── FIX: read lock.
         cacheLock.readLock().lock();
         try {
             List<ModuleInfo> enabled = new ArrayList<>();
@@ -598,7 +581,6 @@ public class ModuleLoader {
     }
 
     public int getHookedAppCount(String modulePackage) {
-        // ── FIX: read lock.
         cacheLock.readLock().lock();
         try {
             ModuleInfo m = loadedModules.get(modulePackage);
@@ -688,14 +670,6 @@ public class ModuleLoader {
     // RECOMMENDED SCOPE
     // ═════════════════════════════════════════════════════════════════
 
-    /**
-     * Read assets/scope.list from a module APK.
-     *
-     * LSPosed convention: one package name per line. Blank lines and
-     * lines beginning with '#' are ignored. Returns an empty set if
-     * the entry is absent, the APK is missing, or the read fails —
-     * never null.
-     */
     private Set<String> readRecommendedScope(String apkPath) {
         Set<String> scope = new HashSet<>();
         if (apkPath == null) return scope;

@@ -40,7 +40,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class MainActivity extends AppCompatActivity {
-    private static final String VERSION_LABEL = "5.8";
+    private static final String VERSION_LABEL = "6.4";
     private ViewPager2 viewPager;
     private BottomNavigationView bottomNavigation;
     private Toolbar toolbar;

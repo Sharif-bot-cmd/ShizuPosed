@@ -12,7 +12,7 @@ import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
-import android.widget.ProgressBar;
+import android.widget.ImageView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -20,20 +20,15 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.cardview.widget.CardView;
 import androidx.fragment.app.Fragment;
-import androidx.recyclerview.widget.LinearLayoutManager;
-import androidx.recyclerview.widget.RecyclerView;
 
 import com.shizuposed.manager.R;
 import com.shizuposed.manager.ShizuPosedManagerApp;
-import com.shizuposed.manager.adapter.HookedProcessAdapter;
 import com.shizuposed.manager.core.ModuleLoader;
 import com.shizuposed.manager.core.ProcessMonitor;
-import com.shizuposed.manager.model.HookedProcess;
 import com.shizuposed.manager.model.ModuleInfo;
 import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.utils.Logger;
 
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -41,11 +36,36 @@ import java.util.Set;
 import de.robv.android.xposed.LSPosedManager;
 import de.robv.android.xposed.XposedBridge;
 
+/**
+ * HomeFragment
+ *
+ * The Home tab. Shows:
+ *   • A status card ("Activated" / "Not Activated") at the top,
+ *     with a check or cross icon matching the state.
+ *   • A row of counters: scoped apps, active modules, installed apps.
+ *   • A Framework Info card with the same fields LSPosed's Home
+ *     tab reports.
+ *   • A refresh button.
+ *
+ * STATUS SEMANTICS
+ * ----------------
+ * "Activated" means ShizuPosed is fully operational: Shizuku is
+ * authorized and the foreground service is running. Anything else
+ * is "Not Activated" with a short subtitle explaining what's
+ * missing.
+ *
+ * Two icons live in the status card:
+ *   • ivStatusIcon     — the green check, visible when Activated
+ *   • ivStatusIconCross — the red cross, visible when Not Activated
+ *
+ * updateStatus() swaps them. Only one is ever visible.
+ */
 public class HomeFragment extends Fragment {
-    private RecyclerView processRecyclerView;
-    private ProgressBar progressIndicator;
-    private TextView tvStatus, tvHookedCount, tvTotalApps, tvActiveModules;
+
+    private TextView tvStatus, tvStatusDetail;
+    private TextView tvHookedCount, tvTotalApps, tvActiveModules;
     private CardView cardStatus;
+    private ImageView ivStatusIcon, ivStatusIconCross;
     private Button btnRefresh, btnStartService;
 
     // Framework info card fields
@@ -57,8 +77,6 @@ public class HomeFragment extends Fragment {
     private Logger logger;
     private ProcessMonitor processMonitor;
     private ModuleLoader moduleLoader;
-    private HookedProcessAdapter processAdapter;
-    private List<HookedProcess> hookedProcesses = new ArrayList<>();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private volatile boolean viewReady = false;
@@ -88,20 +106,20 @@ public class HomeFragment extends Fragment {
 
     @Nullable
     @Override
-    public View onCreateView(@NonNull LayoutInflater inflater, @Nullable ViewGroup container,
+    public View onCreateView(@NonNull LayoutInflater inflater,
+                             @Nullable ViewGroup container,
                              @Nullable Bundle savedInstanceState) {
-        View view = inflater.inflate(R.layout.fragment_home, container, false);
-        initViews(view);
-        return view;
+        return inflater.inflate(R.layout.fragment_home, container, false);
     }
 
     @Override
-    public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
+    public void onViewCreated(@NonNull View view,
+                              @Nullable Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
         viewReady = true;
+        initViews(view);
         populateFrameworkInfo();
         setupListeners();
-        setupRecyclerView();
         updateRealData();
     }
 
@@ -110,16 +128,26 @@ public class HomeFragment extends Fragment {
         super.onDestroyView();
         viewReady = false;
         mainHandler.removeCallbacks(statusUpdater);
-        processRecyclerView = null;
-        processAdapter = null;
-        progressIndicator = null;
-        tvStatus = null; tvHookedCount = null; tvTotalApps = null; tvActiveModules = null;
+
+        tvStatus = null;
+        tvStatusDetail = null;
+        tvHookedCount = null;
+        tvTotalApps = null;
+        tvActiveModules = null;
         cardStatus = null;
-        btnRefresh = null; btnStartService = null;
-        tvFrameworkVersion = null; tvApiVersion = null;
-        tvShellPackage = null; tvShellUid = null;
-        tvSystemVersion = null; tvDevice = null; tvSystemAbi = null;
-        tvFrameworkApiProtection = null; tvFrameworkDexOptimize = null;
+        ivStatusIcon = null;
+        ivStatusIconCross = null;
+        btnRefresh = null;
+        btnStartService = null;
+        tvFrameworkVersion = null;
+        tvApiVersion = null;
+        tvShellPackage = null;
+        tvShellUid = null;
+        tvSystemVersion = null;
+        tvDevice = null;
+        tvSystemAbi = null;
+        tvFrameworkApiProtection = null;
+        tvFrameworkDexOptimize = null;
     }
 
     @Override
@@ -137,7 +165,7 @@ public class HomeFragment extends Fragment {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // SAFE ENTRY POINTS
+    // VIEW + EVENT WIRING
     // ═════════════════════════════════════════════════════════════
 
     public void refresh() {
@@ -149,26 +177,40 @@ public class HomeFragment extends Fragment {
     }
 
     private void initViews(View view) {
-        processRecyclerView = view.findViewById(R.id.processRecyclerView);
-        progressIndicator = view.findViewById(R.id.progressIndicator);
         tvStatus = view.findViewById(R.id.tvStatus);
+        tvStatusDetail = view.findViewById(R.id.tvStatusDetail);
         tvHookedCount = view.findViewById(R.id.tvHookedCount);
         tvTotalApps = view.findViewById(R.id.tvTotalApps);
         tvActiveModules = view.findViewById(R.id.tvActiveModules);
         cardStatus = view.findViewById(R.id.cardStatus);
+        ivStatusIcon = view.findViewById(R.id.ivStatusIcon);
+        ivStatusIconCross = view.findViewById(R.id.ivStatusIconCross);
         btnRefresh = view.findViewById(R.id.btnRefresh);
         btnStartService = view.findViewById(R.id.btnStartService);
 
         tvFrameworkVersion = view.findViewById(R.id.tvFrameworkVersion);
-        tvApiVersion       = view.findViewById(R.id.tvApiVersion);
-        tvShellPackage     = view.findViewById(R.id.tvShellPackage);
-        tvShellUid         = view.findViewById(R.id.tvShellUid);
-        tvSystemVersion    = view.findViewById(R.id.tvSystemVersion);
-        tvDevice           = view.findViewById(R.id.tvDevice);
-        tvSystemAbi        = view.findViewById(R.id.tvSystemAbi);
+        tvApiVersion = view.findViewById(R.id.tvApiVersion);
+        tvShellPackage = view.findViewById(R.id.tvShellPackage);
+        tvShellUid = view.findViewById(R.id.tvShellUid);
+        tvSystemVersion = view.findViewById(R.id.tvSystemVersion);
+        tvDevice = view.findViewById(R.id.tvDevice);
+        tvSystemAbi = view.findViewById(R.id.tvSystemAbi);
         tvFrameworkApiProtection = view.findViewById(R.id.tvFrameworkApiProtection);
-        tvFrameworkDexOptimize   = view.findViewById(R.id.tvFrameworkDexOptimize);
+        tvFrameworkDexOptimize = view.findViewById(R.id.tvFrameworkDexOptimize);
     }
+
+    private void setupListeners() {
+        if (btnRefresh != null) {
+            btnRefresh.setOnClickListener(v -> updateRealData());
+        }
+        if (btnStartService != null) {
+            btnStartService.setOnClickListener(v -> startService());
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // FRAMEWORK INFO
+    // ═════════════════════════════════════════════════════════════
 
     private void populateFrameworkInfo() {
         if (!viewReady) return;
@@ -204,7 +246,6 @@ public class HomeFragment extends Fragment {
         } catch (Throwable ignored) {}
         tvSystemAbi.setText(abi);
 
-        // ─── XStealth-related rows ─────────────────────────────
         populateXStealthStatus();
 
         if (logger != null) {
@@ -217,17 +258,10 @@ public class HomeFragment extends Fragment {
         }
     }
 
-    /**
-     * Update the API Protection and Dex Optimization rows in the
-     * Framework Info card. Both read from XStealthPrefs so they stay
-     * in sync with the toggles in the XStealth detail sheet.
-     */
     private void populateXStealthStatus() {
         if (!viewReady) return;
         Context ctx = requireContext();
 
-        // API Protection row. Only meaningful when the XStealth master
-        // toggle is on, since nothing installs the check otherwise.
         if (tvFrameworkApiProtection != null) {
             boolean master = com.shizuposed.manager.stealth.XStealthPrefs
                 .isEnabled(ctx);
@@ -250,8 +284,6 @@ public class HomeFragment extends Fragment {
             tvFrameworkApiProtection.setTextColor(ctx.getColor(colorRes));
         }
 
-        // Dex Optimization row. Independent of the master toggle — it
-        // runs on the manager side, not inside the target process.
         if (tvFrameworkDexOptimize != null) {
             boolean on = com.shizuposed.manager.stealth.XStealthPrefs
                 .isDexOptimizeEnabled(ctx);
@@ -281,25 +313,9 @@ public class HomeFragment extends Fragment {
         return out.toString();
     }
 
-    private void setupRecyclerView() {
-        if (processRecyclerView == null) return;
-        processRecyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
-        processAdapter = new HookedProcessAdapter(hookedProcesses, requireContext());
-        processRecyclerView.setAdapter(processAdapter);
-    }
-
-    private void setupListeners() {
-        if (btnRefresh != null) {
-            btnRefresh.setOnClickListener(v -> {
-                showLoading(true);
-                updateRealData();
-                showLoading(false);
-            });
-        }
-        if (btnStartService != null) {
-            btnStartService.setOnClickListener(v -> startService());
-        }
-    }
+    // ═════════════════════════════════════════════════════════════
+    // STATUS + COUNTERS
+    // ═════════════════════════════════════════════════════════════
 
     private void updateRealData() {
         if (!viewReady) return;
@@ -323,68 +339,83 @@ public class HomeFragment extends Fragment {
             tvActiveModules.setText(String.valueOf(getEnabledModuleCount()));
         }
 
-        List<HookedProcess> processes = (processMonitor != null)
-            ? processMonitor.getHookedProcesses()
-            : new ArrayList<>();
-
-        hookedProcesses.clear();
-        for (HookedProcess p : processes) {
-            if (p == null) continue;
-            boolean hooked = p.isHooked();
-            boolean inScope = processMonitor != null
-                && processMonitor.isPackageInScope(p.getProcessName());
-            if (hooked || inScope) {
-                hookedProcesses.add(p);
-            }
-        }
-
-        if (processAdapter != null) {
-            processAdapter.updateData(hookedProcesses);
-        }
-
-        // ─── ADD THIS LINE HERE ─────────────────────────────────
         populateXStealthStatus();
-        // ────────────────────────────────────────────────────────
 
-        logger.d("Updated real data - Scoped: " + getScopedAppCount()
-            + ", Active modules: " + getEnabledModuleCount()
-            + ", Apps: " + getTotalInstalledApps()
-            + ", Shown processes: " + hookedProcesses.size()
-            + ", Service: " + serviceRunning);
+        if (logger != null) {
+            logger.d("Updated real data - Scoped: " + getScopedAppCount()
+                + ", Active modules: " + getEnabledModuleCount()
+                + ", Apps: " + getTotalInstalledApps()
+                + ", Service: " + serviceRunning
+                + ", Shizuku: " + shizukuAuthorized);
+        }
     }
 
+    /**
+     * Binary status with a matching icon.
+     *
+     *   Activated      → green check
+     *   Not Activated  → red cross
+     *
+     * The subtitle tells the user exactly what's missing. The
+     * "Activate" button is shown only when the user can act on it —
+     * i.e. Shizuku is authorized but the service isn't running.
+     */
     private void updateStatus(boolean shizukuAuthorized, boolean serviceRunning) {
-        if (tvStatus == null || cardStatus == null || btnStartService == null) return;
+        if (tvStatus == null || cardStatus == null) return;
         if (!isAdded()) return;
+        Context ctx = requireContext();
+
+        boolean activated = shizukuAuthorized && serviceRunning;
+
+        // ── Icon swap. Only one is ever visible.
+        if (ivStatusIcon != null) {
+            ivStatusIcon.setVisibility(activated ? View.VISIBLE : View.GONE);
+        }
+        if (ivStatusIconCross != null) {
+            ivStatusIconCross.setVisibility(activated ? View.GONE : View.VISIBLE);
+        }
 
         if (!shizukuAuthorized) {
-            tvStatus.setText("No Shizuku Permission");
-            tvStatus.setTextColor(requireContext().getColor(android.R.color.holo_red_light));
-            cardStatus.setCardBackgroundColor(
-                requireContext().getColor(android.R.color.holo_red_light));
-            btnStartService.setEnabled(false);
+            tvStatus.setText("Not Activated");
+            tvStatus.setTextColor(ctx.getColor(android.R.color.holo_red_light));
+            if (tvStatusDetail != null) {
+                tvStatusDetail.setText("Grant Shizuku permission to continue");
+            }
+            if (btnStartService != null) {
+                btnStartService.setVisibility(View.VISIBLE);
+                btnStartService.setEnabled(false);
+            }
         } else if (serviceRunning) {
-            tvStatus.setText("Running ✅");
-            tvStatus.setTextColor(requireContext().getColor(android.R.color.holo_green_light));
-            cardStatus.setCardBackgroundColor(
-                requireContext().getColor(android.R.color.holo_green_light));
-            btnStartService.setEnabled(false);
+            tvStatus.setText("Activated");
+            tvStatus.setTextColor(ctx.getColor(android.R.color.holo_green_light));
+            if (tvStatusDetail != null) {
+                tvStatusDetail.setText("Framework is running");
+            }
+            if (btnStartService != null) {
+                btnStartService.setVisibility(View.GONE);
+            }
         } else {
-            tvStatus.setText("Stopped ⚠️");
-            tvStatus.setTextColor(requireContext().getColor(android.R.color.holo_orange_light));
-            cardStatus.setCardBackgroundColor(
-                requireContext().getColor(android.R.color.holo_orange_light));
-            btnStartService.setEnabled(true);
+            tvStatus.setText("Not Activated");
+            tvStatus.setTextColor(ctx.getColor(android.R.color.holo_orange_light));
+            if (tvStatusDetail != null) {
+                tvStatusDetail.setText("Tap Activate to start the service");
+            }
+            if (btnStartService != null) {
+                btnStartService.setVisibility(View.VISIBLE);
+                btnStartService.setEnabled(true);
+            }
         }
     }
 
     private int getTotalInstalledApps() {
         try {
             PackageManager pm = requireContext().getPackageManager();
-            List<ApplicationInfo> apps = pm.getInstalledApplications(PackageManager.GET_META_DATA);
+            List<ApplicationInfo> apps = pm.getInstalledApplications(0);
             return apps != null ? apps.size() : 0;
         } catch (Exception e) {
-            if (logger != null) logger.e("Error getting total apps: " + e.getMessage());
+            if (logger != null) {
+                logger.e("Error getting total apps: " + e.getMessage());
+            }
             return 0;
         }
     }
@@ -398,7 +429,9 @@ public class HomeFragment extends Fragment {
             }
             return union.size();
         } catch (Throwable t) {
-            if (logger != null) logger.e("getScopedAppCount error: " + t.getMessage());
+            if (logger != null) {
+                logger.e("getScopedAppCount error: " + t.getMessage());
+            }
             return 0;
         }
     }
@@ -412,23 +445,24 @@ public class HomeFragment extends Fragment {
         }
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // SERVICE CONTROL
+    // ═════════════════════════════════════════════════════════════
+
     private void startService() {
         if (!isAdded() || getContext() == null) return;
         try {
-            Intent serviceIntent = new Intent(requireContext(), ShizuPosedService.class);
+            Intent serviceIntent = new Intent(
+                requireContext(), ShizuPosedService.class);
             requireContext().startForegroundService(serviceIntent);
-            Toast.makeText(requireContext(), "Service starting…", Toast.LENGTH_SHORT).show();
+            Toast.makeText(requireContext(), "Service starting…",
+                Toast.LENGTH_SHORT).show();
             if (logger != null) logger.i("Service started manually");
             mainHandler.postDelayed(this::updateRealData, 1000);
         } catch (Exception e) {
-            Toast.makeText(requireContext(), "Failed to start service", Toast.LENGTH_SHORT).show();
+            Toast.makeText(requireContext(), "Failed to start service",
+                Toast.LENGTH_SHORT).show();
             if (logger != null) logger.e("Start service error: " + e.getMessage());
-        }
-    }
-
-    private void showLoading(boolean show) {
-        if (progressIndicator != null) {
-            progressIndicator.setVisibility(show ? View.VISIBLE : View.GONE);
         }
     }
 }
