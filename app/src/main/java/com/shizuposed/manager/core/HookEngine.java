@@ -51,6 +51,30 @@ public class HookEngine {
     private static final Set<String> sHookedClasses =
         ConcurrentHashMap.newKeySet();
 
+    public static final class InstallRecord {
+        public final String backendName;
+        public final Runnable reverse;   // nullable
+
+        public InstallRecord(String backendName, Runnable reverse) {
+            this.backendName = backendName;
+            this.reverse = reverse;
+        }
+    }
+
+    private static final ConcurrentHashMap<java.lang.reflect.Member, InstallRecord>
+        sInstallRecords = new ConcurrentHashMap<>();
+
+    public static InstallRecord getInstallRecord(java.lang.reflect.Member member) {
+        return member == null ? null : sInstallRecords.get(member);
+    }
+
+    static void recordInstall(java.lang.reflect.Member member,
+                              String backendName,
+                              Runnable reverse) {
+        if (member == null) return;
+        sInstallRecords.put(member, new InstallRecord(backendName, reverse));
+    }
+
     /**
      * Shell-side libs dir, set once by XposedHook after it resolves
      * the shell base. Used by installBackends() to load libcallsite.so.
@@ -168,6 +192,14 @@ public class HookEngine {
                     String key = original.getDeclaringClass().getName()
                         + "." + original.getName();
                     registeredHooks.put(key, original);
+
+                    // ── Populate the install record so the
+                    //    IXUnhook handle returned to the module
+                    //    knows which backend succeeded and whether
+                    //    it can reverse.
+                    String backendName = d.getLastInstalledBackendName();
+                    Runnable reverse = d.getLastInstalledReverse();
+                    recordInstall(original, backendName, reverse);
                 }
             }
 
@@ -181,6 +213,10 @@ public class HookEngine {
                     String key = original.getDeclaringClass().getName()
                         + ".<init>" + original.getParameterCount();
                     log("[dispatcher] hooked constructor " + key);
+
+                    String backendName = d.getLastInstalledBackendName();
+                    Runnable reverse = d.getLastInstalledReverse();
+                    recordInstall(original, backendName, reverse);
                 }
             }
         });

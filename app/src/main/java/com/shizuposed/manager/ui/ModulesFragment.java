@@ -70,28 +70,28 @@ import java.util.concurrent.Executors;
  * Shows every installed Xposed module, with the built-in XStealth
  * pinned at the top of the list.
  *
- * APP LIST CACHING
- * ----------------
- * The scope editor needs the installed-app list, which requires
- * PackageManager.getInstalledApplications(GET_META_DATA | ...).
- * That call opens every installed APK and reads its manifest, which
- * costs 300-800ms on a device with 200+ apps. Running it on every
- * dialog open makes the dialog feel sluggish.
+ * ROW INTERACTION MODEL
+ * ---------------------
+ *   • Tapping the row body   → opens the scope editor (or the
+ *                              detail sheet for XStealth).
+ *   • Tapping the switch     → toggles the module.
+ *   • Tapping the icon       → opens the detail sheet.
+ *   • Long-pressing the row  → opens the module's own UI through
+ *                              ShizuPosed. Installs the self-hook
+ *                              that modules relying on
+ *                              MainActivity.isXposedEnabled() need.
  *
- * The fix is a two-layer cache:
+ * LAUNCH RESULT BROADCAST (R-6.5+)
+ * ---------------------------------
+ * launchUnderShizuPosed() now registers a receiver for
+ * ShizuPosedService.ACTION_LAUNCH_RESULT. The service broadcasts
+ * after the app_process spawn succeeds or fails, so the UI can
+ * report the real outcome instead of the optimistic "Launching…"
+ * toast the previous version showed unconditionally.
  *
- *   • A process-wide static list of ApplicationInfo, invalidated
- *     when the system broadcasts a package add / remove / change /
- *     replace. A short TTL bounds staleness if a broadcast is
- *     missed.
- *
- *   • An eager warm-up on fragment open, run on a background
- *     thread, so the first dialog open after the tab appears
- *     already has a populated cache.
- *
- * The scope editor is also async: it opens immediately with a
- * spinner, and the list populates when the query returns. If the
- * cache is warm (typical), the populate happens within a frame.
+ * An in-flight guard prevents double-taps from spawning two
+ * app_process instances, and an 8-second timeout clears the guard
+ * if the service never responds.
  */
 public class ModulesFragment extends Fragment {
     private RecyclerView moduleRecyclerView;
@@ -131,36 +131,28 @@ public class ModulesFragment extends Fragment {
     private volatile boolean scanInProgress = false;
     private volatile boolean viewReady = false;
 
-    /** Fires when XStealth's master toggle changes in SharedPreferences. */
     private SharedPreferences.OnSharedPreferenceChangeListener xStealthPrefsListener;
+
+    // ─── Launch result tracking ───────────────────────────────────
+    private BroadcastReceiver launchResultReceiver;
+    private static final String ACTION_LAUNCH_RESULT =
+        "com.shizuposed.manager.action.LAUNCH_RESULT";
+    private static final String EXTRA_LAUNCH_OK  = "ok";
+    private static final String EXTRA_LAUNCH_MSG = "message";
+    private static final String EXTRA_LAUNCH_PKG = "package";
+    private final Set<String> launchesInFlight = new HashSet<>();
+    private static final long LAUNCH_TIMEOUT_MS = 8_000L;
 
     // ═════════════════════════════════════════════════════════════
     // APP LIST CACHE
-    //
-    // Process-wide, not per-fragment. Two fragments (Modules tab and
-    // a future Repo tab or settings screen) that both need the list
-    // share the same cache.
-    //
-    // Volatile: reads and writes happen on different threads. The
-    // assignment of a fully-built List is atomic; no other state is
-    // shared.
     // ═════════════════════════════════════════════════════════════
 
     private static volatile List<ApplicationInfo> sCachedApps = null;
     private static volatile long sCachedAppsAt = 0L;
 
-    /** Defensive TTL in case a package-change broadcast is missed. */
     private static final long APP_CACHE_TTL_MS = 60_000L;
-
-    /** True while a background refresh is in flight. */
     private static volatile boolean sAppRefreshInFlight = false;
 
-    /**
-     * Receiver that clears the cache when the app set changes.
-     * Registered per-fragment but shared behavior: any instance that
-     * receives the broadcast clears the shared static cache, so a
-     * single registration is enough.
-     */
     private BroadcastReceiver packageChangeReceiver;
 
     private final ActivityResultLauncher<Intent> filePickerLauncher =
@@ -214,6 +206,7 @@ public class ModulesFragment extends Fragment {
         setupListeners();
         registerXStealthPrefsListener();
         registerPackageChangeReceiver();
+        registerLaunchResultReceiver();
         warmAppListCache();
         loadModules();
         startBackgroundScan();
@@ -225,6 +218,7 @@ public class ModulesFragment extends Fragment {
         viewReady = false;
         unregisterXStealthPrefsListener();
         unregisterPackageChangeReceiver();
+        unregisterLaunchResultReceiver();
         dismissAllDialogs();
         addModuleDialog = null;
         selectAppsDialog = null;
@@ -271,9 +265,6 @@ public class ModulesFragment extends Fragment {
     // APP LIST CACHE
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Return the cached app list if it's fresh, or null.
-     */
     private static List<ApplicationInfo> getCachedApps() {
         List<ApplicationInfo> cached = sCachedApps;
         if (cached == null) return null;
@@ -281,10 +272,6 @@ public class ModulesFragment extends Fragment {
         return cached;
     }
 
-    /**
-     * Query PackageManager for the full app list and store it in
-     * the cache. Called on a background thread only.
-     */
     private List<ApplicationInfo> queryInstalledApps() {
         if (packageManager == null) return new ArrayList<>();
         try {
@@ -303,15 +290,6 @@ public class ModulesFragment extends Fragment {
         }
     }
 
-    /**
-     * Warm the cache on fragment open. Runs on the appListExecutor,
-     * so it doesn't touch the UI thread. If the cache is already
-     * warm, this is a no-op.
-     *
-     * The result is discarded here — the next caller picks it up
-     * from the static cache. This exists purely to shift the query
-     * cost off the first user interaction.
-     */
     private void warmAppListCache() {
         if (getCachedApps() != null) return;
         if (sAppRefreshInFlight) return;
@@ -327,11 +305,6 @@ public class ModulesFragment extends Fragment {
         });
     }
 
-    /**
-     * Register a receiver that clears the cache when the installed
-     * app set changes. ACTION_PACKAGE_REPLACED handles updates that
-     * don't change the package name but do change metadata.
-     */
     private void registerPackageChangeReceiver() {
         if (!isAdded() || getContext() == null) return;
         try {
@@ -375,6 +348,77 @@ public class ModulesFragment extends Fragment {
                 .unregisterReceiver(packageChangeReceiver);
         } catch (Throwable ignored) {}
         packageChangeReceiver = null;
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // LAUNCH RESULT RECEIVER
+    // ═════════════════════════════════════════════════════════════
+
+    private void registerLaunchResultReceiver() {
+        if (!isAdded() || getContext() == null) return;
+        try {
+            launchResultReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    if (intent == null) return;
+                    if (!ACTION_LAUNCH_RESULT.equals(intent.getAction())) return;
+
+                    String pkg = intent.getStringExtra(EXTRA_LAUNCH_PKG);
+                    boolean ok = intent.getBooleanExtra(EXTRA_LAUNCH_OK, false);
+                    String msg = intent.getStringExtra(EXTRA_LAUNCH_MSG);
+
+                    if (pkg != null) {
+                        synchronized (launchesInFlight) {
+                            launchesInFlight.remove(pkg);
+                        }
+                    }
+
+                    if (!isAdded()) return;
+
+                    if (ok) {
+                        Toast.makeText(requireContext(),
+                            "Launched " + (pkg != null ? pkg : "app")
+                                + " under ShizuPosed",
+                            Toast.LENGTH_SHORT).show();
+                        if (logger != null) {
+                            logger.i("Launch succeeded for " + pkg);
+                        }
+                    } else {
+                        String reason = (msg != null && !msg.isEmpty())
+                            ? msg : "see Logs tab";
+                        Toast.makeText(requireContext(),
+                            "Launch failed: " + reason,
+                            Toast.LENGTH_LONG).show();
+                        if (logger != null) {
+                            logger.w("Launch failed for " + pkg + ": " + reason);
+                        }
+                    }
+                }
+            };
+
+            IntentFilter filter = new IntentFilter(ACTION_LAUNCH_RESULT);
+            Context ctx = requireContext().getApplicationContext();
+            if (Build.VERSION.SDK_INT >= 33) {
+                ctx.registerReceiver(launchResultReceiver, filter,
+                    Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                ctx.registerReceiver(launchResultReceiver, filter);
+            }
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.w("registerLaunchResultReceiver failed: " + t.getMessage());
+            }
+            launchResultReceiver = null;
+        }
+    }
+
+    private void unregisterLaunchResultReceiver() {
+        if (launchResultReceiver == null) return;
+        try {
+            requireContext().getApplicationContext()
+                .unregisterReceiver(launchResultReceiver);
+        } catch (Throwable ignored) {}
+        launchResultReceiver = null;
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -426,10 +470,39 @@ public class ModulesFragment extends Fragment {
         if (moduleRecyclerView == null) return;
         moduleAdapter = new ModuleAdapter(modules, requireContext());
         moduleAdapter.setOnModuleActionListener(new ModuleAdapter.OnModuleActionListener() {
-            @Override public void onToggle(ModuleInfo module, boolean enable) { toggleModule(module, enable); }
-            @Override public void onDetail(ModuleInfo module) { showModuleDetail(module); }
-            @Override public void onUninstall(ModuleInfo module) { uninstallModule(module); }
-            @Override public void onSelectApps(ModuleInfo module) { showSelectAppsDialog(module); }
+            @Override
+            public void onToggle(ModuleInfo module, boolean enable) {
+                toggleModule(module, enable);
+            }
+
+            @Override
+            public void onDetail(ModuleInfo module) {
+                showModuleDetail(module);
+            }
+
+            @Override
+            public void onUninstall(ModuleInfo module) {
+                uninstallModule(module);
+            }
+
+            @Override
+            public void onEditScope(ModuleInfo module) {
+                if (XStealthModule.PACKAGE.equals(module.packageName)) {
+                    showModuleDetail(module);
+                } else {
+                    showSelectAppsDialog(module);
+                }
+            }
+
+            @Override
+            public void onOpenModuleApp(ModuleInfo module) {
+                if (module == null || module.packageName == null) return;
+                if (XStealthModule.PACKAGE.equals(module.packageName)) {
+                    showModuleDetail(module);
+                    return;
+                }
+                launchUnderShizuPosed(module.packageName);
+            }
         });
         moduleRecyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
         moduleRecyclerView.setAdapter(moduleAdapter);
@@ -770,31 +843,75 @@ public class ModulesFragment extends Fragment {
 
     public void launchUnderShizuPosed(String packageName) {
         if (packageName == null) return;
-        if (!isAdded()) return;
-        if (shizukuHelper == null || !shizukuHelper.isAvailable() || !shizukuHelper.isAuthorized()) {
+        if (!isAdded() || getContext() == null) return;
+
+        if (shizukuHelper == null
+                || !shizukuHelper.isAvailable()
+                || !shizukuHelper.isAuthorized()) {
             Toast.makeText(requireContext(),
-                "Shizuku not available or not authorized", Toast.LENGTH_LONG).show();
+                "Shizuku not available or not authorized",
+                Toast.LENGTH_LONG).show();
+            if (logger != null) {
+                logger.w("launchUnderShizuPosed: Shizuku unavailable for "
+                    + packageName);
+            }
             return;
         }
+
+        synchronized (launchesInFlight) {
+            if (launchesInFlight.contains(packageName)) {
+                if (logger != null) {
+                    logger.d("launchUnderShizuPosed: already in flight for "
+                        + packageName);
+                }
+                return;
+            }
+            launchesInFlight.add(packageName);
+        }
+
         try {
             Intent svc = new Intent(requireContext(), ShizuPosedService.class);
             svc.setAction(ShizuPosedService.ACTION_LAUNCH_APP);
             svc.putExtra(ShizuPosedService.EXTRA_LAUNCH_PACKAGE, packageName);
             requireContext().startForegroundService(svc);
-            Toast.makeText(requireContext(),
-                "Launching " + packageName + " under ShizuPosed…",
-                Toast.LENGTH_SHORT).show();
-            if (logger != null) logger.i("Requested launch under ShizuPosed: " + packageName);
+
+            if (logger != null) {
+                logger.i("Dispatched launch for " + packageName
+                    + " — awaiting result broadcast");
+            }
+
+            mainHandler.postDelayed(() -> {
+                boolean stillPending;
+                synchronized (launchesInFlight) {
+                    stillPending = launchesInFlight.remove(packageName);
+                }
+                if (stillPending && isAdded()) {
+                    Toast.makeText(requireContext(),
+                        "Launch timed out. Check the Logs tab for details.",
+                        Toast.LENGTH_LONG).show();
+                    if (logger != null) {
+                        logger.w("Launch timed out for " + packageName);
+                    }
+                }
+            }, LAUNCH_TIMEOUT_MS);
+
         } catch (Throwable t) {
+            synchronized (launchesInFlight) {
+                launchesInFlight.remove(packageName);
+            }
             Toast.makeText(requireContext(),
-                "Failed to launch: " + t.getMessage(), Toast.LENGTH_LONG).show();
-            if (logger != null) logger.e("launchUnderShizuPosed failed: " + t.getMessage());
+                "Failed to dispatch launch: " + t.getMessage(),
+                Toast.LENGTH_LONG).show();
+            if (logger != null) {
+                logger.e("launchUnderShizuPosed dispatch failed: " + t.getMessage());
+            }
         }
     }
 
     // ═════════════════════════════════════════════════════════════
     // SCOPE EDITOR
     // ═════════════════════════════════════════════════════════════
+
     public void openScopeEditor(ModuleInfo module) {
         if (module == null || !isAdded() || !viewReady) return;
         if (XStealthModule.PACKAGE.equals(module.packageName)) return;
@@ -823,8 +940,6 @@ public class ModulesFragment extends Fragment {
         TextView tvSelectedCount = dialogView.findViewById(R.id.tvSelectedCount);
         MaterialCheckBox cbHideSystem = dialogView.findViewById(R.id.cbHideSystem);
 
-        // ── Selection state is initialized from the module and
-        //    survives the async list load.
         Set<String> currentSelection = new HashSet<>();
         if (module.hookedApps != null) currentSelection.addAll(module.hookedApps);
 
@@ -846,9 +961,6 @@ public class ModulesFragment extends Fragment {
             dialogSpinner.setVisibility(View.VISIBLE);
         }
 
-        // ── Search, hide-system, chip state. These work on the
-        //    filtered list once it's populated. Until then they're
-        //    inert — the adapters are empty so nothing happens.
         final List<ApplicationInfo> source = new ArrayList<>();
         final List<ApplicationInfo> userApps = new ArrayList<>();
         final List<ApplicationInfo> allAppsRef = new ArrayList<>();
@@ -913,19 +1025,15 @@ public class ModulesFragment extends Fragment {
         }
         if (btnApply != null) btnApply.setVisibility(View.GONE);
 
-        // ── Async populate. The dialog is already built; the list
-        //    appears when this completes.
         final String selfPkg = module.packageName;
         if (appListExecutor != null && !appListExecutor.isShutdown()) {
             appListExecutor.execute(() -> {
-                // Use the cache if warm, otherwise query.
                 List<ApplicationInfo> all = getCachedApps();
                 if (all == null) {
                     all = queryInstalledApps();
                 }
                 List<ApplicationInfo> filtered = filterForScopeEditor(all, selfPkg);
 
-                // Split into user and system.
                 List<ApplicationInfo> users = new ArrayList<>();
                 for (ApplicationInfo app : filtered) {
                     if ((app.flags & ApplicationInfo.FLAG_SYSTEM) == 0) users.add(app);
@@ -943,7 +1051,6 @@ public class ModulesFragment extends Fragment {
                     userApps.clear();
                     userApps.addAll(finalUsers);
 
-                    // Respect the current hide-system toggle state.
                     boolean hideSystem = cbHideSystem == null || cbHideSystem.isChecked();
                     source.clear();
                     source.addAll(hideSystem ? finalUsers : finalAll);
@@ -984,11 +1091,6 @@ public class ModulesFragment extends Fragment {
         selectAppsDialog.show();
     }
 
-    /**
-     * Filter the full app list down to what the scope editor should
-     * show. Removes the manager itself, the module being scoped, and
-     * every other installed module.
-     */
     private List<ApplicationInfo> filterForScopeEditor(List<ApplicationInfo> all,
                                                        String selfPackage) {
         List<ApplicationInfo> out = new ArrayList<>();
@@ -1030,7 +1132,7 @@ public class ModulesFragment extends Fragment {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // UNINSTALL
+    // UNINSTALL (full — deregister + remove APK)
     // ═════════════════════════════════════════════════════════════
 
     public void uninstallModule(ModuleInfo module) {
@@ -1055,31 +1157,51 @@ public class ModulesFragment extends Fragment {
         }
 
         confirmDialog = new AlertDialog.Builder(requireContext())
-            .setTitle("Uninstall Module")
-            .setMessage("Remove " + (module.name != null ? module.name : module.packageName)
-                + " from ShizuPosed?\n\nThe module APK itself is not touched.")
-            .setPositiveButton("Remove", (dialog, which) -> {
-                if (moduleLoader == null) return;
-                try {
-                    boolean removed = moduleLoader.uninstallModule(module.packageName);
-                    if (removed) {
-                        onModuleRemoved(module.packageName);
-                        if (isAdded()) Toast.makeText(requireContext(),
-                            "Removed from ShizuPosed", Toast.LENGTH_SHORT).show();
-                        if (logger != null) logger.i("Removed module: " + module.packageName);
-                    } else {
-                        if (isAdded()) Toast.makeText(requireContext(),
-                            "Failed to remove", Toast.LENGTH_SHORT).show();
-                    }
-                } catch (Exception e) {
-                    if (isAdded()) Toast.makeText(requireContext(),
-                        "Failed: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-                    if (logger != null) logger.e("Uninstall error: " + e.getMessage());
-                }
-            })
+            .setTitle("Uninstall "
+                + (module.name != null ? module.name : module.packageName) + "?")
+            .setMessage("This will:\n\n"
+                + "• Remove the module from ShizuPosed\n"
+                + "• Uninstall the app from your device\n\n"
+                + "You will see the system uninstall dialog next.")
+            .setPositiveButton("Uninstall", (dialog, which) -> performFullUninstall(module))
             .setNegativeButton("Cancel", null)
             .create();
         confirmDialog.show();
+    }
+
+    private void performFullUninstall(ModuleInfo module) {
+        if (module == null || !isAdded() || getContext() == null) return;
+        if (moduleLoader == null) return;
+
+        moduleLoader.uninstallModuleCompletely(
+            requireContext(),
+            module.packageName,
+            (code, message) -> {
+                if (!isAdded()) return;
+                switch (code) {
+                    case ModuleLoader.UNINSTALL_OK:
+                        onModuleRemoved(module.packageName);
+                        Toast.makeText(requireContext(),
+                            "Deregistered. Confirm the system dialog to remove the app.",
+                            Toast.LENGTH_LONG).show();
+                        break;
+                    case ModuleLoader.UNINSTALL_DEREGISTERED_ONLY:
+                        onModuleRemoved(module.packageName);
+                        Toast.makeText(requireContext(), message,
+                            Toast.LENGTH_LONG).show();
+                        break;
+                    case ModuleLoader.UNINSTALL_BUILTIN:
+                        Toast.makeText(requireContext(), message,
+                            Toast.LENGTH_SHORT).show();
+                        break;
+                    case ModuleLoader.UNINSTALL_FAILED:
+                    default:
+                        Toast.makeText(requireContext(),
+                            "Uninstall failed: " + message,
+                            Toast.LENGTH_LONG).show();
+                        break;
+                }
+            });
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -1326,13 +1448,21 @@ public class ModulesFragment extends Fragment {
         module.apkPath = selectedApkPath;
         module.enabled = true;
         module.hookedApps = new HashSet<>();
+        module.manuallyAdded = true;
 
         try {
             moduleLoader.installModule(module);
             loadModules();
 
-            if (selectedApkPath.startsWith(requireContext().getCacheDir().getAbsolutePath())) {
-                File cacheFile = new File(selectedApkPath);
+            // Only delete the cache copy if installModule() did NOT
+            // rewrite apkPath to point somewhere durable. If it
+            // copied the APK to filesDir/imported_modules/, the
+            // cache file is no longer referenced and can be removed.
+            String resolved = module.apkPath;
+            if (resolved != null
+                    && resolved.startsWith(
+                        requireContext().getCacheDir().getAbsolutePath())) {
+                File cacheFile = new File(resolved);
                 if (cacheFile.exists()) cacheFile.delete();
             }
 

@@ -25,14 +25,15 @@ import com.shizuposed.manager.utils.Logger;
 import com.shizuposed.manager.utils.MarkdownRenderer;
 
 /**
- * Detail sheet for a module in the Repo tab.
+ * RepoDetailSheet
  *
- * Shows metadata, quick actions, and a tabbed content area with
- * README and Details views.
+ * Detail view for a module in the Repo tab. LSPosed-style: header,
+ * three sub-tabs (Readme / Releases / Info).
  *
- * The README, if present, is rendered from Markdown to Spannable.
- * Links inside it are clickable via LinkMovementMethod, which
- * forwards to the system browser.
+ * README tab: renders the module's bundled README.md if present.
+ * RELEASES tab: shows the current version. If the module bundles a
+ *   CHANGELOG.md or similar, renders it. Otherwise a placeholder.
+ * INFO tab: metadata table plus Homepage / Support buttons.
  */
 public class RepoDetailSheet extends BottomSheetDialogFragment {
 
@@ -42,26 +43,25 @@ public class RepoDetailSheet extends BottomSheetDialogFragment {
     private Logger logger;
     private volatile boolean viewReady = false;
 
+    // RepoModuleInfo is passed directly; the Bundle only carries the
+    // package name for restoration.
+    private static RepoModuleInfo sPendingInfo;
+
     public static RepoDetailSheet newInstance(RepoModuleInfo info) {
         RepoDetailSheet s = new RepoDetailSheet();
         Bundle b = new Bundle();
         b.putString(ARG_PACKAGE,
             info != null && info.module != null ? info.module.packageName : null);
         s.setArguments(b);
-        // The full RepoModuleInfo is held statically to avoid
-        // Serializable round-trips through the Bundle. Set before
-        // show() by the fragment.
-        s.pendingInfo = info;
+        sPendingInfo = info;
         return s;
     }
-
-    private RepoModuleInfo pendingInfo;
 
     @Override
     public void onAttach(@NonNull Context context) {
         super.onAttach(context);
         logger = Logger.getInstance(context);
-        if (info == null) info = pendingInfo;
+        if (info == null) info = sPendingInfo;
     }
 
     @Nullable
@@ -123,7 +123,7 @@ public class RepoDetailSheet extends BottomSheetDialogFragment {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // ACTIONS
+    // ACTION BUTTONS
     // ═════════════════════════════════════════════════════════════
 
     private void bindActions(View v) {
@@ -133,8 +133,7 @@ public class RepoDetailSheet extends BottomSheetDialogFragment {
         if (btnHomepage != null) {
             if (info.homepage != null && !info.homepage.isEmpty()) {
                 btnHomepage.setVisibility(View.VISIBLE);
-                btnHomepage.setOnClickListener(x ->
-                    openUrl(info.homepage));
+                btnHomepage.setOnClickListener(x -> openUrl(info.homepage));
             } else {
                 btnHomepage.setVisibility(View.GONE);
             }
@@ -143,8 +142,7 @@ public class RepoDetailSheet extends BottomSheetDialogFragment {
         if (btnSupport != null) {
             if (info.supportUrl != null && !info.supportUrl.isEmpty()) {
                 btnSupport.setVisibility(View.VISIBLE);
-                btnSupport.setOnClickListener(x ->
-                    openUrl(info.supportUrl));
+                btnSupport.setOnClickListener(x -> openUrl(info.supportUrl));
             } else {
                 btnSupport.setVisibility(View.GONE);
             }
@@ -171,10 +169,12 @@ public class RepoDetailSheet extends BottomSheetDialogFragment {
     private void bindTabs(View v) {
         TabLayout tabs = v.findViewById(R.id.tlRepoDetailTabs);
         View readmeContainer = v.findViewById(R.id.svRepoReadmeContainer);
-        View detailsContainer = v.findViewById(R.id.svRepoDetailsContainer);
+        View releasesContainer = v.findViewById(R.id.svRepoReleasesContainer);
+        View infoContainer = v.findViewById(R.id.svRepoInfoContainer);
 
         bindReadme(v);
-        bindDetails(v);
+        bindReleases(v);
+        bindInfo(v);
 
         if (tabs != null) {
             tabs.addOnTabSelectedListener(new TabLayout.OnTabSelectedListener() {
@@ -184,22 +184,25 @@ public class RepoDetailSheet extends BottomSheetDialogFragment {
                     if (readmeContainer != null) {
                         readmeContainer.setVisibility(pos == 0 ? View.VISIBLE : View.GONE);
                     }
-                    if (detailsContainer != null) {
-                        detailsContainer.setVisibility(pos == 1 ? View.VISIBLE : View.GONE);
+                    if (releasesContainer != null) {
+                        releasesContainer.setVisibility(pos == 1 ? View.VISIBLE : View.GONE);
+                    }
+                    if (infoContainer != null) {
+                        infoContainer.setVisibility(pos == 2 ? View.VISIBLE : View.GONE);
                     }
                 }
                 @Override public void onTabUnselected(TabLayout.Tab tab) {}
                 @Override public void onTabReselected(TabLayout.Tab tab) {}
             });
 
-            // Default: README tab if the module has one, otherwise
-            // Details. Nothing is worse than opening a detail sheet
-            // onto an empty README tab.
-            int defaultTab = info.hasReadme() ? 0 : 1;
+            // Default tab: README if the module has one, otherwise Info.
+            int defaultTab = info.hasReadme() ? 0 : 2;
             TabLayout.Tab tab = tabs.getTabAt(defaultTab);
             if (tab != null) tab.select();
         }
     }
+
+    // ─── README tab ──────────────────────────────────────────────
 
     private void bindReadme(View v) {
         TextView readme = v.findViewById(R.id.tvRepoReadmeContent);
@@ -223,7 +226,36 @@ public class RepoDetailSheet extends BottomSheetDialogFragment {
         }
     }
 
-    private void bindDetails(View v) {
+    // ─── RELEASES tab ────────────────────────────────────────────
+
+    private void bindReleases(View v) {
+        TextView version = v.findViewById(R.id.tvRepoReleaseVersion);
+        TextView changelog = v.findViewById(R.id.tvRepoReleaseChangelog);
+        TextView empty = v.findViewById(R.id.tvRepoReleaseEmpty);
+
+        if (version != null) {
+            version.setText(info.module.version != null
+                ? "Current version: v" + info.module.version
+                : "Version: unknown");
+        }
+
+        // Check if a changelog is bundled. RepoModuleInfo doesn't
+        // currently carry one — this is a placeholder for a future
+        // addition. For now, show the empty state.
+        if (changelog != null) {
+            changelog.setVisibility(View.GONE);
+        }
+        if (empty != null) {
+            empty.setText("No release notes bundled in this module.\n\n"
+                + "Module authors can include one by adding\n"
+                + "assets/CHANGELOG.md to the module APK.");
+            empty.setVisibility(View.VISIBLE);
+        }
+    }
+
+    // ─── INFO tab ────────────────────────────────────────────────
+
+    private void bindInfo(View v) {
         TextView tv = v.findViewById(R.id.tvRepoDetailsContent);
         if (tv == null) return;
 

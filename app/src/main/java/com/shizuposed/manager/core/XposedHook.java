@@ -44,31 +44,11 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 @SuppressWarnings({"unchecked", "rawtypes", "deprecation"})
 public class XposedHook {
 
-    // ═════════════════════════════════════════════════════════════════
-    // SHELL BASE DIRECTORY
-    //
-    // Determined at class-load time. Prefers the value set by
-    // ShizuPosedService via -Dshizuposed.shell.base=<path>, which the
-    // service has already confirmed writable. Falls back to probing
-    // both candidates if the property is absent, so XposedHook can
-    // still be launched manually for debugging.
-    //
-    // Every path below this point derives from BASE_DIR, so both the
-    // manager and the shell process agree on where the payload lives
-    // without the shell needing to know the manager's internal state.
-    // ═════════════════════════════════════════════════════════════════
-
-    /** Primary candidate, matches ShizuPosedService.SHELL_BASE_CANDIDATES[0]. */
     private static final String SHELL_BASE_PRIMARY =
         "/data/user/0/com.android.shell/files/.syscall_cache";
 
-    /** Fallback candidate, matches ShizuPosedService.SHELL_BASE_CANDIDATES[1]. */
     private static final String SHELL_BASE_FALLBACK =
         "/data/local/tmp/shizuposed";
-
-    // ─── resolved paths ───────────────────────────────────────────────
-    // Initialized in the static block below. Non-final because they
-    // depend on the runtime property, but never reassigned after init.
 
     private static final String BASE_DIR;
     private static final String MODULES_DIR;
@@ -87,12 +67,9 @@ public class XposedHook {
         LOG_FILE     = base + "/xposed.log";
     }
 
-    // ─── native library names ─────────────────────────────────────────
-
     private static final String LIB_AMIRU       = "libamiru.so";
     private static final String LIB_SHIZUPOSED  = "libshizuposed.so";
-        private static final String LIB_CALLSITE  = "libcallsite.so";
-    // ─── state ────────────────────────────────────────────────────────
+    private static final String LIB_CALLSITE    = "libcallsite.so";
 
     private static int myPid = 0;
     private static int myUid = 0;
@@ -100,14 +77,10 @@ public class XposedHook {
     private static int targetUid = -1;
 
     private static final Map<String, Object> moduleInstances = new ConcurrentHashMap<>();
-
     private static final List<String> loadedModuleNames = new ArrayList<>();
 
-    /** Track which native libs loaded, for the marker/diagnostics. */
     private static volatile boolean amiruLoaded = false;
     private static volatile boolean shizuposedLoaded = false;
-
-    // ─── data holder ──────────────────────────────────────────────────
 
     private static final class ModuleInfo {
         String packageName;
@@ -203,15 +176,35 @@ public class XposedHook {
 
             boolean useBootstrap = (targetUid > 0);
 
-            HookEngine.setShellLibsDir(
-                System.getProperty("shizuposed.shell.libs", LIBS_DIR));
-
             HookEngine.ensureBackendInstalled();
 
             // ── IXposedHookCmdInit dispatch ───────────────────────────
             dispatchCmdInit(args, targetPackage);
 
             ResourceHooking.getInstanceSafe().init();
+
+            // ── Hook delay ────────────────────────────────────────────
+            // An optional pause between when the framework starts in
+            // the target process and when it begins driving the
+            // target's bootstrap. Set by ShizuPosedService via
+            // -Dshizuposed.hook.delay=<ms>. Default is 0 — no delay.
+            //
+            // A small delay helps on ROMs where the framework races
+            // the target's own initialization. Higher values add
+            // launch latency. Bounded in RuntimePrefs to [0, 2000].
+            try {
+                int hookDelayMs = Integer.parseInt(
+                    System.getProperty("shizuposed.hook.delay", "0"));
+                if (hookDelayMs > 0) {
+                    log("Hook delay: sleeping " + hookDelayMs + "ms before bootstrap");
+                    try {
+                        Thread.sleep(hookDelayMs);
+                    } catch (InterruptedException ignored) {}
+                    log("Hook delay: done");
+                }
+            } catch (Throwable t) {
+                log("Hook delay parse failed: " + t.getMessage());
+            }
 
             if (useBootstrap) {
                 log("Mode: BOOTSTRAP (target uid " + targetUid + ")");
@@ -246,28 +239,28 @@ public class XposedHook {
         try {
             System.load(szpPath);
             shizuposedLoaded = true;
-            log("✅ Loaded " + LIB_SHIZUPOSED + " from " + szpPath);
+            log("Loaded " + LIB_SHIZUPOSED + " from " + szpPath);
         } catch (Throwable t) {
             shizuposedLoaded = false;
-            log("⚠️ " + LIB_SHIZUPOSED + " not loaded: " + t.getMessage());
+            log(LIB_SHIZUPOSED + " not loaded: " + t.getMessage());
         }
 
         String amiruPath = libDir + "/" + LIB_AMIRU;
         try {
             System.load(amiruPath);
             amiruLoaded = true;
-            log("✅ Loaded " + LIB_AMIRU + " from " + amiruPath);
+            log("Loaded " + LIB_AMIRU + " from " + amiruPath);
         } catch (Throwable t) {
             amiruLoaded = false;
-            log("⚠️ " + LIB_AMIRU + " not loaded (optional): " + t.getMessage());
+            log(LIB_AMIRU + " not loaded (optional): " + t.getMessage());
         }
 
         String callsitePath = libDir + "/" + LIB_CALLSITE;
         if (new File(callsitePath).exists()) {
-            log("ℹ️ " + LIB_CALLSITE + " present at " + callsitePath
+            log(LIB_CALLSITE + " present at " + callsitePath
                 + " (load happens in HookEngine)");
         } else {
-            log("ℹ️ " + LIB_CALLSITE + " not present — CallSite backend "
+            log(LIB_CALLSITE + " not present — CallSite backend "
                 + "will report unavailable");
         }
 
@@ -491,7 +484,8 @@ public class XposedHook {
                                                    ApplicationInfo appInfo) {
         try {
             Class<?> at = Class.forName("android.app.ActivityThread");
-            Class<?> compatInfoClass = Class.forName("android.content.res.CompatibilityInfo");
+            Class<?> compatInfoClass =
+                Class.forName("android.content.res.CompatibilityInfo");
 
             Method getPackageInfoNoCheck = findMethodAny(at, "getPackageInfoNoCheck",
                 new Class<?>[]{ApplicationInfo.class, compatInfoClass},
@@ -603,7 +597,8 @@ public class XposedHook {
                                             String pkg) {
         try {
             Class<?> at = Class.forName("android.app.ActivityThread");
-            Class<?> dataClass = Class.forName("android.app.ActivityThread$AppBindData");
+            Class<?> dataClass = Class.forName(
+                "android.app.ActivityThread$AppBindData");
 
             Method bindApplication = findMethodAny(at, "handleBindApplication",
                 new Class<?>[]{dataClass},
@@ -651,7 +646,8 @@ public class XposedHook {
         try {
             Class<?> compatInfoClass = Class.forName(
                 "android.content.res.CompatibilityInfo");
-            Field defaultCompat = compatInfoClass.getField("DEFAULT_COMPATIBILITY_INFO");
+            Field defaultCompat = compatInfoClass.getField(
+                "DEFAULT_COMPATIBILITY_INFO");
             Object compat = defaultCompat.get(null);
             setFieldAny(data, compat, "compatInfo", "compatibilityInfo");
         } catch (Throwable ignored) {}
@@ -764,7 +760,8 @@ public class XposedHook {
     private static XC_LoadPackage.LoadPackageParam buildLoadPackageParam(
             String pkg, ClassLoader appLoader, ApplicationInfo appInfo) {
 
-        XC_LoadPackage.LoadPackageParam param = new XC_LoadPackage.LoadPackageParam();
+        XC_LoadPackage.LoadPackageParam param =
+            new XC_LoadPackage.LoadPackageParam();
         param.packageName = pkg;
         param.processName = pkg;
         param.classLoader = appLoader;
@@ -796,10 +793,6 @@ public class XposedHook {
             List<ModuleInfo> modules = loadApplicableModules(pkg);
             if (modules.isEmpty()) {
                 log("No applicable modules for " + pkg);
-                // Even with no modules to load, install the global
-                // inflate hook. A module can register layout callbacks
-                // from handleInitPackageResources, which fires
-                // independently of handleLoadPackage.
                 try {
                     ResourceHooking.getInstanceSafe()
                         .installGlobalLayoutHook(pkg, appLoader);
@@ -817,10 +810,6 @@ public class XposedHook {
                 if (loadModule(m, null, appLoader, param)) loaded++;
             }
 
-            // Install the global inflate hook before bindApplication()
-            // drives Application.onCreate. Layouts inflated during
-            // Application.onCreate and later will fire
-            // XC_LayoutInflated callbacks.
             try {
                 ResourceHooking.getInstanceSafe()
                     .installGlobalLayoutHook(pkg, appLoader);
@@ -828,7 +817,8 @@ public class XposedHook {
                 log("installGlobalLayoutHook failed: " + t.getMessage());
             }
 
-            log("Installed hooks from " + loaded + " module(s) before Application start");
+            log("Installed hooks from " + loaded
+                + " module(s) before Application start");
             return loaded;
         } catch (Throwable t) {
             log("installModuleHooks failed: " + t);
@@ -946,9 +936,6 @@ public class XposedHook {
                 log("Resource hooking setup failed: " + t.getMessage());
             }
 
-            // Install the global inflate hook. Runs after
-            // Application.onCreate, so layouts already inflated are
-            // missed — the callback fires only for future inflations.
             try {
                 ResourceHooking.getInstanceSafe()
                     .installGlobalLayoutHook(pkg, appLoader);
@@ -956,8 +943,8 @@ public class XposedHook {
                 log("installGlobalLayoutHook failed: " + t.getMessage());
             }
 
-            log("Injection complete: " + loaded + " module(s) loaded into " + pkg
-                + " (pid=" + myPid + ")");
+            log("Injection complete: " + loaded
+                + " module(s) loaded into " + pkg + " (pid=" + myPid + ")");
             writeStatus("HOOKED", pkg + "|pid=" + myPid + "|modules=" + loaded
                 + "|bootstrap=false");
 
@@ -1014,11 +1001,9 @@ public class XposedHook {
             }
 
             if (!tmp.renameTo(f)) {
-                //noinspection ResultOfMethodCallIgnored
                 f.delete();
                 if (!tmp.renameTo(f)) {
                     log("writeHookedMarker: rename failed for " + pkg);
-                    //noinspection ResultOfMethodCallIgnored
                     tmp.delete();
                     return;
                 }
@@ -1039,6 +1024,7 @@ public class XposedHook {
     // ═════════════════════════════════════════════════════════════════
     // MODULE DISCOVERY
     // ═════════════════════════════════════════════════════════════════
+
     private static List<ModuleInfo> loadApplicableModules(String pkg) {
         List<ModuleInfo> result = new ArrayList<>();
 
@@ -1064,11 +1050,6 @@ public class XposedHook {
                 boolean isBuiltIn = isBuiltInModule(info.packageName);
 
                 if (!isBuiltIn) {
-                    // Self-hook bypass: if the target package equals
-                    // the module's own package, include the module
-                    // unconditionally. Handles modules whose "am I
-                    // activated?" check is a self-hook on one of
-                    // their own UI methods.
                     boolean isSelf = info.packageName != null
                         && info.packageName.equals(pkg);
 
@@ -1076,13 +1057,15 @@ public class XposedHook {
 
                     if (info.cachedDexPath == null
                             || !new File(info.cachedDexPath).exists()) {
-                        log("Skipping module " + info.packageName + " — dex missing");
+                        log("Skipping module " + info.packageName
+                            + " — dex missing");
                         continue;
                     }
 
                     if (isSelf) {
                         log("loadApplicableModules: including module "
-                            + info.packageName + " for its own launch (self-hook)");
+                            + info.packageName
+                            + " for its own launch (self-hook)");
                     }
                 }
 

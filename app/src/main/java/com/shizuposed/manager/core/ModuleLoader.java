@@ -39,43 +39,27 @@ import java.util.zip.ZipFile;
  *   • Installing / uninstalling / saving modules
  *   • Scanning APKs for entry points (assets/xposed_init) and caching the
  *     module dex so XposedHook can load it from the shell side.
- *   • Reading assets/scope.list to populate ModuleInfo.recommendedApps,
- *     the LSPosed-convention recommended scope used by the scope editor.
+ *   • Reading assets/scope.list to populate ModuleInfo.recommendedApps.
  *
- * CACHE COHERENCE
- * ---------------
- * loadModules() clears and repopulates the cache in place. Multiple
- * callers invoke it — the Modules fragment, the Repo fragment, the
- * service's worker thread. If one caller is mid-load while another
- * reads getCachedModules(), the reader sees a partial or empty map.
+ * UNINSTALL SEMANTICS (R-6.5+)
+ * ----------------------------
+ * Two distinct uninstall operations:
  *
- * ModuleScanner reads the cache to decide which modules are already
- * registered. A partial cache makes it think freshly-registered
- * modules are new, which surfaces as a spurious "N modules detected"
- * notification on app open.
+ *   • uninstallModule(pkg) — legacy deregister-only path. Removes
+ *     the JSON descriptor and cached dex, leaves the APK installed.
+ *     Used by the scanner's automatic purge pass.
  *
- * The fix is a ReentrantReadWriteLock. loadModules() holds the write
- * lock while it clears and repopulates. Every reader holds the read
- * lock. Readers never observe a load in progress, and two loads never
- * interleave.
+ *   • uninstallModuleCompletely(ctx, pkg, callback) — full uninstall.
+ *     Deregisters AND dispatches ACTION_DELETE so the user is
+ *     prompted to remove the actual APK. Must be called from an
+ *     Activity context.
  *
- * XStealth
- * --------
- * XStealth is a built-in module: it has no APK, no cached dex, and
- * no JSON descriptor on disk. It's synthesized into the module list
- * on every loadModules() call, with its enabled state and scope
- * read from XStealthPrefs. Because it has no on-disk representation,
- * installModule/saveModule/uninstallModule all refuse to touch it.
- *
- * RECOMMENDED SCOPE
- * -----------------
- * recommendedApps is always sourced from the APK, never trusted from
- * the JSON descriptor alone. installModule() and loadModules() both
- * call readRecommendedScope() so a module that adds or changes its
- * scope.list in an update picks up the change without a re-install.
- * When the APK read yields an empty set, the JSON's existing value
- * is preserved — a transient zip read failure must not wipe a
- * previously-known scope.
+ * MANUAL ADD PROTECTION (R-6.5+)
+ * ------------------------------
+ * Manual entries carry ModuleInfo.manuallyAdded=true. The scanner
+ * skips purging them. Additionally, if a manual install's APK path
+ * was inside the app cache, installModule() copies the APK into
+ * filesDir/imported_modules/ so the path survives cache cleanup.
  */
 public class ModuleLoader {
     private static final String TAG = "ModuleLoader";
@@ -91,18 +75,17 @@ public class ModuleLoader {
 
     private final ConcurrentHashMap<String, ModuleInfo> loadedModules = new ConcurrentHashMap<>();
 
-    // ── FIX: cache coherence lock.
-    //
-    // loadModules() takes the write lock and holds it across the
-    // clear + repopulate sequence. Every reader takes the read lock
-    // for the duration of its read. This guarantees that no reader
-    // observes a partially-populated cache, and that two concurrent
-    // loads do not interleave their clear/repopulate passes.
-    //
-    // Fairness is left off (default). Read-heavy workloads benefit;
-    // a write waiting on a read will eventually get its turn because
-    // ReentrantReadWriteLock does not starve writers indefinitely.
     private final ReentrantReadWriteLock cacheLock = new ReentrantReadWriteLock();
+
+    /** Result codes for uninstallModuleCompletely(). */
+    public static final int UNINSTALL_OK = 0;
+    public static final int UNINSTALL_DEREGISTERED_ONLY = 1;
+    public static final int UNINSTALL_BUILTIN = 2;
+    public static final int UNINSTALL_FAILED = 3;
+
+    public interface UninstallCallback {
+        void onResult(int code, String message);
+    }
 
     private ModuleLoader(Context context) {
         this.context = context.getApplicationContext();
@@ -182,11 +165,6 @@ public class ModuleLoader {
     // ═════════════════════════════════════════════════════════════════
 
     public List<ModuleInfo> loadModules() {
-        // ── FIX: hold the write lock across the whole clear +
-        // repopulate sequence. A reader that calls getCachedModules()
-        // during this method blocks until the load completes, so it
-        // sees either the old cache or the new one — never a partial
-        // or empty intermediate state.
         cacheLock.writeLock().lock();
         try {
             List<ModuleInfo> modules = new ArrayList<>();
@@ -218,12 +196,8 @@ public class ModuleLoader {
                             ModuleInfo module = gson.fromJson(json, ModuleInfo.class);
                             if (module == null || module.packageName == null) continue;
 
-                            // Never trust a JSON that claims to be XStealth.
-                            // The built-in entry below is the only source.
                             if (XStealthModule.PACKAGE.equals(module.packageName)) continue;
 
-                            // Defensive: Gson leaves the field null if the
-                            // JSON has no recommendedApps key.
                             if (module.recommendedApps == null) {
                                 module.recommendedApps = new HashSet<>();
                             }
@@ -244,11 +218,6 @@ public class ModuleLoader {
                                 }
                             }
 
-                            // Refresh recommended scope from the APK on
-                            // every load. Cheap — one zip entry read. Only
-                            // overwrites the JSON value when the APK read
-                            // produced a non-empty set, so a transient read
-                            // failure cannot wipe a previously-known scope.
                             if (module.apkPath != null) {
                                 try {
                                     Set<String> fresh = readRecommendedScope(module.apkPath);
@@ -308,7 +277,6 @@ public class ModuleLoader {
                     }
                 }
 
-                // Synthesize the built-in XStealth entry from XStealthPrefs.
                 registerXStealth(modules);
 
                 if (modules.isEmpty()) {
@@ -326,7 +294,6 @@ public class ModuleLoader {
     }
 
     public List<ModuleInfo> getCachedModules() {
-        // ── FIX: read lock. Blocks while a load is in progress.
         cacheLock.readLock().lock();
         try {
             return new ArrayList<>(loadedModules.values());
@@ -335,12 +302,6 @@ public class ModuleLoader {
         }
     }
 
-    /**
-     * Build the synthetic XStealth ModuleInfo from current prefs.
-     * Appended to the list and inserted into the cache. Always
-     * present, regardless of whether the toggle is on — the row
-     * needs to exist so users can turn it on.
-     */
     private void registerXStealth(List<ModuleInfo> out) {
         try {
             ModuleInfo x = new ModuleInfo();
@@ -386,7 +347,8 @@ public class ModuleLoader {
 
             try {
                 PackageManager pm = context.getPackageManager();
-                android.content.pm.PackageInfo pkgInfo = pm.getPackageInfo(module.packageName, 0);
+                android.content.pm.PackageInfo pkgInfo =
+                    pm.getPackageInfo(module.packageName, 0);
                 if (pkgInfo != null) {
                     module.version = pkgInfo.versionName;
                     if (module.name == null || module.name.isEmpty()) {
@@ -396,9 +358,41 @@ public class ModuleLoader {
             } catch (PackageManager.NameNotFoundException ignored) {
             }
 
-            if (module.apkPath == null || !new File(module.apkPath).exists()) {
-                String fromPm = findModuleApkPath(module.packageName);
-                if (fromPm != null) module.apkPath = fromPm;
+            // ── APKPATH RESOLUTION ──────────────────────────────
+            // Prefer the installed APK path. If the caller passed a
+            // transient cache path AND the package isn't actually
+            // installed, copy the APK into ShizuPosed's private
+            // storage so the path survives cache cleanup.
+            String installedApkPath = findModuleApkPath(module.packageName);
+            if (installedApkPath != null && !installedApkPath.isEmpty()) {
+                module.apkPath = installedApkPath;
+            } else {
+                String callerPath = module.apkPath;
+                boolean callerPathValid = callerPath != null
+                    && new File(callerPath).exists();
+
+                if (callerPathValid && isInCacheDir(callerPath)) {
+                    String durable = copyApkToPrivateStorage(
+                        callerPath, module.packageName);
+                    if (durable != null) {
+                        module.apkPath = durable;
+                        if (logger != null) {
+                            logger.i("installModule: copied transient APK "
+                                + "to durable storage: " + durable);
+                        }
+                    } else {
+                        if (logger != null) {
+                            logger.w("installModule: could not copy APK "
+                                + "to durable storage for " + module.packageName);
+                        }
+                    }
+                } else if (!callerPathValid) {
+                    if (logger != null) {
+                        logger.w("installModule: no resolvable apkPath for "
+                            + module.packageName + " (caller path="
+                            + callerPath + ")");
+                    }
+                }
             }
 
             try {
@@ -430,6 +424,8 @@ public class ModuleLoader {
                 module.recommendedApps = new HashSet<>();
             }
 
+            module.lastUpdated = System.currentTimeMillis();
+
             File moduleFile = new File(moduleDir, module.packageName + ".json");
             String json = gson.toJson(module);
             FileUtils.writeFile(moduleFile, json);
@@ -440,7 +436,6 @@ public class ModuleLoader {
                 return false;
             }
 
-            // ── FIX: write lock for the cache mutation.
             cacheLock.writeLock().lock();
             try {
                 loadedModules.put(module.packageName, module);
@@ -451,6 +446,8 @@ public class ModuleLoader {
             logger.i("Installed module: " + module.packageName
                 + " (dex=" + module.cachedDexPath + ", entry=" + module.xposedInit
                 + ", hasUi=" + module.hasUi
+                + ", manual=" + module.manuallyAdded
+                + ", apkPath=" + module.apkPath
                 + ", recommended=" + module.getRecommendedAppCount() + ")");
             return true;
         } catch (Exception e) {
@@ -484,11 +481,12 @@ public class ModuleLoader {
                 module.recommendedApps = new HashSet<>();
             }
 
+            module.lastUpdated = System.currentTimeMillis();
+
             File moduleFile = new File(moduleDir, module.packageName + ".json");
             String json = gson.toJson(module);
             FileUtils.writeFile(moduleFile, json);
 
-            // ── FIX: write lock.
             cacheLock.writeLock().lock();
             try {
                 loadedModules.put(module.packageName, module);
@@ -504,6 +502,14 @@ public class ModuleLoader {
         }
     }
 
+    /**
+     * Legacy deregister-only uninstall.
+     *
+     * Removes the module's JSON descriptor and cached dex, but
+     * leaves the module's APK installed on the device. Used by the
+     * scanner's purge pass and by callers that only want to stop
+     * ShizuPosed from loading a module.
+     */
     public boolean uninstallModule(String packageName) {
         try {
             if (XStealthModule.PACKAGE.equals(packageName)) {
@@ -518,7 +524,6 @@ public class ModuleLoader {
                 logger.i("Deleted module file: " + moduleFile.getAbsolutePath());
             }
 
-            // ── FIX: write lock.
             ModuleInfo removed;
             cacheLock.writeLock().lock();
             try {
@@ -549,12 +554,126 @@ public class ModuleLoader {
         }
     }
 
+    /**
+     * Full uninstall: deregister the module AND request the system
+     * to uninstall the underlying APK.
+     *
+     * Must be called from an Activity context because ACTION_DELETE
+     * requires user confirmation in a system dialog.
+     */
+    public boolean uninstallModuleCompletely(Context activityContext,
+                                             String packageName,
+                                             UninstallCallback callback) {
+        if (packageName == null) {
+            if (callback != null) {
+                callback.onResult(UNINSTALL_FAILED, "null package name");
+            }
+            return false;
+        }
+
+        if (XStealthModule.PACKAGE.equals(packageName)) {
+            if (logger != null) {
+                logger.w("uninstallModuleCompletely: XStealth is built-in, "
+                    + "cannot be uninstalled");
+            }
+            if (callback != null) {
+                callback.onResult(UNINSTALL_BUILTIN,
+                    "XStealth is a built-in module and cannot be uninstalled");
+            }
+            return false;
+        }
+
+        if (activityContext == null) {
+            if (logger != null) {
+                logger.w("uninstallModuleCompletely: activityContext is null, "
+                    + "falling back to deregister-only");
+            }
+            boolean ok = uninstallModule(packageName);
+            if (callback != null) {
+                callback.onResult(ok ? UNINSTALL_DEREGISTERED_ONLY : UNINSTALL_FAILED,
+                    ok ? "Deregistered (no context available for APK removal)"
+                       : "Deregistration failed");
+            }
+            return ok;
+        }
+
+        boolean deregistered = uninstallModule(packageName);
+        if (!deregistered) {
+            if (logger != null) {
+                logger.w("uninstallModuleCompletely: deregistration failed for "
+                    + packageName + " — not dispatching uninstall intent");
+            }
+            if (callback != null) {
+                callback.onResult(UNINSTALL_FAILED,
+                    "Could not deregister module");
+            }
+            return false;
+        }
+
+        try {
+            android.content.Intent intent = new android.content.Intent(
+                android.content.Intent.ACTION_DELETE);
+            intent.setData(android.net.Uri.parse("package:" + packageName));
+            intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+
+            boolean installed = isPackageInstalled(packageName);
+            if (!installed) {
+                if (logger != null) {
+                    logger.i("uninstallModuleCompletely: " + packageName
+                        + " was not installed — deregistered only");
+                }
+                if (callback != null) {
+                    callback.onResult(UNINSTALL_DEREGISTERED_ONLY,
+                        "Module deregistered (APK was already not installed)");
+                }
+                return true;
+            }
+
+            activityContext.startActivity(intent);
+
+            if (logger != null) {
+                logger.i("uninstallModuleCompletely: dispatched uninstall "
+                    + "intent for " + packageName);
+            }
+
+            if (callback != null) {
+                callback.onResult(UNINSTALL_OK,
+                    "Deregistered and uninstall prompt shown");
+            }
+            return true;
+
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.w("uninstallModuleCompletely: failed to dispatch "
+                    + "uninstall intent for " + packageName + ": "
+                    + t.getMessage());
+            }
+            if (callback != null) {
+                callback.onResult(UNINSTALL_DEREGISTERED_ONLY,
+                    "Deregistered, but could not open uninstall dialog: "
+                    + t.getMessage());
+            }
+            return true;
+        }
+    }
+
+    private boolean isPackageInstalled(String packageName) {
+        try {
+            PackageManager pm = context.getPackageManager();
+            pm.getPackageInfo(packageName, 0);
+            return true;
+        } catch (PackageManager.NameNotFoundException e) {
+            return false;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
     // ═════════════════════════════════════════════════════════════════
     // QUERIES
     // ═════════════════════════════════════════════════════════════════
 
     public ModuleInfo getModule(String packageName) {
-        // ── FIX: read lock.
         cacheLock.readLock().lock();
         try {
             return loadedModules.get(packageName);
@@ -564,7 +683,6 @@ public class ModuleLoader {
     }
 
     public boolean isModuleEnabled(String packageName) {
-        // ── FIX: read lock.
         cacheLock.readLock().lock();
         try {
             ModuleInfo m = loadedModules.get(packageName);
@@ -575,7 +693,6 @@ public class ModuleLoader {
     }
 
     public List<ModuleInfo> getEnabledModules() {
-        // ── FIX: read lock.
         cacheLock.readLock().lock();
         try {
             List<ModuleInfo> enabled = new ArrayList<>();
@@ -598,7 +715,6 @@ public class ModuleLoader {
     }
 
     public int getHookedAppCount(String modulePackage) {
-        // ── FIX: read lock.
         cacheLock.readLock().lock();
         try {
             ModuleInfo m = loadedModules.get(modulePackage);
@@ -619,6 +735,76 @@ public class ModuleLoader {
 
     public void notifyResourceChange(String packageName, int id, Object replacement) {
         logger.i("Resource change: " + packageName + " ID: 0x" + Integer.toHexString(id));
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // MANUAL ADD PROTECTION HELPERS
+    // ═════════════════════════════════════════════════════════════════
+
+    /**
+     * True if the given absolute path is inside the app's cache
+     * directory. Cache paths are transient — the system may delete
+     * them at any time, and ModulesFragment.addModuleFromDialog()
+     * deletes the copy after install.
+     */
+    private boolean isInCacheDir(String absPath) {
+        if (absPath == null) return false;
+        try {
+            String cacheBase = context.getCacheDir().getAbsolutePath();
+            return absPath.startsWith(cacheBase);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Copy an APK from a transient location into ShizuPosed's own
+     * private storage, under filesDir/imported_modules/. Returns
+     * the durable path, or null on failure.
+     *
+     * This exists so a manually-added module keeps working even
+     * after the caller's cache copy is deleted, and even after the
+     * module's own package name doesn't resolve through
+     * PackageManager (which is common for modules that hook by
+     * targeting another app's package).
+     */
+    private String copyApkToPrivateStorage(String srcPath, String packageName) {
+        if (srcPath == null || packageName == null) return null;
+        try {
+            File src = new File(srcPath);
+            if (!src.exists() || !src.isFile()) return null;
+
+            File importedDir = new File(context.getFilesDir(), "imported_modules");
+            if (!importedDir.exists() && !importedDir.mkdirs()) {
+                if (logger != null) {
+                    logger.w("copyApkToPrivateStorage: could not create "
+                        + importedDir.getAbsolutePath());
+                }
+                return null;
+            }
+
+            File dst = new File(importedDir, packageName + ".apk");
+
+            if (dst.exists() && dst.length() == src.length()) {
+                return dst.getAbsolutePath();
+            }
+
+            try (FileInputStream in = new FileInputStream(src);
+                 FileOutputStream out = new FileOutputStream(dst)) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                out.flush();
+            }
+
+            dst.setReadable(true, true);
+            return dst.getAbsolutePath();
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.w("copyApkToPrivateStorage failed: " + t.getMessage());
+            }
+            return null;
+        }
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -688,14 +874,6 @@ public class ModuleLoader {
     // RECOMMENDED SCOPE
     // ═════════════════════════════════════════════════════════════════
 
-    /**
-     * Read assets/scope.list from a module APK.
-     *
-     * LSPosed convention: one package name per line. Blank lines and
-     * lines beginning with '#' are ignored. Returns an empty set if
-     * the entry is absent, the APK is missing, or the read fails —
-     * never null.
-     */
     private Set<String> readRecommendedScope(String apkPath) {
         Set<String> scope = new HashSet<>();
         if (apkPath == null) return scope;

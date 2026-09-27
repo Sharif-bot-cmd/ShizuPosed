@@ -41,10 +41,7 @@ public class ModuleInfo implements Serializable {
     // selected, and selected without being recommended.
     //
     // Empty when the module declares no scope.list. Never null.
-    // Set by ModuleLoader.readRecommendedScope() at install/load
-    // time, and preserved across ModuleScanner re-registration.
     // ============================================================
-    // ── CHANGE: new field.
     public Set<String> recommendedApps;
 
     public boolean hasXposedInit;
@@ -56,12 +53,27 @@ public class ModuleInfo implements Serializable {
      * Used only by the scope editor: a module with a UI can select
      * its own package in its own scope, so it can be launched under
      * ShizuPosed and hook itself. Headless modules do not see their
-     * own package, matching R-3.6 behavior.
-     *
-     * Set by ModuleScanner at install/scan time. Migrated on load
-     * for records written before this field existed.
+     * own package.
      */
     public boolean hasUi = false;
+
+    // ============================================================
+    // MANUAL ADD PROTECTION (R-6.5+)
+    //
+    // True if the user added this module manually via the Add
+    // Module dialog. The scanner's automatic purge pass skips any
+    // module with this flag set — the user's explicit intent takes
+    // precedence over the apkExists / packageInstalled checks.
+    //
+    // This matters because a manually-added module often has a
+    // package name that doesn't resolve through PackageManager:
+    // modules that hook by targeting another app's package rather
+    // than shipping their own.
+    //
+    // Auto-detected modules leave this false and are still subject
+    // to the purge pass if their APK disappears.
+    // ============================================================
+    public boolean manuallyAdded = false;
 
     public ModuleInfo() {
         this.enabled = true;
@@ -74,8 +86,8 @@ public class ModuleInfo implements Serializable {
         this.hookAllApps = false;
         this.hookSystemApps = false;
         this.hasUi = false;
-        // ── CHANGE: initialize recommended set so it is never null.
         this.recommendedApps = new HashSet<>();
+        this.manuallyAdded = false;
     }
 
     public ModuleInfo(String packageName, String name) {
@@ -135,33 +147,16 @@ public class ModuleInfo implements Serializable {
     // RECOMMENDED SCOPE HELPERS
     // ============================================================
 
-    /**
-     * Is this package in the module's recommended scope?
-     * Null-safe on both the set and the argument.
-     */
-    // ── CHANGE: new helper.
     public boolean isRecommended(String packageName) {
         return packageName != null
             && recommendedApps != null
             && recommendedApps.contains(packageName);
     }
 
-    /**
-     * How many packages the module recommends. Zero when the
-     * module declares no scope.list.
-     */
-    // ── CHANGE: new helper.
     public int getRecommendedAppCount() {
         return recommendedApps != null ? recommendedApps.size() : 0;
     }
 
-    /**
-     * Does this module declare a recommended scope at all? Used by
-     * the scope editor to decide whether to show the Recommended
-     * chip. An always-visible chip that does nothing is worse than
-     * no chip.
-     */
-    // ── CHANGE: new helper.
     public boolean hasRecommendedScope() {
         return recommendedApps != null && !recommendedApps.isEmpty();
     }
@@ -179,6 +174,7 @@ public class ModuleInfo implements Serializable {
                 ", hookAllApps=" + hookAllApps +
                 ", hasXposedInit=" + hasXposedInit +
                 ", hasUi=" + hasUi +
+                ", manuallyAdded=" + manuallyAdded +
                 '}';
     }
 }

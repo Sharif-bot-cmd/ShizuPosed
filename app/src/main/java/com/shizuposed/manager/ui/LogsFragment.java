@@ -2,9 +2,13 @@ package com.shizuposed.manager.ui;
 
 import android.content.Context;
 import android.os.Bundle;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.view.LayoutInflater;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ProgressBar;
@@ -27,6 +31,29 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * LogsFragment
+ *
+ * The Logs tab. Shows the manager's own log with search.
+ *
+ * SEARCH
+ * ------
+ * Filters on text change (not just submit) so the list narrows as
+ * the user types. Matches against message, tag, level, and package
+ * name. An empty query resets to the full list.
+ *
+ * The search field has a clear (X) icon on the right. Tapping it
+ * empties the field and restores the full list.
+ *
+ * The keyboard hides when the user starts scrolling the list, so
+ * the log entries aren't obscured.
+ *
+ * EMPTY STATE
+ * -----------
+ * Two distinct empty states:
+ *   • No logs at all     → "No log entries yet"
+ *   • Query matches none → "No log entries match \"<query>\""
+ */
 public class LogsFragment extends Fragment {
     private RecyclerView logRecyclerView;
     private ProgressBar progressIndicator;
@@ -36,7 +63,7 @@ public class LogsFragment extends Fragment {
     private TextView tvEmptyState;
 
     private Logger logger;
-    private List<LogEntry> logs = new ArrayList<>();
+    private List<LogEntry> allLogs = new ArrayList<>();
     private LogAdapter logAdapter;
 
     private volatile boolean viewReady = false;
@@ -79,6 +106,10 @@ public class LogsFragment extends Fragment {
         tvEmptyState = null;
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // VIEW SETUP
+    // ═════════════════════════════════════════════════════════════
+
     private void initViews(View view) {
         logRecyclerView = view.findViewById(R.id.logRecyclerView);
         progressIndicator = view.findViewById(R.id.progressIndicator);
@@ -87,72 +118,170 @@ public class LogsFragment extends Fragment {
         fabClearLogs = view.findViewById(R.id.fabClearLogs);
         fabExportLogs = view.findViewById(R.id.fabExportLogs);
         tvEmptyState = view.findViewById(R.id.tvEmptyState);
+
+        // Add a clear (X) icon to the search field. Tapping it
+        // empties the query and restores the full list.
+        if (etSearchLogs != null) {
+            etSearchLogs.setCompoundDrawablesWithIntrinsicBounds(0, 0,
+                android.R.drawable.ic_menu_close_clear_cancel, 0);
+            etSearchLogs.setOnTouchListener((v, event) -> {
+                if (event.getAction() != MotionEvent.ACTION_UP) return false;
+                android.graphics.drawable.Drawable[] d =
+                    etSearchLogs.getCompoundDrawables();
+                if (d[2] == null) return false;
+                int drawableRight = etSearchLogs.getRight()
+                    - etSearchLogs.getCompoundPaddingRight()
+                    + d[2].getBounds().width();
+                if (event.getRawX() >= drawableRight) {
+                    etSearchLogs.setText("");
+                    applyFilter("");
+                    return true;
+                }
+                return false;
+            });
+        }
     }
 
     private void setupRecyclerView() {
         if (logRecyclerView == null) return;
-        logAdapter = new LogAdapter(logs);
+        logAdapter = new LogAdapter(new ArrayList<>());
         logRecyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
         logRecyclerView.setAdapter(logAdapter);
+
+        // Hide the keyboard when the user starts scrolling.
+        logRecyclerView.addOnScrollListener(new RecyclerView.OnScrollListener() {
+            @Override
+            public void onScrollStateChanged(@NonNull RecyclerView rv, int newState) {
+                if (newState == RecyclerView.SCROLL_STATE_DRAGGING
+                        && etSearchLogs != null) {
+                    InputMethodManager imm = (InputMethodManager)
+                        requireContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+                    if (imm != null) {
+                        imm.hideSoftInputFromWindow(
+                            etSearchLogs.getWindowToken(), 0);
+                    }
+                }
+            }
+        });
     }
 
     private void setupListeners() {
-        if (btnRefresh != null) btnRefresh.setOnClickListener(v -> loadLogs());
-        if (fabClearLogs != null) fabClearLogs.setOnClickListener(v -> clearLogs());
-        if (fabExportLogs != null) fabExportLogs.setOnClickListener(v -> exportLogs());
+        if (btnRefresh != null) {
+            btnRefresh.setOnClickListener(v -> loadLogs());
+        }
+        if (fabClearLogs != null) {
+            fabClearLogs.setOnClickListener(v -> clearLogs());
+        }
+        if (fabExportLogs != null) {
+            fabExportLogs.setOnClickListener(v -> exportLogs());
+        }
         if (etSearchLogs != null) {
-            etSearchLogs.setOnEditorActionListener((v, actionId, event) -> {
-                filterLogs(etSearchLogs.getText().toString());
-                return true;
+            etSearchLogs.addTextChangedListener(new TextWatcher() {
+                @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+                @Override public void onTextChanged(CharSequence s, int a, int b, int c) {
+                    applyFilter(s != null ? s.toString() : "");
+                }
+                @Override public void afterTextChanged(Editable s) {}
             });
         }
     }
+
+    // ═════════════════════════════════════════════════════════════
+    // LOAD + FILTER
+    // ═════════════════════════════════════════════════════════════
 
     private void loadLogs() {
         if (!viewReady || logger == null || logAdapter == null) return;
         showLoading(true);
         try {
-            logs = logger.getLogEntries();
-            logAdapter.updateData(logs);
+            allLogs = logger.getLogEntries();
+            if (allLogs == null) allLogs = new ArrayList<>();
 
-            if (tvEmptyState != null) {
-                tvEmptyState.setVisibility(logs.isEmpty() ? View.VISIBLE : View.GONE);
+            String query = etSearchLogs != null
+                ? etSearchLogs.getText().toString() : "";
+            applyFilter(query);
+
+            if (logger != null) {
+                logger.i("Loaded " + allLogs.size() + " log entries");
             }
-            if (logRecyclerView != null) {
-                logRecyclerView.setVisibility(logs.isEmpty() ? View.GONE : View.VISIBLE);
-                if (!logs.isEmpty()) logRecyclerView.scrollToPosition(logs.size() - 1);
-            }
-            logger.i("Loaded " + logs.size() + " log entries");
         } catch (Exception e) {
-            logger.e("Error loading logs: " + e.getMessage());
+            if (logger != null) logger.e("Error loading logs: " + e.getMessage());
             if (isAdded()) {
-                Toast.makeText(requireContext(), "Failed to load logs", Toast.LENGTH_SHORT).show();
+                Toast.makeText(requireContext(), "Failed to load logs",
+                    Toast.LENGTH_SHORT).show();
             }
         }
         showLoading(false);
     }
 
-    private void filterLogs(String query) {
+    /**
+     * Filter the full log list by the given query. Matches against
+     * message, tag, level, and package name. Empty query resets to
+     * the full list.
+     *
+     * Updates the empty state: "no logs" vs "no matches".
+     */
+    private void applyFilter(String query) {
         if (logAdapter == null) return;
-        if (query.isEmpty()) {
-            logAdapter.updateData(logs);
-            return;
-        }
+
         List<LogEntry> filtered = new ArrayList<>();
-        String lowerQuery = query.toLowerCase();
-        for (LogEntry entry : logs) {
-            if (entry.message.toLowerCase().contains(lowerQuery)
-                || entry.tag.toLowerCase().contains(lowerQuery)
-                || entry.level.toLowerCase().contains(lowerQuery)
-                || (entry.packageName != null && entry.packageName.toLowerCase().contains(lowerQuery))) {
-                filtered.add(entry);
+        String q = (query != null) ? query.toLowerCase().trim() : "";
+
+        if (q.isEmpty()) {
+            filtered.addAll(allLogs);
+        } else {
+            for (LogEntry entry : allLogs) {
+                if (entry == null) continue;
+                boolean match = false;
+                if (entry.message != null
+                        && entry.message.toLowerCase().contains(q)) {
+                    match = true;
+                } else if (entry.tag != null
+                        && entry.tag.toLowerCase().contains(q)) {
+                    match = true;
+                } else if (entry.level != null
+                        && entry.level.toLowerCase().contains(q)) {
+                    match = true;
+                } else if (entry.packageName != null
+                        && entry.packageName.toLowerCase().contains(q)) {
+                    match = true;
+                }
+                if (match) filtered.add(entry);
             }
         }
+
         logAdapter.updateData(filtered);
-        if (filtered.isEmpty() && isAdded()) {
-            Toast.makeText(requireContext(), "No matching logs", Toast.LENGTH_SHORT).show();
+
+        // Empty state: distinguish "no logs at all" from "no matches".
+        if (tvEmptyState != null) {
+            if (filtered.isEmpty()) {
+                if (allLogs.isEmpty()) {
+                    tvEmptyState.setText("No log entries yet");
+                } else {
+                    tvEmptyState.setText("No log entries match \""
+                        + query + "\"");
+                }
+                tvEmptyState.setVisibility(View.VISIBLE);
+            } else {
+                tvEmptyState.setVisibility(View.GONE);
+            }
+        }
+
+        if (logRecyclerView != null) {
+            logRecyclerView.setVisibility(filtered.isEmpty()
+                ? View.GONE : View.VISIBLE);
+            // Auto-scroll to the newest entry only when the query
+            // is empty. When filtering, leave the user where they
+            // are so the list doesn't jump under them.
+            if (!filtered.isEmpty() && q.isEmpty()) {
+                logRecyclerView.scrollToPosition(filtered.size() - 1);
+            }
         }
     }
+
+    // ═════════════════════════════════════════════════════════════
+    // ACTIONS
+    // ═════════════════════════════════════════════════════════════
 
     private void clearLogs() {
         if (!isAdded()) return;
@@ -162,14 +291,14 @@ public class LogsFragment extends Fragment {
             .setPositiveButton("Clear", (dialog, which) -> {
                 if (logger == null || logAdapter == null) return;
                 logger.clearLogs();
-                logs.clear();
-                logAdapter.updateData(logs);
-                if (tvEmptyState != null) tvEmptyState.setVisibility(View.VISIBLE);
-                if (logRecyclerView != null) logRecyclerView.setVisibility(View.GONE);
+                allLogs.clear();
+                if (etSearchLogs != null) etSearchLogs.setText("");
+                applyFilter("");
                 if (isAdded()) {
-                    Toast.makeText(requireContext(), "Logs cleared", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(requireContext(), "Logs cleared",
+                        Toast.LENGTH_SHORT).show();
                 }
-                logger.i("Logs cleared");
+                if (logger != null) logger.i("Logs cleared");
             })
             .setNegativeButton("Cancel", null)
             .show();
@@ -180,16 +309,22 @@ public class LogsFragment extends Fragment {
         try {
             String logContent = logger.exportLogs();
             String fileName = "shizuposed_logs_"
-                + new java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.getDefault())
-                .format(new java.util.Date()) + ".txt";
-            File logFile = new File(requireContext().getExternalFilesDir(null), fileName);
+                + new java.text.SimpleDateFormat("yyyyMMdd_HHmmss",
+                    java.util.Locale.getDefault())
+                    .format(new java.util.Date()) + ".txt";
+            File logFile = new File(
+                requireContext().getExternalFilesDir(null), fileName);
             com.shizuposed.manager.utils.FileUtils.writeFile(logFile, logContent);
             Toast.makeText(requireContext(),
-                "Logs exported to " + logFile.getAbsolutePath(), Toast.LENGTH_LONG).show();
-            logger.i("Logs exported to: " + logFile.getAbsolutePath());
+                "Logs exported to " + logFile.getAbsolutePath(),
+                Toast.LENGTH_LONG).show();
+            if (logger != null) {
+                logger.i("Logs exported to: " + logFile.getAbsolutePath());
+            }
         } catch (Exception e) {
-            Toast.makeText(requireContext(), "Failed to export logs", Toast.LENGTH_SHORT).show();
-            logger.e("Export error: " + e.getMessage());
+            Toast.makeText(requireContext(), "Failed to export logs",
+                Toast.LENGTH_SHORT).show();
+            if (logger != null) logger.e("Export error: " + e.getMessage());
         }
     }
 
@@ -207,10 +342,15 @@ public class LogsFragment extends Fragment {
         }
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // ADAPTER
+    // ═════════════════════════════════════════════════════════════
+
     private static class LogAdapter extends RecyclerView.Adapter<LogAdapter.LogViewHolder> {
         private List<LogEntry> logs;
         private final java.text.SimpleDateFormat timeFormat =
-            new java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.getDefault());
+            new java.text.SimpleDateFormat("HH:mm:ss.SSS",
+                java.util.Locale.getDefault());
 
         LogAdapter(List<LogEntry> logs) {
             this.logs = logs != null ? logs : new ArrayList<>();
@@ -227,7 +367,8 @@ public class LogsFragment extends Fragment {
         @Override
         public void onBindViewHolder(@NonNull LogViewHolder holder, int position) {
             LogEntry entry = logs.get(position);
-            holder.tvTime.setText(timeFormat.format(new java.util.Date(entry.timestamp)));
+            holder.tvTime.setText(timeFormat.format(
+                new java.util.Date(entry.timestamp)));
             holder.tvLevel.setText(entry.level);
             holder.tvTag.setText(entry.tag);
             holder.tvMessage.setText(entry.message);
@@ -240,7 +381,8 @@ public class LogsFragment extends Fragment {
             }
 
             int color;
-            switch (entry.level.toUpperCase()) {
+            String level = entry.level != null ? entry.level.toUpperCase() : "";
+            switch (level) {
                 case "VERBOSE": color = android.R.color.darker_gray; break;
                 case "DEBUG":   color = android.R.color.holo_blue_light; break;
                 case "INFO":    color = android.R.color.holo_green_light; break;

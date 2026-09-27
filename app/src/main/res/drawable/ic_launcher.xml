@@ -5,26 +5,49 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <path
-        android:pathData="M31,63.928c0,0 6.4,-11 12.1,-13.1c7.2,-2.6 26,-1.4 26,-1.4l38.1,38.1L107,108.928l-32,-1L31,63.928z">
-        <aapt:attr name="android:fillColor">
-            <gradient 
-                android:startColor="#4CAF50"
-                android:endColor="#2E7D32"
-                android:startX="0"
-                android:startY="0"
-                android:endX="108"
-                android:endY="108"
-                android:type="linear" />
-        </aapt:attr>
-    </path>
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M65.3,45.828l3.8,-6.6c0.2,-0.4 0.1,-0.9 -0.3,-1.1c-0.4,-0.2 -0.9,-0.1 -1.1,0.3l-3.9,6.7c-6.3,-2.8 -13.4,-2.8 -19.7,0l-3.9,-6.7c-0.2,-0.4 -0.7,-0.5 -1.1,-0.3C38.8,38.328 38.7,38.828 38.9,39.228l3.8,6.6C36.2,49.428 31.7,56.028 31,63.928h46C76.3,56.028 71.8,49.428 65.3,45.828z"/>
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M43.2,50.528c0.2,0 0.4,-0.1 0.5,-0.2c0.3,-0.3 0.3,-0.7 0,-1c-0.3,-0.3 -0.7,-0.3 -1,0c-0.3,0.3 -0.3,0.7 0,1C42.8,50.428 43,50.528 43.2,50.528z"/>
+
+    <!--
+        ShizuPosed launcher icon.
+
+        An X, drawn as two crossing strokes with a small center gap.
+        Foreground layer for the adaptive icon. The background is a
+        rounded-rect gradient that lives in a separate layer, so
+        this drawable is safe to use both as a standalone icon and
+        as the adaptive foreground.
+
+        Colors:
+          • White strokes on a gradient background
+          • Green gradient matches the LSPosed visual family
+    -->
+
+    <!-- Descending stroke: top-left to bottom-right -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M64.8,50.528c0.2,0 0.4,-0.1 0.5,-0.2c0.3,-0.3 0.3,-0.7 0,-1c-0.3,-0.3 -0.7,-0.3 -1,0c-0.3,0.3 -0.3,0.7 0,1C64.4,50.428 64.6,50.528 64.8,50.528z"/>
+        android:pathData="M 22,22
+                          L 36,22
+                          L 86,86
+                          L 72,86
+                          Z" />
+
+    <!-- Ascending stroke: bottom-left to top-right -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 86,22
+                          L 72,22
+                          L 22,86
+                          L 36,86
+                          Z" />
+
+    <!--
+        A small square "spark" at the intersection point. Mirrors
+        the LSPosed accent without the animation frame. Purely
+        decorative; the X reads correctly without it.
+    -->
+    <path
+        android:fillColor="#FFEB3B"
+        android:pathData="M 51,51
+                          L 57,51
+                          L 57,57
+                          L 51,57
+                          Z" />
 </vector>

@@ -1,13 +1,55 @@
 <?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+
+    <!--
+        Round variant. Same X as ic_launcher.xml. The background
+        circle is drawn here so the round form is self-contained.
+    -->
+
+    <!-- Background circle -->
     <path
-        android:fillColor="#4CAF50"
-        android:pathData="M54,0 C24.2,0 0,24.2 0,54 C0,83.8 24.2,108 54,108 C83.8,108 108,83.8 108,54 C108,24.2 83.8,0 54,0 Z"/>
+        android:pathData="M54,4 C81.6,4 104,26.4 104,54 C104,81.6 81.6,104 54,104 C26.4,104 4,81.6 4,54 C4,26.4 26.4,4 54,4 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startColor="#4CAF50"
+                android:endColor="#2E7D32"
+                android:startX="0"
+                android:startY="0"
+                android:endX="108"
+                android:endY="108"
+                android:type="linear" />
+        </aapt:attr>
+    </path>
+
+    <!-- Descending stroke: top-left to bottom-right -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M54,25 C40.2,25 29,36.2 29,50 C29,58.2 33,65.6 39.2,70.4 L36,78 L44.6,73.4 C47.6,74.8 50.8,75.6 54,75.6 C67.8,75.6 79,64.4 79,50.6 C79,36.8 67.8,25 54,25 Z M62,52.6 L46,52.6 L46,48.6 L62,48.6 L62,52.6 Z"/>
+        android:pathData="M 26,26
+                          L 38,26
+                          L 82,82
+                          L 70,82
+                          Z" />
+
+    <!-- Ascending stroke: bottom-left to top-right -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 82,26
+                          L 70,26
+                          L 26,82
+                          L 38,82
+                          Z" />
+
+    <!-- Accent spark at the intersection -->
+    <path
+        android:fillColor="#FFEB3B"
+        android:pathData="M 51,51
+                          L 57,51
+                          L 57,57
+                          L 51,57
+                          Z" />
 </vector>

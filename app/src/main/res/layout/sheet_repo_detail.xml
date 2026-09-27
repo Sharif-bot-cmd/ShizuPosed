@@ -49,11 +49,11 @@
     </LinearLayout>
 
     <!-- Action buttons -->
-    <com.google.android.material.button.MaterialButtonToggleGroup
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="12dp"
-        app:singleSelection="false">
+        android:orientation="horizontal">
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btnRepoOpenHomepage"
@@ -61,6 +61,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="Homepage"
+            android:layout_marginEnd="8dp"
             android:visibility="gone" />
 
         <com.google.android.material.button.MaterialButton
@@ -70,9 +71,9 @@
             android:layout_height="wrap_content"
             android:text="Support"
             android:visibility="gone" />
-    </com.google.android.material.button.MaterialButtonToggleGroup>
+    </LinearLayout>
 
-    <!-- Tabs -->
+    <!-- Sub-tabs: Readme / Releases / Info -->
     <com.google.android.material.tabs.TabLayout
         android:id="@+id/tlRepoDetailTabs"
         android:layout_width="match_parent"
@@ -83,12 +84,17 @@
         <com.google.android.material.tabs.TabItem
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="README" />
+            android:text="Readme" />
 
         <com.google.android.material.tabs.TabItem
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Details" />
+            android:text="Releases" />
+
+        <com.google.android.material.tabs.TabItem
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Info" />
     </com.google.android.material.tabs.TabLayout>
 
     <FrameLayout
@@ -131,9 +137,53 @@
             </LinearLayout>
         </ScrollView>
 
-        <!-- Details container -->
+        <!-- RELEASES container -->
         <ScrollView
-            android:id="@+id/svRepoDetailsContainer"
+            android:id="@+id/svRepoReleasesContainer"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:paddingBottom="24dp">
+
+                <TextView
+                    android:id="@+id/tvRepoReleaseVersion"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Current version: v1.0"
+                    android:textSize="16sp"
+                    android:textStyle="bold"
+                    android:layout_marginBottom="12dp" />
+
+                <TextView
+                    android:id="@+id/tvRepoReleaseChangelog"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textSize="14sp"
+                    android:lineSpacingMultiplier="1.2"
+                    android:textIsSelectable="true"
+                    android:visibility="gone" />
+
+                <TextView
+                    android:id="@+id/tvRepoReleaseEmpty"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="No release notes bundled in this module."
+                    android:textSize="14sp"
+                    android:textColor="?android:attr/textColorSecondary"
+                    android:gravity="center"
+                    android:padding="24dp"
+                    android:visibility="visible" />
+            </LinearLayout>
+        </ScrollView>
+
+        <!-- INFO container -->
+        <ScrollView
+            android:id="@+id/svRepoInfoContainer"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
             android:visibility="gone">

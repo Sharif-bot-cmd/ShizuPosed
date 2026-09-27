@@ -5,14 +5,13 @@ import android.graphics.drawable.Drawable;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.Button;
 import android.widget.ImageView;
-import com.google.android.material.materialswitch.MaterialSwitch;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
 import androidx.recyclerview.widget.RecyclerView;
 
+import com.google.android.material.materialswitch.MaterialSwitch;
 import com.shizuposed.manager.R;
 import com.shizuposed.manager.model.ModuleInfo;
 import com.shizuposed.manager.stealth.XStealthModule;
@@ -24,32 +23,38 @@ import java.util.List;
 /**
  * ModuleAdapter
  *
- * Row adapter for the Modules tab. Every module renders the same
- * base layout, but XStealth gets a reduced variant:
+ * Row adapter for the Modules tab, LSPosed-style.
  *
- *   • Shield icon from ic_xstealth instead of a resolved launcher
- *     icon. XStealth has no APK to resolve against.
- *   • No enable toggle — its toggle lives in the detail sheet.
- *     The row switch is hidden.
- *   • No "Hooked Apps" label — XStealth has no scope visible in
- *     this row. A status label replaces the toggle area, showing
- *     whether XStealth is enabled.
- *   • No "Select Apps" button — same reason.
+ * Row interaction model:
+ *   • Tapping the row body opens the scope editor.
+ *   • Tapping the enable switch toggles the module.
+ *   • Tapping the icon opens the detail sheet.
+ *   • Long-pressing the row opens the module's own UI through
+ *     ShizuPosed. This is the path that installs the self-hook
+ *     activation checks that UI modules rely on.
  *
- * RECOMMENDED SCOPE
- * -----------------
- * A normal module row shows a "· N recommended" hint next to the
- * hooked-apps count when the module declares a recommended scope
- * (assets/scope.list in its APK). The hint is informational.
+ * XStealth's row still has no enable switch. Its toggle lives in
+ * the detail sheet. Tapping the row opens the detail sheet for it,
+ * not the scope editor.
  *
- * RecyclerView reuses ViewHolders across rows, so the XStealth
- * branch must explicitly set every hidden widget back to VISIBLE
- * for the next non-XStealth row. Otherwise, scrolling causes the
- * icon, toggle, or count to disappear from unrelated modules.
+ * The self-hook pattern
+ * ---------------------
+ * Some modules check their own activation state by hooking a
+ * method on their own UI (e.g. MainActivity.isXposedEnabled).
+ * The presence of that hook is the signal. Under LSPosed this
+ * works automatically because LSPosed injects into every process.
+ * Under ShizuPosed the module's own process only gets hooks if
+ * the module's UI is launched through ShizuPosed.
+ *
+ * Long-press dispatches through the caller, which routes the
+ * launch through ShizuPosedService instead of the launcher. That
+ * is the difference between a module UI showing "Enabled" and
+ * showing "Disabled."
  */
 public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleViewHolder> {
+
     private List<ModuleInfo> modules;
-    private Context context;
+    private final Context context;
     private OnModuleActionListener listener;
     private long lastToggleTime = 0;
     private static final long TOGGLE_DEBOUNCE = 500;
@@ -58,7 +63,18 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
         void onToggle(ModuleInfo module, boolean enable);
         void onDetail(ModuleInfo module);
         void onUninstall(ModuleInfo module);
-        void onSelectApps(ModuleInfo module);
+        /**
+         * Row body tapped. For normal modules this should open the
+         * scope editor. For XStealth it should open the detail
+         * sheet.
+         */
+        void onEditScope(ModuleInfo module);
+        /**
+         * Row long-pressed. Opens the module's own UI through
+         * ShizuPosed, so its own process gets hooks and any
+         * self-hook activation check fires.
+         */
+        void onOpenModuleApp(ModuleInfo module);
     }
 
     public ModuleAdapter(List<ModuleInfo> modules, Context context) {
@@ -85,59 +101,121 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
 
         // ─── Icon ─────────────────────────────────────────────────
         if (isXStealth) {
-            holder.ivIcon.setVisibility(View.VISIBLE);
             holder.ivIcon.setImageResource(R.drawable.ic_xstealth);
         } else {
-            holder.ivIcon.setVisibility(View.VISIBLE);
             Drawable icon = IconResolver.resolve(context, module.packageName, module.apkPath);
-            if (icon != null) {
-                holder.ivIcon.setImageDrawable(icon);
-            } else {
-                holder.ivIcon.setImageResource(R.drawable.ic_module);
-            }
+            if (icon != null) holder.ivIcon.setImageDrawable(icon);
+            else holder.ivIcon.setImageResource(R.drawable.ic_module);
         }
 
-        // ─── Common text fields ───────────────────────────────────
         holder.tvName.setText(module.name != null ? module.name : module.packageName);
         holder.tvPackage.setText(module.packageName);
 
-        if (module.version != null) {
-            holder.tvVersion.setText("v" + module.version);
-            holder.tvVersion.setVisibility(View.VISIBLE);
-        } else {
-            holder.tvVersion.setVisibility(View.GONE);
-        }
-
-        holder.tvEntry.setText(module.xposedInit != null ? module.xposedInit : "Auto-detect");
-
-        // Row tap → detail. Same for every module.
-        holder.itemView.setOnClickListener(v -> {
-            if (listener != null) listener.onDetail(module);
-        });
-
-        // Long-press → uninstall. Same for every module, though
-        // XStealth refuses the removal in ModulesFragment.
-        holder.itemView.setOnLongClickListener(v -> {
-            if (listener != null) listener.onUninstall(module);
-            return true;
-        });
-
-        // ─── XStealth: reduced row ────────────────────────────────
         if (isXStealth) {
             bindXStealthRow(holder, module);
-            return;
+        } else {
+            bindNormalRow(holder, module);
         }
-
-        // ─── Normal module: full row ──────────────────────────────
-        bindNormalRow(holder, module);
     }
 
     /**
-     * XStealth row: no toggle, no hooked-apps count, no select-apps
-     * button. A status label takes the toggle's place.
+     * Normal module row:
+     *   • Enable switch visible.
+     *   • Scope summary visible.
+     *   • Chevron visible (hint: tap to edit scope).
+     */
+    private void bindNormalRow(ModuleViewHolder holder, ModuleInfo module) {
+        // Status dot
+        holder.indicatorStatus.setBackgroundResource(
+            module.enabled
+                ? R.drawable.status_indicator_enabled
+                : R.drawable.status_indicator_disabled
+        );
+
+        // Enable switch
+        if (holder.swEnabled != null) {
+            holder.swEnabled.setVisibility(View.VISIBLE);
+            holder.swEnabled.setOnCheckedChangeListener(null);
+            holder.swEnabled.setChecked(module.enabled);
+            holder.swEnabled.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                long now = System.currentTimeMillis();
+                if (now - lastToggleTime < TOGGLE_DEBOUNCE) {
+                    // Revert the visual state — the toggle was debounced.
+                    holder.swEnabled.setOnCheckedChangeListener(null);
+                    holder.swEnabled.setChecked(!isChecked);
+                    holder.swEnabled.setOnCheckedChangeListener((bv, c) -> {});
+                    return;
+                }
+                lastToggleTime = now;
+                if (listener != null) listener.onToggle(module, isChecked);
+            });
+        }
+
+        if (holder.tvEnabledLabel != null) {
+            holder.tvEnabledLabel.setText(module.enabled ? "Enabled" : "Disabled");
+        }
+
+        // Scope summary
+        if (holder.tvScopeSummary != null) {
+            int count = module.hookedApps != null ? module.hookedApps.size() : 0;
+            if (module.hookAllApps) {
+                holder.tvScopeSummary.setText("All apps scoped");
+            } else if (count == 0) {
+                holder.tvScopeSummary.setText("No apps scoped · tap to select");
+            } else {
+                holder.tvScopeSummary.setText(count + " app"
+                    + (count != 1 ? "s" : "") + " scoped · tap to edit");
+            }
+        }
+
+        // Recommended hint
+        if (holder.tvRecommended != null) {
+            int rec = module.getRecommendedAppCount();
+            if (rec > 0) {
+                holder.tvRecommended.setText("· " + rec + " recommended");
+                holder.tvRecommended.setVisibility(View.VISIBLE);
+            } else {
+                holder.tvRecommended.setVisibility(View.GONE);
+            }
+        }
+
+        // Chevron visible
+        if (holder.ivChevron != null) {
+            holder.ivChevron.setVisibility(View.VISIBLE);
+        }
+
+        // Row tap → scope editor (or XStealth detail via the caller)
+        holder.itemView.setOnClickListener(v -> {
+            if (listener != null) listener.onEditScope(module);
+        });
+
+        // Long-press → open the module's own UI through ShizuPosed.
+        // This is the gesture that installs the self-hook activation
+        // check for modules that use one.
+        holder.itemView.setOnLongClickListener(v -> {
+            if (listener != null) listener.onOpenModuleApp(module);
+            return true;
+        });
+
+        // Icon tap → detail sheet
+        if (holder.ivIcon != null) {
+            holder.ivIcon.setOnClickListener(v -> {
+                if (listener != null) listener.onDetail(module);
+            });
+        }
+    }
+
+    /**
+     * XStealth row:
+     *   • No enable switch (its toggle lives in the detail sheet).
+     *   • Scope summary hidden.
+     *   • Chevron visible but its semantics are "open detail", not
+     *     "edit scope".
+     *   • Row tap opens the detail sheet.
+     *   • Long-press is the same as a tap, since XStealth has no
+     *     launchable UI.
      */
     private void bindXStealthRow(ModuleViewHolder holder, ModuleInfo module) {
-        // Status indicator dot follows the enabled state.
         boolean enabled = XStealthPrefs.isEnabled(context);
         holder.indicatorStatus.setBackgroundResource(
             enabled
@@ -145,83 +223,43 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
                 : R.drawable.status_indicator_disabled
         );
 
-        // Status label: Enabled / Disabled, matching the state in
-        // the detail sheet.
-        if (holder.tvHookedApps != null) {
-            holder.tvHookedApps.setText(enabled ? "Enabled" : "Disabled");
-            holder.tvHookedApps.setVisibility(View.VISIBLE);
-        }
-
-        // XStealth has no recommended scope. Explicitly hide the
-        // hint so a recycled ViewHolder from a normal module does
-        // not leak its text into this row.
-        if (holder.tvRecommended != null) {
-            holder.tvRecommended.setVisibility(View.GONE);
-        }
-
-        // Hide the toggle. RecyclerView may have reused a ViewHolder
-        // that was showing it, so this must be explicit.
         if (holder.swEnabled != null) {
             holder.swEnabled.setOnCheckedChangeListener(null);
             holder.swEnabled.setVisibility(View.GONE);
         }
 
-        // Hide the select-apps button.
-        if (holder.btnSelectApps != null) {
-            holder.btnSelectApps.setVisibility(View.GONE);
-        }
-    }
-
-    /**
-     * Normal module row: toggle, hooked-apps count, select-apps
-     * button. Every hidden widget is restored to VISIBLE because
-     * the ViewHolder may have been recycled from an XStealth row.
-     */
-    private void bindNormalRow(ModuleViewHolder holder, ModuleInfo module) {
-        holder.indicatorStatus.setBackgroundResource(
-            module.enabled
-                ? R.drawable.status_indicator_enabled
-                : R.drawable.status_indicator_disabled
-        );
-
-        // Toggle
-        if (holder.swEnabled != null) {
-            holder.swEnabled.setVisibility(View.VISIBLE);
-            holder.swEnabled.setOnCheckedChangeListener(null);
-            holder.swEnabled.setChecked(module.enabled);
-            holder.swEnabled.setOnCheckedChangeListener((buttonView, isChecked) -> {
-                long currentTime = System.currentTimeMillis();
-                if (currentTime - lastToggleTime < TOGGLE_DEBOUNCE) return;
-                lastToggleTime = currentTime;
-                if (listener != null) listener.onToggle(module, isChecked);
-            });
+        if (holder.tvEnabledLabel != null) {
+            holder.tvEnabledLabel.setText(enabled ? "Enabled" : "Disabled");
         }
 
-        // Hooked-apps label
-        if (holder.tvHookedApps != null) {
-            holder.tvHookedApps.setVisibility(View.VISIBLE);
-            int hookedCount = module.hookedApps != null ? module.hookedApps.size() : 0;
-            holder.tvHookedApps.setText("Hooked Apps: " + hookedCount
-                + (module.hookAllApps ? " (All)" : ""));
+        if (holder.tvScopeSummary != null) {
+            holder.tvScopeSummary.setText(
+                "Built-in · applies to every app ShizuPosed launches");
         }
 
-        // Recommended count hint. Shows "· N recommended" only when
-        // the module declares a scope.list. Hidden otherwise.
         if (holder.tvRecommended != null) {
-            int recommendedCount = module.getRecommendedAppCount();
-            if (recommendedCount > 0) {
-                holder.tvRecommended.setText("· " + recommendedCount + " recommended");
-                holder.tvRecommended.setVisibility(View.VISIBLE);
-            } else {
-                holder.tvRecommended.setVisibility(View.GONE);
-            }
+            holder.tvRecommended.setVisibility(View.GONE);
         }
 
-        // Select-apps button
-        if (holder.btnSelectApps != null) {
-            holder.btnSelectApps.setVisibility(View.VISIBLE);
-            holder.btnSelectApps.setOnClickListener(v -> {
-                if (listener != null) listener.onSelectApps(module);
+        if (holder.ivChevron != null) {
+            holder.ivChevron.setVisibility(View.VISIBLE);
+        }
+
+        // Row tap → detail sheet (for XStealth, scope isn't editable)
+        holder.itemView.setOnClickListener(v -> {
+            if (listener != null) listener.onDetail(module);
+        });
+
+        // Long-press → detail sheet too. XStealth has no launchable
+        // UI, so there's nothing to open through ShizuPosed.
+        holder.itemView.setOnLongClickListener(v -> {
+            if (listener != null) listener.onDetail(module);
+            return true;
+        });
+
+        if (holder.ivIcon != null) {
+            holder.ivIcon.setOnClickListener(v -> {
+                if (listener != null) listener.onDetail(module);
             });
         }
     }
@@ -239,10 +277,9 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
     static class ModuleViewHolder extends RecyclerView.ViewHolder {
         View indicatorStatus;
         ImageView ivIcon;
-        TextView tvName, tvPackage, tvVersion, tvEntry, tvHookedApps;
-        TextView tvRecommended;
+        TextView tvName, tvPackage, tvEnabledLabel, tvScopeSummary, tvRecommended;
+        ImageView ivChevron;
         MaterialSwitch swEnabled;
-        Button btnSelectApps;
 
         ModuleViewHolder(@NonNull View itemView) {
             super(itemView);
@@ -250,12 +287,11 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
             ivIcon = itemView.findViewById(R.id.ivIcon);
             tvName = itemView.findViewById(R.id.tvName);
             tvPackage = itemView.findViewById(R.id.tvPackage);
-            tvVersion = itemView.findViewById(R.id.tvVersion);
-            tvEntry = itemView.findViewById(R.id.tvEntry);
-            tvHookedApps = itemView.findViewById(R.id.tvHookedApps);
+            tvEnabledLabel = itemView.findViewById(R.id.tvEnabledLabel);
+            tvScopeSummary = itemView.findViewById(R.id.tvScopeSummary);
             tvRecommended = itemView.findViewById(R.id.tvRecommended);
+            ivChevron = itemView.findViewById(R.id.ivChevron);
             swEnabled = itemView.findViewById(R.id.swEnabled);
-            btnSelectApps = itemView.findViewById(R.id.btnSelectApps);
         }
     }
 }

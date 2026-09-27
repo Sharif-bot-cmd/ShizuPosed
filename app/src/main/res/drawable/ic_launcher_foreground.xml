@@ -6,39 +6,159 @@
     android:viewportHeight="108">
 
     <!--
-        Android head silhouette.
-        The 108x108 viewport is the adaptive-icon canvas; only the
-        central 72x72 region (18..90 on each axis) survives the
-        launcher mask. The drawing below stays well inside that.
+        Adaptive icon foreground: an X made of two bandage strips,
+        with the Android head perched above the crossing point.
 
-        Head dome: upper half of a circle, radius 22, center (54, 62).
-        Eyes: two small filled circles.
-        Antennae: two short diagonal strokes from the top of the dome.
+        Layout on the 108x108 canvas:
+          - Antennae:       y 20..26
+          - Android head:   x 40..68, y 26..48
+          - X bandage:      x 28..80, y 50..82
+          - Everything is inside the 18..90 safe zone so the 66%
+            launcher mask doesn't clip it.
+
+        The head was shrunk from an 18-wide arc to a 14-wide arc
+        so the antennae have vertical clearance. The head's top
+        now sits at y=26; the antennae reach down to y=26 and
+        stop cleanly.
     -->
 
-    <!-- Head dome (upper half circle) -->
-    <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M32,62 a22,22 0 0,1 44,0 z" />
+    <!-- ═══════════════════════════════════════════════════════
+         ANDROID HEAD (above the X)
+         ═══════════════════════════════════════════════════════ -->
 
-    <!-- Left antenna -->
+    <!-- Left antenna: from head top edge (y=26) up to y=20 -->
     <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M36,45 L31,36 L35,34 L40,43 z" />
+        android:fillColor="#3DDC84"
+        android:pathData="M 44,26
+                          L 45.5,21
+                          L 47.5,21.8
+                          L 46,26 Z" />
 
     <!-- Right antenna -->
     <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M72,45 L77,36 L73,34 L68,43 z" />
+        android:fillColor="#3DDC84"
+        android:pathData="M 62,26
+                          L 63.5,21
+                          L 65.5,21.8
+                          L 64,26 Z" />
+
+    <!-- Head: rounded top, flat bottom. 14-wide arc, 22-unit body. -->
+    <path
+        android:fillColor="#3DDC84"
+        android:pathData="M 40,37
+                          A 14,11 0 0,1 68,37
+                          L 68,48
+                          L 40,48 Z" />
 
     <!-- Left eye -->
     <path
-        android:fillColor="#1A1A2E"
-        android:pathData="M47,55 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+        android:fillColor="#FFFFFF"
+        android:pathData="M 48,38
+                          A 1.8,1.8 0 1,1 47.99,38 Z" />
 
     <!-- Right eye -->
     <path
-        android:fillColor="#1A1A2E"
-        android:pathData="M61,55 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+        android:fillColor="#FFFFFF"
+        android:pathData="M 60,38
+                          A 1.8,1.8 0 1,1 59.99,38 Z" />
 
+    <!-- ═══════════════════════════════════════════════════════
+         X BANDAGE (below the head)
+         ═══════════════════════════════════════════════════════ -->
+
+    <!-- Descending bandage (top-left to bottom-right) -->
+    <group
+        android:pivotX="54"
+        android:pivotY="66"
+        android:rotation="38">
+
+        <!-- Bandage strip -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M 30,61
+                              L 78,61
+                              A 5,5 0 0,1 78,71
+                              L 30,71
+                              A 5,5 0 0,1 30,61 Z" />
+
+        <!-- Gauze pad, left end -->
+        <path
+            android:fillColor="#E0E0E0"
+            android:pathData="M 34,62
+                              L 43,62
+                              L 43,70
+                              L 34,70 Z" />
+
+        <!-- Gauze pad, right end -->
+        <path
+            android:fillColor="#E0E0E0"
+            android:pathData="M 65,62
+                              L 74,62
+                              L 74,70
+                              L 65,70 Z" />
+
+        <!-- Grid lines on the left gauze pad -->
+        <path
+            android:strokeColor="#BDBDBD"
+            android:strokeWidth="0.5"
+            android:pathData="M 36,62 L 36,70
+                              M 38.5,62 L 38.5,70
+                              M 41,62 L 41,70" />
+
+        <!-- Grid lines on the right gauze pad -->
+        <path
+            android:strokeColor="#BDBDBD"
+            android:strokeWidth="0.5"
+            android:pathData="M 67,62 L 67,70
+                              M 69.5,62 L 69.5,70
+                              M 72,62 L 72,70" />
+    </group>
+
+    <!-- Ascending bandage (bottom-left to top-right) -->
+    <group
+        android:pivotX="54"
+        android:pivotY="66"
+        android:rotation="-38">
+
+        <!-- Bandage strip -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M 30,61
+                              L 78,61
+                              A 5,5 0 0,1 78,71
+                              L 30,71
+                              A 5,5 0 0,1 30,61 Z" />
+
+        <!-- Gauze pad, left end -->
+        <path
+            android:fillColor="#E0E0E0"
+            android:pathData="M 34,62
+                              L 43,62
+                              L 43,70
+                              L 34,70 Z" />
+
+        <!-- Gauze pad, right end -->
+        <path
+            android:fillColor="#E0E0E0"
+            android:pathData="M 65,62
+                              L 74,62
+                              L 74,70
+                              L 65,70 Z" />
+
+        <!-- Grid lines on the left gauze pad -->
+        <path
+            android:strokeColor="#BDBDBD"
+            android:strokeWidth="0.5"
+            android:pathData="M 36,62 L 36,70
+                              M 38.5,62 L 38.5,70
+                              M 41,62 L 41,70" />
+
+        <!-- Grid lines on the right gauze pad -->
+        <path
+            android:strokeColor="#BDBDBD"
+            android:strokeWidth="0.5"
+            android:pathData="M 67,62 L 67,70
+                              M 69.5,62 L 69.5,70
+                              M 72,62 L 72,70" />
+    </group>
 </vector>

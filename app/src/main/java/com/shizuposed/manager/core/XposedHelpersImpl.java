@@ -111,6 +111,74 @@ public final class XposedHelpersImpl {
         }
     }
 
+    // ─── resolution helpers (called by XposedHelpers façade) ────────
+
+    /**
+     * Resolve a Method from (class, name, parameterTypes) where the
+     * parameterTypesAndCallback array may include a trailing
+     * XC_MethodHook / callback object that must be ignored during
+     * method resolution.
+     *
+     * @param clazz                       the class to search
+     * @param name                        method name
+     * @param parameterTypesAndCallback   parameter classes, optionally
+     *                                    followed by a callback
+     * @return the resolved Method, or null if not found
+     */
+    public static Method resolveMethod(Class<?> clazz,
+                                       String name,
+                                       Object[] parameterTypesAndCallback) {
+        if (clazz == null || name == null) return null;
+
+        int len = (parameterTypesAndCallback == null)
+            ? 0 : parameterTypesAndCallback.length;
+
+        // The last element may be the callback, not a parameter type.
+        if (len > 0 && !(parameterTypesAndCallback[len - 1] instanceof Class)) {
+            len--; // drop the trailing callback
+        }
+
+        Class<?>[] parameterTypes = new Class<?>[len];
+        for (int i = 0; i < len; i++) {
+            Object o = parameterTypesAndCallback[i];
+            if (!(o instanceof Class)) {
+                log("resolveMethod: parameter " + i + " is not a Class: " + o);
+                return null;
+            }
+            parameterTypes[i] = (Class<?>) o;
+        }
+
+        // Walk the hierarchy looking for a declared match.
+        for (Class<?> c = clazz; c != null; c = c.getSuperclass()) {
+            try {
+                return c.getDeclaredMethod(name, parameterTypes);
+            } catch (NoSuchMethodException ignored) {
+                // try superclass
+            } catch (Throwable t) {
+                log("resolveMethod error for " + name + ": " + t.getMessage());
+                return null;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Extract the trailing XC_MethodHook from the
+     * parameterTypesAndCallback array. Returns null if none present.
+     */
+    public static XC_MethodHook extractCallback(Object[] parameterTypesAndCallback) {
+        if (parameterTypesAndCallback == null
+                || parameterTypesAndCallback.length == 0) {
+            return null;
+        }
+        Object last = parameterTypesAndCallback[
+            parameterTypesAndCallback.length - 1];
+        if (last instanceof XC_MethodHook) {
+            return (XC_MethodHook) last;
+        }
+        return null;
+    }
+
     // ─── hook entry points ───────────────────────────────────────────
 
     /** The standard Xposed findAndHookMethod signature the modules call. */

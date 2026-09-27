@@ -4,12 +4,47 @@
     android:height="24dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
+
+    <!--
+        Notification small icon.
+
+        Android renders small icons as a single-color silhouette.
+        Any color in this file is stripped; the shape is what
+        matters. At 24dp, only two simple shapes read clearly:
+
+          • The Android head (top third)
+          • The X (bottom two thirds)
+
+        Everything else — eyes, antennae, gauze pads — turns to
+        mush at this size and is omitted.
+
+        Fill color must be non-transparent. Android uses it as the
+        mask and ignores the actual color value.
+    -->
+
+    <!-- Android head: rounded top, flat bottom -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M4,15 a8,8 0 0,1 16,0 z" />
+        android:pathData="M 7,7
+                          A 5,4 0 0,1 17,7
+                          L 17,11
+                          L 7,11 Z" />
+
+    <!-- X descending stroke -->
     <path
-        android:fillColor="#00000000"
-        android:strokeColor="#FFFFFF"
-        android:strokeWidth="0.5"
-        android:pathData="M7,9 L5.5,6 M17,9 L18.5,6" />
+        android:fillColor="#FFFFFF"
+        android:pathData="M 6,13
+                          L 8,13
+                          L 18,21
+                          L 16,21
+                          Z" />
+
+    <!-- X ascending stroke -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 18,13
+                          L 16,13
+                          L 6,21
+                          L 8,21
+                          Z" />
 </vector>
