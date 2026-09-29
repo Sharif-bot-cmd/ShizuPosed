@@ -110,15 +110,15 @@
             android:textAllCaps="false"
             style="?attr/materialButtonOutlinedStyle" />
 
-        <!-- Uninstall -->
         <Button
-            android:id="@+id/btnUninstallModule"
+            android:id="@+id/btnRemoveModule"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="24dp"
-            android:text="Uninstall module"
+            android:layout_marginTop="8dp"
+            android:text="Remove module"
             android:textAllCaps="false"
-            android:backgroundTint="@android:color/holo_red_light"
-            android:textColor="@android:color/white" />
+            android:textColor="#D32F2F"
+            style="?attr/materialButtonOutlinedStyle" />
+
     </LinearLayout>
 </ScrollView>

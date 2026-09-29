@@ -24,6 +24,16 @@ import java.util.Set;
  *
  * The decision is made in shouldApplyTo(pkg). XStealthModule calls
  * it at the top of handleLoadPackage().
+ *
+ * NEW IN THIS VERSION
+ * -------------------
+ *   • hideSettingsFileReads — gates SettingsFileCheck (Runtime.exec
+ *     and ProcessBuilder interception). Default true.
+ *   • hideSocketDaemons — gates SocketCheck. Default false, because
+ *     SocketCheck does nothing unless socketDaemons is populated,
+ *     and populating it requires per-daemon reverse engineering.
+ *   • socketDaemons — the list of daemon socket names SocketCheck
+ *     should shadow. Empty by default.
  */
 public final class XStealthConfig {
 
@@ -31,6 +41,26 @@ public final class XStealthConfig {
     public final boolean nextEnabled;
     public final boolean hideDevOptions;
     public final boolean hideAdb;
+
+    /**
+     * NEW: hide settings XML reads via Runtime.exec / ProcessBuilder.
+     * Gates SettingsFileCheck. Default true.
+     */
+    public final boolean hideSettingsFileReads;
+
+    /**
+     * NEW: enable SocketCheck. Default false. Even when true,
+     * SocketCheck does nothing unless socketDaemons is non-empty.
+     */
+    public final boolean hideSocketDaemons;
+
+    /**
+     * NEW: names of daemon unix sockets SocketCheck should shadow.
+     * Empty by default. Populated only when a specific daemon's
+     * protocol has been reversed.
+     */
+    public final Set<String> socketDaemons;
+
     public final boolean hideShizukuPackage;
     public final boolean hideShizuPosedPackage;
     public final boolean hideRunningProcesses;
@@ -49,6 +79,8 @@ public final class XStealthConfig {
         nextEnabled           = o.optBoolean("nextEnabled", false);
         hideDevOptions        = o.optBoolean("hideDevOptions", true);
         hideAdb               = o.optBoolean("hideAdb", true);
+        hideSettingsFileReads = o.optBoolean("hideSettingsFileReads", true);
+        hideSocketDaemons     = o.optBoolean("hideSocketDaemons", false);
         hideShizukuPackage    = o.optBoolean("hideShizukuPackage", true);
         hideShizuPosedPackage = o.optBoolean("hideShizuPosedPackage", true);
         hideRunningProcesses  = o.optBoolean("hideRunningProcesses", true);
@@ -65,6 +97,16 @@ public final class XStealthConfig {
             }
         }
         scope = Collections.unmodifiableSet(s);
+
+        Set<String> d = new HashSet<>();
+        JSONArray darr = o.optJSONArray("socketDaemons");
+        if (darr != null) {
+            for (int i = 0; i < darr.length(); i++) {
+                String name = darr.optString(i, null);
+                if (name != null && !name.isEmpty()) d.add(name);
+            }
+        }
+        socketDaemons = Collections.unmodifiableSet(d);
     }
 
     /**

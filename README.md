@@ -4,7 +4,7 @@
 
 ShizuPosed runs Xposed-API modules in apps launched through it — no root, no bootloader unlock, no system partition changes. Shizuku invokes `app_process` as the shell UID, a Java runtime bootstraps inside the target's process, and method hooks go in through a multi-backend dispatcher. Modules written for LSPosed and classic Xposed keep working.
 
-Version 6.7.
+Version 7.0.
 
 ---
 
@@ -52,7 +52,7 @@ The `Service.onCreate` gap is structural. There's no fallback because there's no
 
 ### Row interaction model
 
-The Modules tab row now supports four gestures, each doing one thing:
+The Modules tab row supports four gestures, each doing one thing:
 
 | Gesture | Action |
 |---|---|
@@ -61,7 +61,7 @@ The Modules tab row now supports four gestures, each doing one thing:
 | Tap the icon | Opens the detail sheet |
 | Long-press the row | Opens the module's UI through ShizuPosed |
 
-Uninstall moves to the detail sheet's `Uninstall` button. That's a deliberate change: opening a module's UI is a much more common action than removing it, and long-press is a reasonable gesture for it.
+Uninstall lives in the detail sheet's `Uninstall` button. That's a deliberate choice: opening a module's UI is a much more common action than removing it, and long-press is a reasonable gesture for it.
 
 ### Behavior of XStealth's row
 
@@ -89,12 +89,15 @@ Target process
   ├── ModuleLoader               dex load + entry invocation
   ├── ResourceHooking            resource + layout hooks
   ├── XStealthModule             built-in privacy module
-  │     ├── DevOptionsCheck      settings + resolver hooks
-  │     ├── AdbCheck             settings + resolver hooks
+  │     ├── DevOptionsCheck      Settings.Global + resolver hooks
+  │     ├── AdbCheck             Settings.Secure + Global + resolver
+  │     ├── SettingsFileCheck    Runtime.exec + ProcessBuilder
+  │     ├── SocketCheck          LocalSocket shim (opt-in)
   │     ├── PackageCheck         PackageManager lookups
   │     ├── RunningProcessCheck  ActivityManager lookups
   │     ├── ApiProtectionCheck   reflection + baselines
   │     ├── XStealthNative       libc symbol interposition
+  │     │     └── includes exec-family interposers
   │     └── XStealthNativeNext   libc syscall stub patching
   └── markers written to         <shell-base>/hooked/
 
@@ -138,9 +141,18 @@ XStealth ships with ShizuPosed and hides the framework's presence from detection
 
 XStealth applies to every app ShizuPosed launches. It has no per-app scope.
 
+XStealth is organized in two layers:
+
+- **Java-layer checks** — hook Android APIs inside the target's own process.
+- **Native layer** — interpose libc symbols and patch libc syscall stubs so native callers are also covered.
+
+Both layers fail open. A bug in a check means the target gets the real API result, not a crash.
+
 ### What XStealth hides
 
 **Developer Options and ADB.** Hooks every settings read path: `Settings.Global` and `Settings.Secure` static getters, the `ForUser` variants, and direct `ContentResolver.query` calls against `content://settings/{global,secure}/<key>`.
+
+**Subprocess reads of the settings XML (7.0).** `SettingsFileCheck` hooks `Runtime.exec` (all five overloads) and `ProcessBuilder.start()`. When a command references a settings XML path or a watched shell-side path, it returns a synthetic `Process` whose stdout is a scrubbed XML document, with exit code 0. The subprocess never spawns.
 
 **Shizuku and ShizuPosed packages.** Intercepts `PackageManager.getPackageInfo`, `getApplicationInfo`, `getInstalledPackages`, and `getInstalledApplications` — the int overloads and the newer `PackageInfoFlags` / `ApplicationInfoFlags` overloads.
 
@@ -154,7 +166,53 @@ XStealth applies to every app ShizuPosed launches. It has no per-app scope.
 
 ### What XStealth doesn't hide
 
-Hardware attestation (Play Integrity `MEETS_STRONG_INTEGRITY`). Root-empowered inspection. Server-side cross-reference. Native reads of the settings database. `Runtime.exec` subprocesses. Method-list reconstruction. Exotic reflection via `Unsafe` or JNI-level private methods. Signals unrelated to ShizuPosed: keyboard, accessibility services, overlay permissions, bootloader state, custom ROM, screen recorders.
+Hardware attestation (Play Integrity `MEETS_STRONG_INTEGRITY`). Root-empowered inspection. Server-side cross-reference. Native reads of the settings database that don't go through the exec family. Method-list reconstruction. Exotic reflection via `Unsafe` or JNI-level private methods. Signals unrelated to ShizuPosed: keyboard, accessibility services, overlay permissions, bootloader state, custom ROM, screen recorders.
+
+---
+
+## The subprocess gap (7.0)
+
+A common detection pattern is to bypass the Java settings API entirely and shell out:
+
+```java
+Runtime.getRuntime().exec(new String[]{
+    "sh", "-c",
+    "cat /data/system/users/0/settings_global.xml"});
+```
+
+The app never calls `Settings.Global.getInt()`. It never calls `ContentResolver.query()`. It reads the XML directly through a subprocess that has the file permission the app itself lacks.
+
+Before 7.0, XStealth did not cover this. An app using this pattern would see the real settings and detect Developer Options or ADB.
+
+7.0 closes the gap in two layers:
+
+**Java layer — `SettingsFileCheck`.** Hooks `Runtime.exec` (all five public overloads) and `ProcessBuilder.start()`. If a command references a watched settings XML path or a watched shell-side data path, the hook returns a synthetic `Process` that serves a scrubbed XML document on stdout, an empty stream on stderr, and `exitValue() == 0`. No subprocess spawns.
+
+**Native layer — `libxstealth.so` exec interposers.** Hooks `execve`, `posix_spawn`, `posix_spawnp`, `popen`, and `system`. This catches callers that go through JNI or a native library instead of the Java `Runtime.exec` API. The `posix_spawn` interposer catches `Runtime.exec` at the native layer on Android 10+, because `ProcessImpl` routes through it. So even if the Java hook is somehow bypassed, the native layer still serves scrubbed output.
+
+Both layers use the same narrow match rule: only commands that reference a watched path or a watched key alongside a file-reading verb are affected. `logcat -d`, `getprop`, and other unrelated shell-outs pass through unchanged.
+
+**Still not covered:** native `execve` called before the `.so` is loaded, or from a process that loaded its own copy of libc. That's a load-order limitation, not a design gap.
+
+---
+
+## Socket shim — opt-in, off by default (7.0)
+
+Some detection kits talk to a privileged daemon over a unix domain `LocalSocket` instead of through Binder. To intercept that traffic, XStealth includes `SocketCheck`.
+
+`SocketCheck` is **off by default** and installs **no hooks** unless a specific daemon is configured. The reasoning:
+
+- `LocalSocket` is used by crash reporters, analytics SDKs, media pipelines, and custom app IPC. Blanket-hooking it breaks apps.
+- Intercepting a daemon's traffic requires knowing that daemon's wire protocol. The protocol isn't guessable; it has to be reversed.
+- Without a protocol implementation, interception is a no-op that costs CPU and adds risk.
+
+The shape:
+
+- `SocketCheck.install(lpparam, config)` returns early if `config.hideSocketDaemons` is false or `config.socketDaemons` is empty.
+- When a daemon is configured, its traffic is shadowed but passed through byte-for-byte until a `Responder` for that daemon is registered. A no-op `Responder` is installed by default.
+- When you reverse a daemon's protocol, you swap the no-op for a real `Responder` and the shim starts serving synthetic replies.
+
+This is infrastructure, not a working feature. It exists so that when a specific daemon needs to be shimmed, the mechanism is already in place.
 
 ---
 
@@ -328,7 +386,11 @@ resparam.res.hookLayout(R.layout.main, new XC_LayoutInflated() {
 
 ## Requirements
 
-Android 10 or newer, ARM64. Shizuku 13.1.1 or newer, running and authorized — the recommended build is the fork by **thedjchi** at `github.com/thedjchi/Shizuku`. About 200 MB free storage. No root required. For building: JDK 21 and Android SDK 37. For rebuilding the native libraries: `clang` (Termux `clang` or NDK r25+).
+Android 10 or newer, ARM64. Shizuku 13.1.1 or newer, running and authorized — the recommended build is the fork by **thedjchi** at `github.com/thedjchi/Shizuku`. About 200 MB free storage. No root required.
+
+For building the app: JDK 21 and Android SDK 37.
+
+For rebuilding the native libraries: `clang` alone is sufficient on Termux. No NDK is required if you're building on-device, because Termux clang already targets the host platform (aarch64 Android) and ships the Android headers. If you're cross-compiling from a desktop, use NDK r25+ or Termux clang.
 
 Shevery is also supported, though some of its privileged-API paths have known issues.
 
@@ -341,7 +403,7 @@ Install Shizuku (fork recommended) from the link above, then start it via ADB or
 Install the ShizuPosed Manager APK:
 
 ```
-adb install -r ShizuPosed-R-6.2.apk
+adb install -r ShizuPosed-R-7.0.apk
 ```
 
 Or just tap the APK to install it. ADB is not required for the manager itself — only for starting Shizuku.
@@ -366,9 +428,16 @@ Five tabs.
 
 **Settings** has the runtime toggles, scan interval and hook delay sliders, cache management, and config export.
 
+The XStealth detail sheet gains two new toggles in 7.0:
+
+- **Hide subprocess reads** — gates `SettingsFileCheck`. On by default.
+- **Hide socket daemons** — gates `SocketCheck`. Off by default. Does nothing unless daemons are listed in the config.
+
 ---
 
 ## Building
+
+### The app
 
 ```bash
 export ANDROID_HOME=$HOME/Android/Sdk
@@ -378,16 +447,120 @@ cd ShizuPosed
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
+### The native libraries (7.0)
+
+On Termux, from the source directory:
+
+```bash
+pkg install clang binutils
+
+clang -shared -fPIC -O2 \
+    -o libxstealth.so \
+    libxstealth.c \
+    -llog -ldl -lpthread
+
+clang -shared -fPIC -O2 \
+    -o libxstealth_next.so \
+    libxstealth_next.c \
+    -llog -ldl -lpthread
+```
+
+No NDK, no target triple, no cross-compilation. Termux clang is already running on the target architecture and ships the Android headers (`jni.h`, `android/log.h`). If any header is missing:
+
+```bash
+pkg install ndk-sysroot
+```
+
+Deploy:
+
+```bash
+adb push libxstealth.so libxstealth_next.so /data/local/tmp/
+adb shell "cp /data/local/tmp/libxstealth.so \
+            /data/user/0/com.android.shell/files/libs/"
+adb shell "cp /data/local/tmp/libxstealth_next.so \
+            /data/user/0/com.android.shell/files/libs/"
+adb shell "chmod 644 /data/user/0/com.android.shell/files/libs/libxstealth*.so"
+```
+
+The Java side requires no changes when the native libraries are rebuilt — the JNI signatures are unchanged.
+
 ---
 
 ## Changelog
+
+### 7.0
+
+**NEW — subprocess hiding**
+
+• `SettingsFileCheck`: Java-layer interception of `Runtime.exec`
+  (all five overloads) and `ProcessBuilder.start()`. Commands that
+  reference a settings XML path or a watched shell-side path get a
+  synthetic `Process` serving scrubbed XML. Narrow match — only
+  commands with a watched path or a watched key plus a file-reading
+  verb are affected. Everything else passes through.
+
+• `libxstealth.so` grows exec-family interposers: `execve`,
+  `posix_spawn`, `posix_spawnp`, `popen`, `system`. The
+  `posix_spawn` hook catches `Runtime.exec` at the native layer on
+  Android 10+, since `ProcessImpl` routes through it.
+
+• Both layers fail open. If a hook throws, the real call proceeds.
+
+**NEW — socket shim (opt-in)**
+
+• `SocketCheck`: Java-layer shadow of `LocalSocket` connections to
+  configured daemons. Off by default. Installs no hooks unless a
+  daemon is listed in the config.
+
+• Without a registered `Responder` for a daemon, its traffic is
+  observed but passed through byte-for-byte. This is infrastructure
+  for future per-daemon shims, not a working feature.
+
+**NEW — native library reconstruction**
+
+• `libxstealth.c` and `libxstealth_next.c` are now reconstructable
+  from the shipped `.so`s. The reconstruction is behaviorally
+  equivalent, includes the exec-family additions, and compiles with
+  Termux clang without the NDK.
+
+**CONFIG**
+
+• `XStealthConfig` gains `hideSettingsFileReads` (default true) and
+  `hideSocketDaemons` + `socketDaemons` (default false / empty).
+
+**IMPROVED**
+
+• `XStealthModule` wires up the new checks. Registry counts reflect
+  them.
+
+• `XStealthNative.describe()` reports which interposers are
+  installed, including the new exec family.
+
+**NOTES**
+
+• The `Service.onCreate` and `system_server` gaps are unchanged.
+  The exec-family additions close a detection path, not a timing
+  path.
+
+• `SocketCheck` is deliberately narrow. It will not help against
+  Binder-based settings access (already covered by
+  `ContentResolver.query` hooks) or native `connect()` from JNI.
+
+### 6.9
+
+• add remove module in module sheet detail instead of uninstall module.
+
+### 6.8
+
+• remove uninstall module and long press launch app that cause an issues.
+• Fix the self hook not installed when open module app.
 
 ### 6.7
 
 • Improve design for add module to use material 3.
 • fix the issues when adding the module so it doesnt auto remove in 30-60 seconds.
 
-### 6.6 
+### 6.6
 
 • Remove the useless command -v that cause an issue when executing app_process.
 
@@ -547,15 +720,21 @@ These are structural, not bugs to be fixed.
 
 **`unhook()` on most backends is a no-op.** Pine, Amiru, Native, and Instrumentation don't expose a reverse. CallSite, Proxy, and Noop do.
 
-**XStealth's practical ceiling.** XStealth covers the common detection paths for Developer Options, ADB, package presence, running processes, `/proc` reads, and reflection walks. It doesn't cover hardware attestation, native reads of the settings database, `Runtime.exec` subprocesses, method-list reconstruction, exotic reflection, kernel-level watchers, or signals unrelated to ShizuPosed.
+**XStealth's practical ceiling.** XStealth covers the common detection paths for Developer Options, ADB, package presence, running processes, `/proc` reads, `Runtime.exec` subprocess reads, and reflection walks. It doesn't cover hardware attestation, native reads of the settings database that bypass the exec family entirely, method-list reconstruction, exotic reflection, kernel-level watchers, or signals unrelated to ShizuPosed.
 
 A banking app that shows a warning may be failing on any of these, not just the ones XStealth hides.
+
+**Subprocess hiding has a load-order window.** The exec-family interposers in `libxstealth.so` only catch subprocess spawns that happen after the library is loaded. Spawns during the app's earliest init, before `XStealthModule.handleLoadPackage()` runs, may slip through. In practice bootstrap mode installs hooks before `Application.onCreate`, so this window is small, but it exists.
+
+**Socket shim is inert by default.** `SocketCheck` installs no hooks unless a daemon is configured and a `Responder` is registered for it. Without both, it's a no-op. This is deliberate — the alternative is breaking every app that uses `LocalSocket`, which is most of them.
 
 **Android 11+.** Module UIs that want to report Activated via the status provider must declare ShizuPosed's provider authority in their own `<queries>` block.
 
 **Amiru-specific:** object arguments arrive as `null`, `thisObject` arrives as `null`, after-hooks aren't dispatched, JIT-inlined callers aren't invalidated, constructors aren't hookable, ARM64 only.
 
 **Native engines:** in-process only, object arguments and `thisObject` arrive as `null`, after-hooks aren't dispatched, ARM64 only.
+
+**Native reconstruction caveat.** The reconstructed `libxstealth_next.c` handlers call the resolved real symbol directly rather than executing the saved stub prologue as a trampoline. This is behaviorally equivalent for path hiding, but it means the reconstruction does not chain through any pre-existing patches on the same stub. If another framework is also patching those stubs, behavior may differ from the original `.so`.
 
 ---
 

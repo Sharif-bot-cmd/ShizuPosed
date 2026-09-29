@@ -5,6 +5,8 @@ import com.shizuposed.manager.stealth.checks.ApiProtectionCheck;
 import com.shizuposed.manager.stealth.checks.DevOptionsCheck;
 import com.shizuposed.manager.stealth.checks.PackageCheck;
 import com.shizuposed.manager.stealth.checks.RunningProcessCheck;
+import com.shizuposed.manager.stealth.checks.SettingsFileCheck;
+import com.shizuposed.manager.stealth.checks.SocketCheck;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XposedBridge;
@@ -31,6 +33,23 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * XStealth Next is a separate opt-in that activates the aggressive
  * native engine on top of the primary one. It's controlled by its
  * own toggle and has no effect when the master toggle is off.
+ *
+ * CHECK LAYERS
+ * ------------
+ *   DevOptionsCheck     — Settings.Global + ContentResolver.query
+ *   AdbCheck            — Settings.Secure + Settings.Global + query
+ *   SettingsFileCheck   — Runtime.exec + ProcessBuilder (NEW)
+ *   SocketCheck         — LocalSocket (NEW, off by default)
+ *   PackageCheck        — PackageManager lookups
+ *   RunningProcessCheck — ActivityManager lookups
+ *   ApiProtectionCheck  — reflection + fingerprint baselines
+ *   XStealthNative      — libc interposition (file reads)
+ *   XStealthNativeNext  — syscall stub patching
+ *
+ * The Java-layer checks cover the API surface. The native layer
+ * covers the syscall surface. SettingsFileCheck sits between them:
+ * it catches Java-level subprocess spawns that the native layer
+ * would otherwise miss on ROMs where posix_spawn isn't interposed.
  */
 public class XStealthModule implements IXposedHookLoadPackage {
 
@@ -69,6 +88,8 @@ public class XStealthModule implements IXposedHookLoadPackage {
             + (config.nextEnabled ? " (Next)" : "")
             + (config.isScopeAllApps() ? " (all apps)" : ""));
 
+        // ─── Settings-based checks ───────────────────────────────
+
         if (config.hideDevOptions) {
             try { DevOptionsCheck.install(lpparam); }
             catch (Throwable t) { XposedBridge.log(TAG + ": DevOptions hook failed: " + t); }
@@ -78,6 +99,31 @@ public class XStealthModule implements IXposedHookLoadPackage {
             try { AdbCheck.install(lpparam); }
             catch (Throwable t) { XposedBridge.log(TAG + ": ADB hook failed: " + t); }
         }
+
+        // ─── Subprocess reads (NEW) ──────────────────────────────
+        // Runtime.exec / ProcessBuilder hooks. Catches apps that
+        // shell out to `cat` or `grep` the settings XML directly.
+        // This is the Java-layer complement to the native execve
+        // interposer in libxstealth.so.
+        if (config.hideSettingsFileReads) {
+            try { SettingsFileCheck.install(lpparam); }
+            catch (Throwable t) {
+                XposedBridge.log(TAG + ": SettingsFileCheck failed: " + t);
+            }
+        }
+
+        // ─── Socket shim (NEW) ───────────────────────────────────
+        // Off by default. Even when on, does nothing unless
+        // config.socketDaemons is non-empty. SocketCheck decides
+        // whether to install hooks at all by consulting the config.
+        if (config.hideSocketDaemons) {
+            try { SocketCheck.install(lpparam, config); }
+            catch (Throwable t) {
+                XposedBridge.log(TAG + ": SocketCheck failed: " + t);
+            }
+        }
+
+        // ─── Package / process / API ─────────────────────────────
 
         if (config.hideShizukuPackage || config.hideShizuPosedPackage) {
             try { PackageCheck.install(lpparam, config); }
@@ -93,6 +139,8 @@ public class XStealthModule implements IXposedHookLoadPackage {
             try { ApiProtectionCheck.install(lpparam); }
             catch (Throwable t) { XposedBridge.log(TAG + ": ApiProtectionCheck failed: " + t); }
         }
+
+        // ─── Native layer ────────────────────────────────────────
 
         if (config.hideProcFs) {
             try {

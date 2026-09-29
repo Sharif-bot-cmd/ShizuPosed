@@ -5,6 +5,8 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.drawable.Drawable;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -15,6 +17,7 @@ import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.appcompat.app.AlertDialog;
 import androidx.fragment.app.Fragment;
 
 import com.google.android.material.bottomsheet.BottomSheetDialogFragment;
@@ -23,7 +26,7 @@ import com.shizuposed.manager.ShizukuHelper;
 import com.shizuposed.manager.adapter.IconResolver;
 import com.shizuposed.manager.core.ModuleLoader;
 import com.shizuposed.manager.model.ModuleInfo;
-import com.shizuposed.manager.service.ShizuPosedService;
+import com.shizuposed.manager.stealth.XStealthModule;
 import com.shizuposed.manager.utils.Logger;
 import com.shizuposed.manager.utils.ModuleActivityLauncher;
 import com.shizuposed.manager.utils.ModuleActivityResolver;
@@ -42,6 +45,8 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
 
     private volatile boolean viewReady = false;
     private ModuleActivityResolver.Result resolvedActivity;
+
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     public static ModuleDetailSheet newInstance(String packageName) {
         ModuleDetailSheet s = new ModuleDetailSheet();
@@ -79,7 +84,22 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             return;
         }
 
-        module = moduleLoader != null ? moduleLoader.getModule(pkg) : null;
+        // Force a fresh load so cachedDexPath reflects the current
+        // disk state. Otherwise we can read a stale in-memory record
+        // and skip the ShizuPosed launch path for no good reason.
+        if (moduleLoader != null) {
+            try {
+                moduleLoader.loadModules();
+            } catch (Throwable t) {
+                if (logger != null) {
+                    logger.w("ModuleDetailSheet: loadModules failed: "
+                        + t.getMessage());
+                }
+            }
+            module = moduleLoader.getModule(pkg);
+        } else {
+            module = null;
+        }
 
         if (module == null) {
             if (isAdded()) Toast.makeText(requireContext(),
@@ -91,6 +111,7 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
         bindHeader(view);
         bindActions(view);
         bindScope(view);
+        bindRemove(view);
     }
 
     @Override
@@ -142,7 +163,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
 
         Button openApp = v.findViewById(R.id.btnOpenModuleApp);
         Button forceStop = v.findViewById(R.id.btnForceStopScoped);
-        Button uninstall = v.findViewById(R.id.btnUninstallModule);
 
         if (openApp != null) {
             resolvedActivity = ModuleActivityResolver.resolve(
@@ -170,35 +190,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
         if (forceStop != null) {
             forceStop.setOnClickListener(x -> forceStopScopedApps());
         }
-
-        if (uninstall != null) {
-            uninstall.setOnClickListener(x -> {
-                Fragment parent = getParentFragment();
-                if (parent instanceof ModulesFragment) {
-                    ((ModulesFragment) parent).uninstallModule(module);
-                    dismissAllowingStateLoss();
-                } else {
-                    if (moduleLoader == null) return;
-                    boolean removed = moduleLoader.uninstallModule(module.packageName);
-                    if (removed) {
-                        try {
-                            if (isAdded()) {
-                                Intent i = new Intent(requireContext(),
-                                    ShizuPosedService.class);
-                                i.setAction(ShizuPosedService.ACTION_REPUSH_MODULES);
-                                requireContext().startForegroundService(i);
-                            }
-                        } catch (Throwable ignored) {}
-                        if (isAdded()) Toast.makeText(requireContext(),
-                            "Module uninstalled", Toast.LENGTH_SHORT).show();
-                    } else {
-                        if (isAdded()) Toast.makeText(requireContext(),
-                            "Uninstall failed", Toast.LENGTH_SHORT).show();
-                    }
-                    dismissAllowingStateLoss();
-                }
-            });
-        }
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -212,15 +203,10 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
      *
      *   1. Launch through ShizuPosed. This runs the module's UI
      *      inside app_process with hooks installed, which is what
-     *      self-hook-based activation checks need to see. Modules
-     *      hook one of their own UI methods and use the presence
-     *      of that hook as the activation signal. Without this
-     *      path, they always show "Disabled" even when their
-     *      target hooks work.
+     *      self-hook-based activation checks need to see.
      *
      *   2. Exported activity, launched directly. Fast, no Shizuku
-     *      round-trip. Used as a fallback when path 1 isn't
-     *      available. The module's UI will open, but its own
+     *      round-trip. The module's UI will open, but its own
      *      process has no hooks — self-hook checks return the
      *      original value. The user is warned.
      *
@@ -267,10 +253,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
         }
 
         if (launched) {
-            // Warn the user. The UI opened, but without ShizuPosed
-            // in its process, self-hook activation checks don't
-            // fire. A module that checks MainActivity.isXposedEnabled
-            // will show "Disabled" even though it's working.
             Toast.makeText(requireContext(),
                 "Opened directly. If the module UI reports "
                 + "\"Disabled\" or \"Not Activated,\" close it and "
@@ -278,7 +260,8 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                 Toast.LENGTH_LONG).show();
             if (logger != null) {
                 logger.i("Direct launch for " + module.packageName
-                    + " — self-hook not installed");
+                    + " — module UI opened without ShizuPosed in its "
+                    + "process; self-hook activation checks will not fire");
             }
         } else {
             String reason = resolvedActivity.isExported
@@ -296,6 +279,10 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
      * Returns true if the launch was dispatched successfully. When
      * it returns true, the caller must not launch the UI by any
      * other path.
+     *
+     * The cachedDexPath guard runs through ensureCachedDex() so a
+     * stale or missing record is repaired against the actual disk
+     * contents before we decide whether ShizuPosed can handle it.
      */
     private boolean tryLaunchThroughShizuPosed() {
         try {
@@ -307,12 +294,28 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                 return false;
             }
 
-            if (module == null
-                    || module.cachedDexPath == null
-                    || module.cachedDexPath.isEmpty()) {
+            if (module == null) {
+                return false;
+            }
+
+            // Repair cachedDexPath from disk if the in-memory record
+            // is stale or missing. Without this, a valid module can
+            // silently fall through to the direct-launch path and
+            // the user gets the "self-hook not installed" warning
+            // for no real reason.
+            boolean dexOk = module.cachedDexPath != null
+                && !module.cachedDexPath.isEmpty()
+                && new java.io.File(module.cachedDexPath).exists();
+
+            if (!dexOk && moduleLoader != null) {
+                dexOk = moduleLoader.ensureCachedDex(module);
+            }
+
+            if (!dexOk) {
                 if (logger != null) {
-                    logger.d("tryLaunchThroughShizuPosed: no cached dex for "
-                        + (module != null ? module.packageName : "null"));
+                    logger.d("tryLaunchThroughShizuPosed: no dex available for "
+                        + module.packageName
+                        + " (apkPath=" + module.apkPath + ")");
                 }
                 return false;
             }
@@ -392,6 +395,75 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                 }
             });
         }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // REMOVE MODULE
+    // ═════════════════════════════════════════════════════════════
+
+    private void bindRemove(View v) {
+        if (!viewReady || module == null) return;
+
+        Button remove = v.findViewById(R.id.btnRemoveModule);
+        if (remove == null) return;
+
+        // XStealth is built-in — no removal.
+        if (XStealthModule.PACKAGE.equals(module.packageName)) {
+            remove.setVisibility(View.GONE);
+            return;
+        }
+
+        remove.setOnClickListener(x -> confirmRemove());
+    }
+
+    private void confirmRemove() {
+        if (!isAdded() || module == null) return;
+
+        final String display = module.name != null ? module.name : module.packageName;
+
+        new AlertDialog.Builder(requireContext())
+            .setTitle("Remove module?")
+            .setMessage("This will stop ShizuPosed from loading "
+                + display
+                + " and ask the system to uninstall the app.\n\n"
+                + "The uninstall prompt will appear next.")
+            .setPositiveButton("Remove", (d, w) -> doRemove())
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    private void doRemove() {
+        if (!isAdded() || module == null || moduleLoader == null) return;
+
+        final String pkg = module.packageName;
+        final Fragment parent = getParentFragment();
+
+        moduleLoader.uninstallModuleCompletely(
+            requireActivity(),
+            pkg,
+            (code, message) -> mainHandler.post(() -> {
+                if (!isAdded()) return;
+
+                // Drop the row from the Modules tab immediately.
+                if (parent instanceof ModulesFragment) {
+                    ((ModulesFragment) parent).onModuleRemoved(pkg);
+                }
+
+                if (message != null) {
+                    Toast.makeText(requireContext(), message,
+                        Toast.LENGTH_LONG).show();
+                }
+
+                if (logger != null) {
+                    logger.i("Remove module " + pkg
+                        + " result code=" + code + " msg=" + message);
+                }
+
+                if (code == ModuleLoader.UNINSTALL_OK
+                        || code == ModuleLoader.UNINSTALL_DEREGISTERED_ONLY) {
+                    dismissAllowingStateLoss();
+                }
+            }));
     }
 
     // ═════════════════════════════════════════════════════════════

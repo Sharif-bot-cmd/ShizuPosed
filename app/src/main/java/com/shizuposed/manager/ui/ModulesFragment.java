@@ -76,18 +76,18 @@ import java.util.concurrent.Executors;
  *                              detail sheet for XStealth).
  *   • Tapping the switch     → toggles the module.
  *   • Tapping the icon       → opens the detail sheet.
- *   • Long-pressing the row  → opens the module's own UI through
- *                              ShizuPosed. Installs the self-hook
- *                              that modules relying on
- *                              MainActivity.isXposedEnabled() need.
+ *
+ * Opening a module's own UI (with the self-hook activation
+ * installed) is done from the detail sheet's "Open module app"
+ * button. Uninstall is no longer exposed in the UI.
  *
  * LAUNCH RESULT BROADCAST (R-6.5+)
  * ---------------------------------
- * launchUnderShizuPosed() now registers a receiver for
+ * launchUnderShizuPosed() registers a receiver for
  * ShizuPosedService.ACTION_LAUNCH_RESULT. The service broadcasts
  * after the app_process spawn succeeds or fails, so the UI can
- * report the real outcome instead of the optimistic "Launching…"
- * toast the previous version showed unconditionally.
+ * report the real outcome instead of an optimistic "Launching…"
+ * toast.
  *
  * An in-flight guard prevents double-taps from spawning two
  * app_process instances, and an 8-second timeout clears the guard
@@ -481,27 +481,12 @@ public class ModulesFragment extends Fragment {
             }
 
             @Override
-            public void onUninstall(ModuleInfo module) {
-                uninstallModule(module);
-            }
-
-            @Override
             public void onEditScope(ModuleInfo module) {
                 if (XStealthModule.PACKAGE.equals(module.packageName)) {
                     showModuleDetail(module);
                 } else {
                     showSelectAppsDialog(module);
                 }
-            }
-
-            @Override
-            public void onOpenModuleApp(ModuleInfo module) {
-                if (module == null || module.packageName == null) return;
-                if (XStealthModule.PACKAGE.equals(module.packageName)) {
-                    showModuleDetail(module);
-                    return;
-                }
-                launchUnderShizuPosed(module.packageName);
             }
         });
         moduleRecyclerView.setLayoutManager(new LinearLayoutManager(requireContext()));
@@ -1132,79 +1117,6 @@ public class ModulesFragment extends Fragment {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // UNINSTALL (full — deregister + remove APK)
-    // ═════════════════════════════════════════════════════════════
-
-    public void uninstallModule(ModuleInfo module) {
-        if (module == null || !isAdded() || !viewReady) return;
-
-        if (XStealthModule.PACKAGE.equals(module.packageName)) {
-            confirmDialog = new AlertDialog.Builder(requireContext())
-                .setTitle("XStealth is built-in")
-                .setMessage("XStealth ships with ShizuPosed and cannot be removed. "
-                    + "Disable it instead?")
-                .setPositiveButton("Disable", (dialog, which) -> {
-                    XStealthPrefs.setEnabled(requireContext(), false);
-                    if (isAdded()) Toast.makeText(requireContext(),
-                        "XStealth disabled", Toast.LENGTH_SHORT).show();
-                    loadModules();
-                    requestModuleRepush("disable xstealth");
-                })
-                .setNegativeButton("Cancel", null)
-                .create();
-            confirmDialog.show();
-            return;
-        }
-
-        confirmDialog = new AlertDialog.Builder(requireContext())
-            .setTitle("Uninstall "
-                + (module.name != null ? module.name : module.packageName) + "?")
-            .setMessage("This will:\n\n"
-                + "• Remove the module from ShizuPosed\n"
-                + "• Uninstall the app from your device\n\n"
-                + "You will see the system uninstall dialog next.")
-            .setPositiveButton("Uninstall", (dialog, which) -> performFullUninstall(module))
-            .setNegativeButton("Cancel", null)
-            .create();
-        confirmDialog.show();
-    }
-
-    private void performFullUninstall(ModuleInfo module) {
-        if (module == null || !isAdded() || getContext() == null) return;
-        if (moduleLoader == null) return;
-
-        moduleLoader.uninstallModuleCompletely(
-            requireContext(),
-            module.packageName,
-            (code, message) -> {
-                if (!isAdded()) return;
-                switch (code) {
-                    case ModuleLoader.UNINSTALL_OK:
-                        onModuleRemoved(module.packageName);
-                        Toast.makeText(requireContext(),
-                            "Deregistered. Confirm the system dialog to remove the app.",
-                            Toast.LENGTH_LONG).show();
-                        break;
-                    case ModuleLoader.UNINSTALL_DEREGISTERED_ONLY:
-                        onModuleRemoved(module.packageName);
-                        Toast.makeText(requireContext(), message,
-                            Toast.LENGTH_LONG).show();
-                        break;
-                    case ModuleLoader.UNINSTALL_BUILTIN:
-                        Toast.makeText(requireContext(), message,
-                            Toast.LENGTH_SHORT).show();
-                        break;
-                    case ModuleLoader.UNINSTALL_FAILED:
-                    default:
-                        Toast.makeText(requireContext(),
-                            "Uninstall failed: " + message,
-                            Toast.LENGTH_LONG).show();
-                        break;
-                }
-            });
-    }
-
-    // ═════════════════════════════════════════════════════════════
     // ADD MODULE
     // ═════════════════════════════════════════════════════════════
 
@@ -1455,9 +1367,7 @@ public class ModulesFragment extends Fragment {
             loadModules();
 
             // Only delete the cache copy if installModule() did NOT
-            // rewrite apkPath to point somewhere durable. If it
-            // copied the APK to filesDir/imported_modules/, the
-            // cache file is no longer referenced and can be removed.
+            // rewrite apkPath to point somewhere durable.
             String resolved = module.apkPath;
             if (resolved != null
                     && resolved.startsWith(

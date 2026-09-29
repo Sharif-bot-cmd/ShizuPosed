@@ -692,6 +692,84 @@ public class ModuleLoader {
         }
     }
 
+    public boolean ensureCachedDex(ModuleInfo module) {
+        if (module == null || module.packageName == null) return false;
+
+        // 1. Already valid.
+        if (module.cachedDexPath != null
+                && new File(module.cachedDexPath).exists()) {
+            return true;
+        }
+
+        // 2. External dex cache.
+        File externalDex = new File(dexCacheDir, module.packageName + ".dex");
+        if (externalDex.exists() && externalDex.length() > 0) {
+            module.cachedDexPath = externalDex.getAbsolutePath();
+            externalDex.setReadable(true, false);
+            saveModule(module);
+            if (logger != null) {
+                logger.i("ensureCachedDex: repaired via external cache for "
+                    + module.packageName + " -> " + module.cachedDexPath);
+            }
+            return true;
+        }
+
+        // 3. Legacy dex cache.
+        File legacyDex = new File(legacyDexCacheDir, module.packageName + ".dex");
+        if (legacyDex.exists() && legacyDex.length() > 0) {
+            File dst = new File(dexCacheDir, module.packageName + ".dex");
+            try (FileInputStream in = new FileInputStream(legacyDex);
+                 FileOutputStream out = new FileOutputStream(dst)) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                out.flush();
+            } catch (Throwable t) {
+                if (logger != null) {
+                    logger.w("ensureCachedDex: legacy copy failed for "
+                        + module.packageName + ": " + t.getMessage());
+                }
+                return false;
+            }
+            dst.setReadable(true, false);
+            module.cachedDexPath = dst.getAbsolutePath();
+            saveModule(module);
+            if (logger != null) {
+                logger.i("ensureCachedDex: repaired via legacy cache for "
+                    + module.packageName + " -> " + module.cachedDexPath);
+            }
+            return true;
+        }
+
+        // 4. Re-derive from APK.
+        if (module.apkPath != null && new File(module.apkPath).exists()) {
+            try {
+                scanModuleForEntryPoints(module);
+            } catch (Throwable t) {
+                if (logger != null) {
+                    logger.w("ensureCachedDex: re-scan failed for "
+                        + module.packageName + ": " + t.getMessage());
+                }
+            }
+            if (module.cachedDexPath != null
+                    && new File(module.cachedDexPath).exists()) {
+                saveModule(module);
+                if (logger != null) {
+                    logger.i("ensureCachedDex: re-derived from APK for "
+                        + module.packageName + " -> " + module.cachedDexPath);
+                }
+                return true;
+            }
+        }
+
+        if (logger != null) {
+            logger.w("ensureCachedDex: no dex available for "
+                + module.packageName
+                + " (apkPath=" + module.apkPath + ")");
+        }
+        return false;
+    }
+
     public List<ModuleInfo> getEnabledModules() {
         cacheLock.readLock().lock();
         try {

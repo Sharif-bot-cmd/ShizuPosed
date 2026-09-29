@@ -26,30 +26,18 @@ import java.util.List;
  * Row adapter for the Modules tab, LSPosed-style.
  *
  * Row interaction model:
- *   • Tapping the row body opens the scope editor.
+ *   • Tapping the row body opens the scope editor (or the detail
+ *     sheet for XStealth).
  *   • Tapping the enable switch toggles the module.
  *   • Tapping the icon opens the detail sheet.
- *   • Long-pressing the row opens the module's own UI through
- *     ShizuPosed. This is the path that installs the self-hook
- *     activation checks that UI modules rely on.
+ *
+ * Opening a module's own UI (with the self-hook activation
+ * installed) is done from the detail sheet's "Open module app"
+ * button.
  *
  * XStealth's row still has no enable switch. Its toggle lives in
  * the detail sheet. Tapping the row opens the detail sheet for it,
  * not the scope editor.
- *
- * The self-hook pattern
- * ---------------------
- * Some modules check their own activation state by hooking a
- * method on their own UI (e.g. MainActivity.isXposedEnabled).
- * The presence of that hook is the signal. Under LSPosed this
- * works automatically because LSPosed injects into every process.
- * Under ShizuPosed the module's own process only gets hooks if
- * the module's UI is launched through ShizuPosed.
- *
- * Long-press dispatches through the caller, which routes the
- * launch through ShizuPosedService instead of the launcher. That
- * is the difference between a module UI showing "Enabled" and
- * showing "Disabled."
  */
 public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleViewHolder> {
 
@@ -62,19 +50,12 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
     public interface OnModuleActionListener {
         void onToggle(ModuleInfo module, boolean enable);
         void onDetail(ModuleInfo module);
-        void onUninstall(ModuleInfo module);
         /**
          * Row body tapped. For normal modules this should open the
          * scope editor. For XStealth it should open the detail
          * sheet.
          */
         void onEditScope(ModuleInfo module);
-        /**
-         * Row long-pressed. Opens the module's own UI through
-         * ShizuPosed, so its own process gets hooks and any
-         * self-hook activation check fires.
-         */
-        void onOpenModuleApp(ModuleInfo module);
     }
 
     public ModuleAdapter(List<ModuleInfo> modules, Context context) {
@@ -189,13 +170,9 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
             if (listener != null) listener.onEditScope(module);
         });
 
-        // Long-press → open the module's own UI through ShizuPosed.
-        // This is the gesture that installs the self-hook activation
-        // check for modules that use one.
-        holder.itemView.setOnLongClickListener(v -> {
-            if (listener != null) listener.onOpenModuleApp(module);
-            return true;
-        });
+        // Long-press disabled — launching the module UI is done from
+        // the detail sheet's "Open module app" button instead.
+        holder.itemView.setOnLongClickListener(null);
 
         // Icon tap → detail sheet
         if (holder.ivIcon != null) {
@@ -212,8 +189,6 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
      *   • Chevron visible but its semantics are "open detail", not
      *     "edit scope".
      *   • Row tap opens the detail sheet.
-     *   • Long-press is the same as a tap, since XStealth has no
-     *     launchable UI.
      */
     private void bindXStealthRow(ModuleViewHolder holder, ModuleInfo module) {
         boolean enabled = XStealthPrefs.isEnabled(context);
@@ -250,12 +225,8 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
             if (listener != null) listener.onDetail(module);
         });
 
-        // Long-press → detail sheet too. XStealth has no launchable
-        // UI, so there's nothing to open through ShizuPosed.
-        holder.itemView.setOnLongClickListener(v -> {
-            if (listener != null) listener.onDetail(module);
-            return true;
-        });
+        // Long-press disabled.
+        holder.itemView.setOnLongClickListener(null);
 
         if (holder.ivIcon != null) {
             holder.ivIcon.setOnClickListener(v -> {
