@@ -7,6 +7,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 
+import de.robv.android.xposed.IXUnhook;
 import de.robv.android.xposed.XC_MethodHook;
 
 public final class XposedHelpersImpl {
@@ -113,18 +114,6 @@ public final class XposedHelpersImpl {
 
     // ─── resolution helpers (called by XposedHelpers façade) ────────
 
-    /**
-     * Resolve a Method from (class, name, parameterTypes) where the
-     * parameterTypesAndCallback array may include a trailing
-     * XC_MethodHook / callback object that must be ignored during
-     * method resolution.
-     *
-     * @param clazz                       the class to search
-     * @param name                        method name
-     * @param parameterTypesAndCallback   parameter classes, optionally
-     *                                    followed by a callback
-     * @return the resolved Method, or null if not found
-     */
     public static Method resolveMethod(Class<?> clazz,
                                        String name,
                                        Object[] parameterTypesAndCallback) {
@@ -133,9 +122,8 @@ public final class XposedHelpersImpl {
         int len = (parameterTypesAndCallback == null)
             ? 0 : parameterTypesAndCallback.length;
 
-        // The last element may be the callback, not a parameter type.
         if (len > 0 && !(parameterTypesAndCallback[len - 1] instanceof Class)) {
-            len--; // drop the trailing callback
+            len--;
         }
 
         Class<?>[] parameterTypes = new Class<?>[len];
@@ -148,7 +136,6 @@ public final class XposedHelpersImpl {
             parameterTypes[i] = (Class<?>) o;
         }
 
-        // Walk the hierarchy looking for a declared match.
         for (Class<?> c = clazz; c != null; c = c.getSuperclass()) {
             try {
                 return c.getDeclaredMethod(name, parameterTypes);
@@ -162,10 +149,42 @@ public final class XposedHelpersImpl {
         return null;
     }
 
-    /**
-     * Extract the trailing XC_MethodHook from the
-     * parameterTypesAndCallback array. Returns null if none present.
-     */
+    public static Constructor<?> resolveConstructor(
+            Class<?> clazz,
+            Object[] parameterTypesAndCallback) {
+        if (clazz == null) return null;
+
+        int len = (parameterTypesAndCallback == null)
+            ? 0 : parameterTypesAndCallback.length;
+
+        if (len > 0 && !(parameterTypesAndCallback[len - 1] instanceof Class)) {
+            len--;
+        }
+
+        Class<?>[] parameterTypes = new Class<?>[len];
+        for (int i = 0; i < len; i++) {
+            Object o = parameterTypesAndCallback[i];
+            if (!(o instanceof Class)) {
+                log("resolveConstructor: parameter " + i
+                    + " is not a Class: " + o);
+                return null;
+            }
+            parameterTypes[i] = (Class<?>) o;
+        }
+
+        try {
+            return clazz.getDeclaredConstructor(parameterTypes);
+        } catch (NoSuchMethodException e) {
+            log("resolveConstructor: no <init> on " + clazz.getName()
+                + " matching " + java.util.Arrays.toString(parameterTypes));
+            return null;
+        } catch (Throwable t) {
+            log("resolveConstructor error on " + clazz.getName()
+                + ": " + t.getMessage());
+            return null;
+        }
+    }
+
     public static XC_MethodHook extractCallback(Object[] parameterTypesAndCallback) {
         if (parameterTypesAndCallback == null
                 || parameterTypesAndCallback.length == 0) {
@@ -181,7 +200,6 @@ public final class XposedHelpersImpl {
 
     // ─── hook entry points ───────────────────────────────────────────
 
-    /** The standard Xposed findAndHookMethod signature the modules call. */
     public static void findAndHookMethod(
             Object classOrName,
             ClassLoader cl,
@@ -216,6 +234,47 @@ public final class XposedHelpersImpl {
 
         } catch (Throwable t) {
             log("findAndHookMethod failed: " + methodName + " — " + t.getMessage());
+        }
+    }
+
+    /**
+     * Resolve and install a hook on a single constructor.
+     *
+     * Returns an IXUnhook handle. Where the backend tracks a
+     * reverse (CallSite, Proxy, Noop), unhook() performs it; where
+     * it doesn't (Pine, Amiru, Native, Instrumentation), unhook()
+     * is a no-op, matching the contract in IXUnhook's javadoc.
+     */
+    public static IXUnhook<XC_MethodHook> findAndHookConstructor(
+            Object classOrName,
+            ClassLoader cl,
+            Object... parameterTypesAndCallback) {
+
+        if (parameterTypesAndCallback.length < 1) {
+            log("findAndHookConstructor: missing callback");
+            return null;
+        }
+
+        try {
+            Class<?> clazz = (classOrName instanceof Class)
+                ? (Class<?>) classOrName
+                : Class.forName((String) classOrName, false, cl);
+
+            Constructor<?> ctor =
+                resolveConstructor(clazz, parameterTypesAndCallback);
+            if (ctor == null) return null;
+
+            XC_MethodHook cb = extractCallback(parameterTypesAndCallback);
+            if (cb == null) {
+                log("findAndHookConstructor: last arg is not XC_MethodHook");
+                return null;
+            }
+
+            return XposedHookBridge.installConstructorHookWithHandle(ctor, cb);
+
+        } catch (Throwable t) {
+            log("findAndHookConstructor failed: " + t.getMessage());
+            return null;
         }
     }
 
@@ -275,7 +334,6 @@ public final class XposedHelpersImpl {
         catch (Throwable ignored) {}
     }
 
-    // suppress unused warning
     @SuppressWarnings("unused")
     private static void unused() { int m = Modifier.PUBLIC; }
 }

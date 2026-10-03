@@ -1,10 +1,10 @@
 package com.shizuposed.manager.stealth.checks;
 
 import android.content.ContentResolver;
-import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
 
+import com.shizuposed.manager.stealth.XStealthConfig;
 import com.shizuposed.manager.stealth.XStealthRegistry;
 
 import de.robv.android.xposed.XC_MethodHook;
@@ -18,7 +18,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Hides that Developer Options are enabled. Hooks every common
  * path an app uses to read the setting:
  *
- *   • Settings.Global.getInt / getString / getLong
+ *   • Settings.Global.getInt / getString / getLong / getFloat
  *   • Settings.Global.getIntForUser / getStringForUser / getLongForUser
  *   • ContentResolver.query on content://settings/global/<key>
  *
@@ -37,9 +37,12 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *
  * Return values from query() are a MatrixCursor shaped like the
  * real settings cursor: columns "name" and "value". Apps that
- * expect those columns find them. Apps that expect columns we
- * don't provide fall through to their own error handling, which
- * for a detection check means "not detected" — the desired outcome.
+ * expect those columns find them.
+ *
+ * This class is also the canonical source of the hidden-key list.
+ * AdbCheck and CachedValueCheck both delegate to hidesKey() so a
+ * cached read and a live read can never return different values
+ * for the same key.
  */
 public final class DevOptionsCheck {
 
@@ -54,7 +57,11 @@ public final class DevOptionsCheck {
 
     private DevOptionsCheck() {}
 
-    public static void install(XC_LoadPackage.LoadPackageParam lpparam) {
+    public static void install(XC_LoadPackage.LoadPackageParam lpparam,
+                               XStealthConfig config) {
+        if (lpparam == null || config == null) return;
+        if (!config.hideDevOptions) return;
+
         Class<?> settingsGlobal = XposedHelpers.findClassIfExists(
             "android.provider.Settings$Global", lpparam.classLoader);
         if (settingsGlobal == null) return;
@@ -79,7 +86,7 @@ public final class DevOptionsCheck {
                 ContentResolver.class, String.class, int.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult(0);
+                        if (hidesKey((String) p.args[1])) p.setResult(0);
                     }
                 });
         } catch (Throwable t) {
@@ -93,7 +100,7 @@ public final class DevOptionsCheck {
                 ContentResolver.class, String.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult("0");
+                        if (hidesKey((String) p.args[1])) p.setResult("0");
                     }
                 });
         } catch (Throwable t) {
@@ -107,7 +114,7 @@ public final class DevOptionsCheck {
                 ContentResolver.class, String.class, long.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult(0L);
+                        if (hidesKey((String) p.args[1])) p.setResult(0L);
                     }
                 });
         } catch (Throwable t) {
@@ -121,7 +128,7 @@ public final class DevOptionsCheck {
                 ContentResolver.class, String.class, float.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult(0f);
+                        if (hidesKey((String) p.args[1])) p.setResult(0f);
                     }
                 });
         } catch (Throwable t) {
@@ -141,7 +148,7 @@ public final class DevOptionsCheck {
                 ContentResolver.class, String.class, int.class, int.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult(0);
+                        if (hidesKey((String) p.args[1])) p.setResult(0);
                     }
                 });
         } catch (Throwable t) {
@@ -155,7 +162,7 @@ public final class DevOptionsCheck {
                 ContentResolver.class, String.class, int.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult("0");
+                        if (hidesKey((String) p.args[1])) p.setResult("0");
                     }
                 });
         } catch (Throwable t) {
@@ -169,7 +176,7 @@ public final class DevOptionsCheck {
                 ContentResolver.class, String.class, long.class, int.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult(0L);
+                        if (hidesKey((String) p.args[1])) p.setResult(0L);
                     }
                 });
         } catch (Throwable t) {
@@ -187,14 +194,13 @@ public final class DevOptionsCheck {
      * one of the hidden ones, return a synthetic cursor whose value
      * column reads 0.
      *
-     * The cursor shape matches what SettingsProvider returns: columns
-     * "_id", "name", "value". Apps that expect those columns find
-     * them.
-     *
-     * If the query has a WHERE clause filtering on name, we check
-     * the name we're returning is consistent with the filter. If not,
-     * we return an empty cursor. The app then reads zero rows and
-     * treats the setting as absent, which is the desired outcome.
+     * If the query has a WHERE clause filtering on a DIFFERENT key,
+     * return an empty cursor rather than a fake row for our key.
+     * The previous version of this method checked
+     * selection.contains("name"), which is true for every settings
+     * query, making the empty-cursor branch dead code. The check
+     * now looks at the bound selection args, which is where the
+     * key actually lives in a "name=?" query.
      */
     private static void hookContentResolverQuery() {
         try {
@@ -210,13 +216,12 @@ public final class DevOptionsCheck {
                         if (uri == null) return;
                         String key = extractSettingsKey(uri);
                         if (key == null) return;
-                        if (!isHiddenKey(key)) return;
+                        if (!hidesKey(key)) return;
 
                         String selection = (String) p.args[2];
-                        if (selection != null && !selectionMatches(selection, key)) {
-                            // The query filters on a different name.
-                            // Return an empty cursor so the caller
-                            // sees no rows.
+                        String[] selArgs = (String[]) p.args[3];
+                        if (!AdbCheck.selectionReferencesKey(
+                                selection, selArgs, key)) {
                             p.setResult(new MatrixCursor(
                                 new String[]{"_id", "name", "value"}));
                             return;
@@ -235,7 +240,7 @@ public final class DevOptionsCheck {
 
     /**
      * Extract the setting key from a settings URI. Returns null for
-     * any URI that isn't content://settings/{global,secure,<namespace>}/<key>.
+     * any URI that isn't content://settings/{global,secure}/<key>.
      */
     private static String extractSettingsKey(Uri uri) {
         if (uri == null) return null;
@@ -243,7 +248,6 @@ public final class DevOptionsCheck {
         if (!"settings".equals(authority)) return null;
         String path = uri.getPath();
         if (path == null) return null;
-        // Paths look like /global/<key> or /secure/<key>.
         if (!path.startsWith("/global/") && !path.startsWith("/secure/")) {
             return null;
         }
@@ -252,21 +256,8 @@ public final class DevOptionsCheck {
         return path.substring(slash + 1);
     }
 
-    /**
-     * Does the caller's WHERE clause reference the key we want to
-     * hide? If it does, we can return a fake row. If it references
-     * a different key, we should return no rows.
-     */
-    private static boolean selectionMatches(String selection, String key) {
-        if (selection == null || key == null) return false;
-        // Cheap check: does the selection contain the key name?
-        // Full SQL parsing isn't needed here — SettingsProvider
-        // queries typically use "name=?" or "name = ?" patterns.
-        return selection.contains(key) || selection.contains("name");
-    }
-
     // ═════════════════════════════════════════════════════════════
-    // Key matching
+    // Key matching — canonical for the whole package
     // ═════════════════════════════════════════════════════════════
 
     /**
@@ -277,11 +268,10 @@ public final class DevOptionsCheck {
      *   • "content://settings/global/development_settings_enabled"
      *   • "/global/development_settings_enabled"
      *
-     * The last two are useful when a caller passes a URI-shaped
-     * string where a plain key was expected. Some apps do this by
-     * mistake, or by design to sidestep naive hooks.
+     * Package-visible so AdbCheck and CachedValueCheck share one
+     * canonical list. Do not duplicate this method anywhere else.
      */
-    private static boolean isHiddenKey(String keyOrUri) {
+    static boolean hidesKey(String keyOrUri) {
         if (keyOrUri == null) return false;
         String key = keyOrUri;
         int slash = keyOrUri.lastIndexOf('/');

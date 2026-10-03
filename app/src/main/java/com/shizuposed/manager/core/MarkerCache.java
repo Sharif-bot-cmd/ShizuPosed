@@ -118,15 +118,11 @@ public final class MarkerCache {
             }
             if (hookedDir == null) return -1;
 
-            // Single compound command. `cd` may fail if the directory
-            // has been removed; `|| exit 0` turns that into a clean
-            // no-op instead of a shell error.
-            //
-            // `for f in *.json` with no matches expands to the literal
-            // pattern in some shells, so the `[ -f "$f" ] || continue`
-            // guard is required.
             String cmd =
-                "cd " + hookedDir + " 2>/dev/null || exit 0; "
+                "cd " + hookedDir + " 2>/dev/null; "
+                + "rc=$?; "
+                + "if [ $rc -ne 0 ]; then echo '=== NO_DIR rc='$rc; exit 0; fi; "
+                + "echo '=== DIR_OK'; "
                 + "for f in *.json; do "
                 + "  [ -f \"$f\" ] || continue; "
                 + "  echo '" + DELIM_BEGIN + "'\"$f\"; "
@@ -141,6 +137,12 @@ public final class MarkerCache {
                     logger.w("[" + TAG + "] refresh: shell returned null");
                 }
                 return -1;
+            }
+
+            if (logger != null) {
+                int stdoutLines = r.stdout == null ? 0 : r.stdout.size();
+                logger.d("[" + TAG + "] refresh: shell returned "
+                    + stdoutLines + " line(s)");
             }
 
             Map<String, String> parsed = parseMarkers(r.stdout);

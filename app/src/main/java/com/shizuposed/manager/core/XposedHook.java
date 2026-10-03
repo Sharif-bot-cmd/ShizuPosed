@@ -35,7 +35,6 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 import dalvik.system.DexClassLoader;
-import de.robv.android.xposed.IXposedHookCmdInit;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XResources;
 import de.robv.android.xposed.callbacks.XC_InitPackageResources;
@@ -137,6 +136,26 @@ public class XposedHook {
 
             initDirectories();
 
+            // ── Load XStealth native engines BEFORE anything else ──
+            //
+            // These interpose libc symbols and patch syscall stubs.
+            // Loading them first means every read the target makes
+            // from the moment the process boots goes through the
+            // filter. If we waited until XStealthModule runs (which
+            // happens after HookEngine setup and module dex load),
+            // the target's early checks would see an unhooked libc
+            // for the first few hundred milliseconds.
+            //
+            // Fail-open: if a library can't load, log and continue.
+            // The Java-layer checks still install later.
+            preloadXStealthNative();
+
+            try {
+                com.shizuposed.manager.stealth.ThreadNameScrub.scrub();
+            } catch (Throwable t) {
+                log("ThreadNameScrub failed: " + t.getMessage());
+            }
+
             logBox("XposedHook", "pid=" + myPid + " uid=" + myUid
                 + " " + AndroidCompat.describe()
                 + " args=" + java.util.Arrays.toString(args));
@@ -177,11 +196,6 @@ public class XposedHook {
             boolean useBootstrap = (targetUid > 0);
 
             HookEngine.ensureBackendInstalled();
-
-            // ── IXposedHookCmdInit dispatch ───────────────────────────
-            dispatchCmdInit(args, targetPackage);
-
-            ResourceHooking.getInstanceSafe().init();
 
             // ── Hook delay ────────────────────────────────────────────
             // An optional pause between when the framework starts in
@@ -231,6 +245,69 @@ public class XposedHook {
     // NATIVE LIBRARY LOADING
     // ═════════════════════════════════════════════════════════════════
 
+    /**
+     * Load the XStealth native engines at process boot, before any
+     * other setup. The Java-layer checks in XStealthModule also call
+     * XStealthNative.load() / XStealthNativeNext.load() later, but
+     * by then the target's early detection may already have read
+     * through an unhooked libc. Preloading here closes that window.
+     *
+     * Each library is independent. If one fails, the others still
+     * load. Fail-open: a library that can't load logs and returns;
+     * the framework continues without it.
+     *
+     * Idempotent. System.load on an already-loaded library is a
+     * no-op in ART, and the XStealthNative/Next/Bridge load() calls
+     * short-circuit when they've already run.
+     */
+    private static void preloadXStealthNative() {
+        String libDir = System.getProperty("shizuposed.shell.libs", LIBS_DIR);
+        log("Preloading XStealth native engines from: " + libDir);
+
+        // Primary. libc symbol interposition: open, read, stat,
+        // execve, popen, __system_property_get, getppid, etc.
+        try {
+            boolean ok = com.shizuposed.manager.stealth.XStealthNative.load(libDir);
+            if (ok) {
+                com.shizuposed.manager.stealth.XStealthNative.setActive(true);
+                log("Preloaded libxstealth.so");
+            } else {
+                log("libxstealth.so preload returned false");
+            }
+        } catch (Throwable t) {
+            log("libxstealth.so preload failed: " + t.getMessage());
+        }
+
+        // Next. Inline syscall stub patching. Requires the primary
+        // engine to be loaded first, because the strategy ladder
+        // uses its symbol resolution table.
+        try {
+            boolean ok = com.shizuposed.manager.stealth.XStealthNativeNext.load(libDir);
+            if (ok) {
+                com.shizuposed.manager.stealth.XStealthNativeNext.setActive(true);
+                log("Preloaded libxstealth_next.so");
+            } else {
+                log("libxstealth_next.so preload returned false");
+            }
+        } catch (Throwable t) {
+            log("libxstealth_next.so preload failed: " + t.getMessage());
+        }
+
+        // Bridge. Enumeration hiding: dl_iterate_phdr, /proc/self/fd,
+        // /proc/self/task, getenv. Independent of the other two.
+        try {
+            boolean ok = com.shizuposed.manager.stealth.XStealthBridge.load(libDir);
+            if (ok) {
+                com.shizuposed.manager.stealth.XStealthBridge.setActive(true);
+                log("Preloaded libxstealth_bridge.so");
+            } else {
+                log("libxstealth_bridge.so preload returned false");
+            }
+        } catch (Throwable t) {
+            log("libxstealth_bridge.so preload failed: " + t.getMessage());
+        }
+    }
+
     private static void loadNativeLibs() {
         String libDir = System.getProperty("shizuposed.shell.libs", LIBS_DIR);
         log("Loading native libs from: " + libDir);
@@ -266,81 +343,6 @@ public class XposedHook {
 
         log("Native engines: shizuposed=" + shizuposedLoaded
             + " amiru=" + amiruLoaded);
-    }
-
-    // ═════════════════════════════════════════════════════════════════
-    // IXposedHookCmdInit
-    // ═════════════════════════════════════════════════════════════════
-
-    private static void dispatchCmdInit(String[] argv, String pkg) {
-        List<ModuleInfo> modules;
-        try {
-            modules = loadApplicableModules(pkg);
-        } catch (Throwable t) {
-            log("dispatchCmdInit: loadApplicableModules failed: " + t.getMessage());
-            return;
-        }
-
-        if (modules.isEmpty()) {
-            log("dispatchCmdInit: no applicable modules");
-            return;
-        }
-
-        ClassLoader frameworkLoader = XposedHook.class.getClassLoader();
-        if (argv == null) argv = new String[0];
-        String cmdline = TextUtils.join(" ", argv);
-
-        int fired = 0;
-        for (ModuleInfo m : modules) {
-            try {
-                Class<?> entryClass;
-                if (m.cachedDexPath != null
-                        && new File(m.cachedDexPath).exists()) {
-                    String optDir = BASE_DIR + "/dexopt/" + m.packageName;
-                    new File(optDir).mkdirs();
-                    DexClassLoader loader = new DexClassLoader(
-                        m.cachedDexPath, optDir, null, frameworkLoader);
-                    String entryName = m.xposedInit;
-                    if (entryName == null || entryName.isEmpty()) {
-                        entryName = readXposedInitFromZip(m.cachedDexPath);
-                    }
-                    if (entryName == null || entryName.isEmpty()) continue;
-                    entryClass = loader.loadClass(entryName);
-                } else {
-                    if (m.xposedInit == null || m.xposedInit.isEmpty()) continue;
-                    entryClass = Class.forName(m.xposedInit, true, frameworkLoader);
-                }
-
-                if (!IXposedHookCmdInit.class.isAssignableFrom(entryClass)) {
-                    continue;
-                }
-
-                Constructor<?> ctor = entryClass.getDeclaredConstructor();
-                HiddenApiBypass.forceAccessible(ctor);
-                Object instance = ctor.newInstance();
-                IXposedHookCmdInit hook = (IXposedHookCmdInit) instance;
-
-                IXposedHookCmdInit.InitCmdProcessParam param =
-                    new IXposedHookCmdInit.InitCmdProcessParam();
-                param.processName = pkg;
-                param.cmdline     = cmdline;
-                param.argv        = argv;
-                param.classLoader = frameworkLoader;
-
-                hook.initCmdProcess(param);
-                fired++;
-                log("dispatchCmdInit: fired on " + m.packageName
-                    + " (entry=" + entryClass.getName() + ")");
-
-            } catch (ClassNotFoundException e) {
-                // Module entry point doesn't implement it. Normal.
-            } catch (Throwable t) {
-                log("dispatchCmdInit: " + m.packageName + " threw: " + t);
-            }
-        }
-
-        log("dispatchCmdInit: " + fired + " module(s) fired (of "
-            + modules.size() + " applicable)");
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -386,6 +388,26 @@ public class XposedHook {
 
             int hooksFrom = installModuleHooks(pkg, appLoader, appInfo);
 
+            // ── Class-loading bridge + component pre-load ─────────
+            //
+            // Installed after module hooks so the module's own
+            // listener registration (if any) is in place. Pre-loads
+            // receiver and provider classes so their hooks are live
+            // before the first broadcast or provider creation.
+            //
+            // Fail-open: if the bridge can't install, the module
+            // hooks that were already installed still work; only
+            // the class-load and pre-load coverage is lost.
+            try {
+                ClassLoadingBridge.install(appLoader);
+                int preloaded = ClassLoadingBridge.preloadComponentClasses(
+                    pkg, appInfo, appLoader);
+                log("ClassLoadingBridge installed (preloaded "
+                    + preloaded + " component class(es))");
+            } catch (Throwable t) {
+                log("ClassLoadingBridge setup failed: " + t.getMessage());
+            }
+
             try {
                 Resources targetResources = resolveTargetResources(activityThread, appInfo);
                 if (targetResources != null) {
@@ -401,6 +423,30 @@ public class XposedHook {
                 com.shizuposed.manager.core.backends.InstrumentationBackend.install(pkg);
             } catch (Throwable t) {
                 log("Instrumentation install failed: " + t.getMessage());
+            }
+
+            // ── ApplicationThread binder hooks ────────────────────
+            //
+            // Sits between ActivityManagerService and the target's
+            // ActivityThread. Closes the Service.onCreate gap
+            // (scheduleCreateService) and gives modules a chance to
+            // intercept binder-level lifecycle events before
+            // Instrumentation or the target's own code sees them.
+            //
+            // Fail-open: if no hooks install (the method signatures
+            // differ on this ROM), the framework continues and the
+            // existing Instrumentation coverage still applies.
+            try {
+                boolean atInstalled =
+                    com.shizuposed.manager.core.backends.ApplicationThreadBackend
+                        .install(activityThread);
+                if (atInstalled) {
+                    log("ApplicationThreadBackend installed");
+                } else {
+                    log("ApplicationThreadBackend installed no hooks");
+                }
+            } catch (Throwable t) {
+                log("ApplicationThreadBackend failed: " + t.getMessage());
             }
 
             tryInstallContentProviders(activityThread, appInfo, appLoader);
@@ -923,6 +969,22 @@ public class XposedHook {
             int loaded = 0;
             for (ModuleInfo m : modules) {
                 if (loadModule(m, app, appLoader, param)) loaded++;
+            }
+
+            // ── Class-loading bridge + component pre-load ─────────
+            //
+            // In post-application mode the Application is already
+            // running, so receiver and provider classes may already
+            // have been loaded. Pre-loading is still useful for
+            // classes that have not been touched yet.
+            try {
+                ClassLoadingBridge.install(appLoader);
+                if (appInfo != null) {
+                    ClassLoadingBridge.preloadComponentClasses(
+                        pkg, appInfo, appLoader);
+                }
+            } catch (Throwable t) {
+                log("ClassLoadingBridge setup failed: " + t.getMessage());
             }
 
             try {

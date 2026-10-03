@@ -4,6 +4,7 @@ import android.content.ContentResolver;
 import android.database.MatrixCursor;
 import android.net.Uri;
 
+import com.shizuposed.manager.stealth.XStealthConfig;
 import com.shizuposed.manager.stealth.XStealthRegistry;
 
 import de.robv.android.xposed.XC_MethodHook;
@@ -23,6 +24,12 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *   • adb_enabled
  *   • adb_wifi_enabled
  *
+ * The key list is deliberately delegated to DevOptionsCheck.hidesKey
+ * so the two checks can never drift. They already covered the same
+ * keys; keeping one canonical list means the value CachedValueCheck
+ * returns for a cached read always matches what the live-read
+ * checks return.
+ *
  * Settings.Secure and Settings.Global both expose the same keys via
  * different APIs; the caller does not always know which one it is
  * reading from.
@@ -36,22 +43,24 @@ public final class AdbCheck {
 
     private static final String TAG = "XStealth";
 
-    private static final String[] HIDDEN_KEYS = {
-        "adb_enabled",
-        "adb_wifi_enabled",
-    };
-
     private AdbCheck() {}
 
-    public static void install(XC_LoadPackage.LoadPackageParam lpparam) {
-        hookSettingsClass(lpparam, "android.provider.Settings$Global");
-        hookSettingsClass(lpparam, "android.provider.Settings$Secure");
-        hookContentResolverQuery();
+    public static void install(XC_LoadPackage.LoadPackageParam lpparam,
+                               XStealthConfig config) {
+        if (lpparam == null || config == null) return;
+        if (!config.hideAdb) return;
+
+        hookSettingsClass(lpparam, "android.provider.Settings$Global",
+            config);
+        hookSettingsClass(lpparam, "android.provider.Settings$Secure",
+            config);
+        hookContentResolverQuery(config);
         XStealthRegistry.record("AdbCheck");
     }
 
     private static void hookSettingsClass(XC_LoadPackage.LoadPackageParam lpparam,
-                                          String className) {
+                                          String className,
+                                          XStealthConfig config) {
         Class<?> clazz = XposedHelpers.findClassIfExists(
             className, lpparam.classLoader);
         if (clazz == null) return;
@@ -63,7 +72,7 @@ public final class AdbCheck {
                 ContentResolver.class, String.class, int.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult(0);
+                        if (hidesKey((String) p.args[1])) p.setResult(0);
                     }
                 });
         } catch (Throwable t) {
@@ -77,7 +86,7 @@ public final class AdbCheck {
                 ContentResolver.class, String.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult("0");
+                        if (hidesKey((String) p.args[1])) p.setResult("0");
                     }
                 });
         } catch (Throwable t) {
@@ -91,7 +100,7 @@ public final class AdbCheck {
                 ContentResolver.class, String.class, long.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult(0L);
+                        if (hidesKey((String) p.args[1])) p.setResult(0L);
                     }
                 });
         } catch (Throwable t) {
@@ -105,7 +114,7 @@ public final class AdbCheck {
                 ContentResolver.class, String.class, int.class, int.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult(0);
+                        if (hidesKey((String) p.args[1])) p.setResult(0);
                     }
                 });
         } catch (Throwable t) {
@@ -119,7 +128,7 @@ public final class AdbCheck {
                 ContentResolver.class, String.class, int.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult("0");
+                        if (hidesKey((String) p.args[1])) p.setResult("0");
                     }
                 });
         } catch (Throwable t) {
@@ -135,7 +144,7 @@ public final class AdbCheck {
      * adb_wifi_enabled. Covers both /global/ and /secure/ namespaces
      * because both exist and are kept in sync by the framework.
      */
-    private static void hookContentResolverQuery() {
+    private static void hookContentResolverQuery(XStealthConfig config) {
         try {
             XposedHelpers.findAndHookMethod(
                 ContentResolver.class, "query",
@@ -149,7 +158,15 @@ public final class AdbCheck {
                         if (uri == null) return;
                         String key = extractSettingsKey(uri);
                         if (key == null) return;
-                        if (!isHiddenKey(key)) return;
+                        if (!hidesKey(key)) return;
+
+                        String selection = (String) p.args[2];
+                        String[] selArgs = (String[]) p.args[3];
+                        if (!selectionReferencesKey(selection, selArgs, key)) {
+                            p.setResult(new MatrixCursor(
+                                new String[]{"_id", "name", "value"}));
+                            return;
+                        }
 
                         MatrixCursor c = new MatrixCursor(
                             new String[]{"_id", "name", "value"});
@@ -176,16 +193,38 @@ public final class AdbCheck {
         return path.substring(slash + 1);
     }
 
-    private static boolean isHiddenKey(String keyOrUri) {
-        if (keyOrUri == null) return false;
-        String key = keyOrUri;
-        int slash = keyOrUri.lastIndexOf('/');
-        if (slash >= 0 && slash < keyOrUri.length() - 1) {
-            key = keyOrUri.substring(slash + 1);
+    /**
+     * Does the caller's query actually ask for this key?
+     *
+     * A settings query that filters on a name uses either
+     * "name=?" with the key in selectionArgs, or "name=<key>"
+     * inline. If the caller filters on a different key, returning
+     * a row for our key would put a value in front of a caller
+     * that never asked for it. Return true only when the query is
+     * either unfiltered (no selection) or actually references the
+     * key we want to hide.
+     */
+    static boolean selectionReferencesKey(String selection,
+                                          String[] selectionArgs,
+                                          String key) {
+        if (selection == null || selection.isEmpty()) return true;
+        // Inline form: "name=adb_enabled" or "name = adb_enabled".
+        if (selection.contains(key)) return true;
+        // Parameterized form: "name=?" with the key in args.
+        if (selectionArgs != null) {
+            for (String a : selectionArgs) {
+                if (key.equals(a)) return true;
+            }
         }
-        for (String k : HIDDEN_KEYS) {
-            if (k.equalsIgnoreCase(key)) return true;
-        }
+        // Selection references some other column or key.
         return false;
+    }
+
+    /**
+     * Canonical key check. Delegates to DevOptionsCheck so the two
+     * checks can never disagree about what is hidden.
+     */
+    static boolean hidesKey(String keyOrUri) {
+        return DevOptionsCheck.hidesKey(keyOrUri);
     }
 }

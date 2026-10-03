@@ -26,6 +26,25 @@ import java.util.Set;
  * The config now includes the scope. An absent or empty "scope"
  * array means "all apps" — the shell side treats it the same way
  * the manager does.
+ *
+ * FIELDS (7.7+)
+ * -------------
+ *   enabled                  — master toggle
+ *   nextEnabled              — XStealth Next engine
+ *   bridgeEnabled            — enumeration-hiding library
+ *   hideDevOptions           — Settings.Global DevOptions hiding
+ *   hideAdb                  — Settings.Secure ADB hiding
+ *   hideShizukuPackage       — PackageManager lookup filtering
+ *   hideShizuPosedPackage    — same, for ShizuPosed's own package
+ *   hideRunningProcesses     — ActivityManager process list filtering
+ *   hideProcFs               — /proc entry scrubbing
+ *   hideSystemProperties     — SystemProperties reads (ro.debuggable etc.)
+ *   hideBuildFields          — Build.TAGS/TYPE/etc. sanitization
+ *   scrubShizuPosedProperties— System.getProperties() scrubbing
+ *   scrubThreadNames         — thread name scrubbing
+ *   apiProtection            — Xposed API reflection guards
+ *   dexOptimize              — module dex2oat optimization
+ *   scope                    — array of package names (empty = all apps)
  */
 public final class XStealthStatusWriter {
 
@@ -40,14 +59,29 @@ public final class XStealthStatusWriter {
      */
     public static JSONObject buildConfig(Context c) throws Exception {
         JSONObject o = new JSONObject();
+
+        // ── Master toggles ────────────────────────────────────────
         o.put("enabled",              XStealthPrefs.isEnabled(c));
         o.put("nextEnabled",          XStealthPrefs.isNextEnabled(c));
+        o.put("bridgeEnabled",        XStealthPrefs.isBridgeEnabled(c));
+
+        // ── Settings / package / process checks ───────────────────
         o.put("hideDevOptions",       XStealthPrefs.isHideDevOptions(c));
         o.put("hideAdb",              XStealthPrefs.isHideAdb(c));
         o.put("hideShizukuPackage",   XStealthPrefs.isHideShizukuPackage(c));
         o.put("hideShizuPosedPackage",XStealthPrefs.isHideShizuPosedPackage(c));
         o.put("hideRunningProcesses", XStealthPrefs.isHideRunningProcesses(c));
         o.put("hideProcFs",           XStealthPrefs.isHideProcFs(c));
+
+        // ── Advanced hiding (7.7) ─────────────────────────────────
+        o.put("hideSystemProperties",       XStealthPrefs.isHideSystemProperties(c));
+        o.put("hideBuildFields",            XStealthPrefs.isHideBuildFields(c));
+        o.put("scrubShizuPosedProperties",  XStealthPrefs.isScrubShizuPosedProperties(c));
+        o.put("scrubThreadNames",           XStealthPrefs.isScrubThreadNames(c));
+        o.put("methodBaseline", XStealthPrefs.isMethodBaselineEnabled(c));
+        o.put("unsafeGate",     XStealthPrefs.isUnsafeGateEnabled(c));
+
+        // ── Optional layers ───────────────────────────────────────
         o.put("apiProtection",        XStealthPrefs.isApiProtectionEnabled(c));
         o.put("dexOptimize",          XStealthPrefs.isDexOptimizeEnabled(c));
 

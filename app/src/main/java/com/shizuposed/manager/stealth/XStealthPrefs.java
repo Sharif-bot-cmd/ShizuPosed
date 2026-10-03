@@ -54,6 +54,19 @@ public final class XStealthPrefs {
     private static final String KEY_API_PROTECTION    = "api_protection";
     private static final String KEY_DEX_OPTIMIZE      = "dex_optimize";
 
+    // ─── NEW in 7.7: additional stealth layers ───────────────────
+    /** Hook android.os.SystemProperties reads. Default true. */
+    private static final String KEY_HIDE_SYSPROPS     = "hideSystemProperties";
+    /** Sanitize android.os.Build.* fields. Default true. */
+    private static final String KEY_HIDE_BUILD        = "hideBuildFields";
+    /** Scrub shizuposed.* system properties. Default true. */
+    private static final String KEY_SCRUB_PROPERTIES  = "scrubShizuPosedProperties";
+    /** Rename ShizuPosed's own threads. Default true. */
+    private static final String KEY_SCRUB_THREADS     = "scrubThreadNames";
+
+    /** Enable the bridge library. Default false. */
+    private static final String KEY_BRIDGE_ENABLED = "bridge_enabled";
+
     /** Package names XStealth applies to. Empty = all apps. */
     private static final String KEY_SCOPE             = "scope";
 
@@ -172,6 +185,79 @@ public final class XStealthPrefs {
 
     public static void setDexOptimizeEnabled(Context c, boolean v) {
         prefs(c).edit().putBoolean(KEY_DEX_OPTIMIZE, v).commit();
+    }
+
+    // ─── System property / Build / thread hiding (new in 7.7) ────
+
+    /**
+     * Hook android.os.SystemProperties reads for ro.debuggable,
+     * ro.secure, ro.boot.verifiedbootstate, and similar.
+     * Default true.
+     */
+    public static boolean isHideSystemProperties(Context c) {
+        return prefs(c).getBoolean(KEY_HIDE_SYSPROPS, true);
+    }
+
+    public static void setHideSystemProperties(Context c, boolean v) {
+        prefs(c).edit().putBoolean(KEY_HIDE_SYSPROPS, v).commit();
+    }
+
+    /**
+     * Sanitize android.os.Build.TAGS / TYPE / HOST / USER to
+     * production defaults. Default true.
+     */
+    public static boolean isHideBuildFields(Context c) {
+        return prefs(c).getBoolean(KEY_HIDE_BUILD, true);
+    }
+
+    public static void setHideBuildFields(Context c, boolean v) {
+        prefs(c).edit().putBoolean(KEY_HIDE_BUILD, v).commit();
+    }
+
+    /**
+     * Remove shizuposed.* entries from System.getProperties() and
+     * System.getProperty(String). Default true.
+     */
+    public static boolean isScrubShizuPosedProperties(Context c) {
+        return prefs(c).getBoolean(KEY_SCRUB_PROPERTIES, true);
+    }
+
+    public static void setScrubShizuPosedProperties(Context c, boolean v) {
+        prefs(c).edit().putBoolean(KEY_SCRUB_PROPERTIES, v).commit();
+    }
+
+    /**
+     * Rename ShizuPosed's own threads to innocuous names.
+     * Default true.
+     */
+    public static boolean isScrubThreadNames(Context c) {
+        return prefs(c).getBoolean(KEY_SCRUB_THREADS, true);
+    }
+
+    public static void setScrubThreadNames(Context c, boolean v) {
+        prefs(c).edit().putBoolean(KEY_SCRUB_THREADS, v).commit();
+    }
+
+    public static boolean isBridgeEnabled(Context c) {
+        return prefs(c).getBoolean(KEY_BRIDGE_ENABLED, false);
+    }
+
+    public static void setBridgeEnabled(Context c, boolean v) {
+        prefs(c).edit().putBoolean(KEY_BRIDGE_ENABLED, v).commit();
+    }
+
+    public static boolean isMethodBaselineEnabled(Context c) {
+        return prefs(c).getBoolean("methodBaseline", true);
+    }
+    public static void setMethodBaselineEnabled(Context c, boolean v) {
+        prefs(c).edit().putBoolean("methodBaseline", v).commit();
+    }
+
+    public static boolean isUnsafeGateEnabled(Context c) {
+        return prefs(c).getBoolean("unsafeGate", true);
+    }
+    public static void setUnsafeGateEnabled(Context c, boolean v) {
+        prefs(c).edit().putBoolean("unsafeGate", v).commit();
     }
 
     // ─── Scope ────────────────────────────────────────────────────
