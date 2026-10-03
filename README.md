@@ -4,7 +4,7 @@
 
 ShizuPosed lets Xposed-API modules run inside apps that it launches. No root, no bootloader unlock, no messing with the system partition. Shizuku calls `app_process` as the shell UID, a Java runtime spins up inside the target's process, and method hooks get installed through a dispatcher that tries several backends until one sticks. Modules built for LSPosed and classic Xposed keep working.
 
-This is version 8.6.
+This is version 8.7.
 
 ---
 
@@ -750,6 +750,10 @@ If a layer reports `active=0` or `0 patches`, the reason is logged alongside. Th
 ---
 
 ## Changelog
+
+### 8.7
+
+Add ShizukuBinderWatcher.
 
 ### 8.6
 
