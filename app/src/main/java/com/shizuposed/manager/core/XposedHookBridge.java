@@ -3,8 +3,10 @@ package com.shizuposed.manager.core;
 import com.shizuposed.manager.utils.Logger;
 
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Member;
 import java.lang.reflect.Method;
 
+import de.robv.android.xposed.IXUnhook;
 import de.robv.android.xposed.XC_MethodHook;
 
 /**
@@ -56,7 +58,79 @@ public final class XposedHookBridge {
         }
     }
 
-    public static String getLastInstallBackend(java.lang.reflect.Member member) {
+    /**
+     * Install a constructor hook and return an IXUnhook handle.
+     *
+     * The handle's unhook() runs the reverse if HookEngine tracked
+     * one (CallSite, Proxy, Noop) and is a no-op if it didn't
+     * (Pine, Amiru, Native, Instrumentation). That matches the
+     * contract documented in IXUnhook.
+     */
+    public static IXUnhook<XC_MethodHook> installConstructorHookWithHandle(
+            final Constructor<?> original,
+            final XC_MethodHook callback) {
+        installConstructorHook(original, callback);
+        return new IXUnhook<XC_MethodHook>() {
+            @Override
+            public void unhook() {
+                Runnable reverse = getLastInstallReverse(original);
+                if (reverse != null) {
+                    try {
+                        reverse.run();
+                    } catch (Throwable t) {
+                        log("constructor unhook failed on "
+                            + original.getDeclaringClass().getName()
+                            + " — " + t.getMessage());
+                    }
+                }
+            }
+            @Override
+            public XC_MethodHook getCallback() {
+                return callback;
+            }
+            @Override
+            public Member getHookedMethod() {
+                return original;
+            }
+        };
+    }
+
+    /**
+     * Same as installConstructorHookWithHandle, but for methods.
+     * Kept alongside the constructor version so findAndHookMethod
+     * can return the same shape of handle.
+     */
+    public static IXUnhook<XC_MethodHook> installHookWithHandle(
+            final Method original,
+            final XC_MethodHook callback) {
+        installHook(original, callback);
+        return new IXUnhook<XC_MethodHook>() {
+            @Override
+            public void unhook() {
+                Runnable reverse = getLastInstallReverse(original);
+                if (reverse != null) {
+                    try {
+                        reverse.run();
+                    } catch (Throwable t) {
+                        log("method unhook failed on "
+                            + original.getDeclaringClass().getName()
+                            + "." + original.getName()
+                            + " — " + t.getMessage());
+                    }
+                }
+            }
+            @Override
+            public XC_MethodHook getCallback() {
+                return callback;
+            }
+            @Override
+            public Member getHookedMethod() {
+                return original;
+            }
+        };
+    }
+
+    public static String getLastInstallBackend(Member member) {
         try {
             HookEngine.InstallRecord r = HookEngine.getInstallRecord(member);
             return r != null ? r.backendName : null;
@@ -65,7 +139,7 @@ public final class XposedHookBridge {
         }
     }
 
-    public static Runnable getLastInstallReverse(java.lang.reflect.Member member) {
+    public static Runnable getLastInstallReverse(Member member) {
         try {
             HookEngine.InstallRecord r = HookEngine.getInstallRecord(member);
             return r != null ? r.reverse : null;

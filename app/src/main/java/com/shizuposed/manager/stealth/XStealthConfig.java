@@ -5,8 +5,13 @@ import org.json.JSONObject;
 
 import java.io.File;
 import java.io.FileReader;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -25,15 +30,15 @@ import java.util.Set;
  * The decision is made in shouldApplyTo(pkg). XStealthModule calls
  * it at the top of handleLoadPackage().
  *
- * NEW IN THIS VERSION
- * -------------------
- *   • hideSettingsFileReads — gates SettingsFileCheck (Runtime.exec
- *     and ProcessBuilder interception). Default true.
- *   • hideSocketDaemons — gates SocketCheck. Default false, because
- *     SocketCheck does nothing unless socketDaemons is populated,
- *     and populating it requires per-daemon reverse engineering.
- *   • socketDaemons — the list of daemon socket names SocketCheck
- *     should shadow. Empty by default.
+ * CACHED DETECTION VALUES
+ * -----------------------
+ * hideCachedDetectionValues — gates CachedValueCheck. Opt-in,
+ * default FALSE. When on, hooks SharedPreferences reads for the
+ * keys named in cachedValueKeys, and returns the same sanitized
+ * value the live-read checks return.
+ *
+ * cachedValueKeys — per-app allow-list. Package name -> list of
+ * exact SharedPreferences key names. Empty by default.
  */
 public final class XStealthConfig {
 
@@ -41,26 +46,9 @@ public final class XStealthConfig {
     public final boolean nextEnabled;
     public final boolean hideDevOptions;
     public final boolean hideAdb;
-
-    /**
-     * NEW: hide settings XML reads via Runtime.exec / ProcessBuilder.
-     * Gates SettingsFileCheck. Default true.
-     */
     public final boolean hideSettingsFileReads;
-
-    /**
-     * NEW: enable SocketCheck. Default false. Even when true,
-     * SocketCheck does nothing unless socketDaemons is non-empty.
-     */
     public final boolean hideSocketDaemons;
-
-    /**
-     * NEW: names of daemon unix sockets SocketCheck should shadow.
-     * Empty by default. Populated only when a specific daemon's
-     * protocol has been reversed.
-     */
     public final Set<String> socketDaemons;
-
     public final boolean hideShizukuPackage;
     public final boolean hideShizuPosedPackage;
     public final boolean hideRunningProcesses;
@@ -68,10 +56,20 @@ public final class XStealthConfig {
     public final boolean apiProtection;
     public final boolean dexOptimize;
 
-    /**
-     * Package names XStealth applies to. Empty means "all apps".
-     * Never null.
-     */
+    public final boolean hideSystemProperties;
+    public final boolean hideBuildFields;
+    public final boolean scrubShizuPosedProperties;
+    public final boolean scrubThreadNames;
+
+    public final boolean bridgeEnabled;
+
+    public final boolean methodBaseline;
+    public final boolean unsafeGate;
+
+    public final boolean hideCachedDetectionValues;
+
+    public final Map<String, List<String>> cachedValueKeys;
+
     public final Set<String> scope;
 
     private XStealthConfig(JSONObject o) {
@@ -87,6 +85,38 @@ public final class XStealthConfig {
         hideProcFs            = o.optBoolean("hideProcFs", true);
         apiProtection = o.optBoolean("apiProtection", false);
         dexOptimize   = o.optBoolean("dexOptimize", false);
+
+        hideSystemProperties      = o.optBoolean("hideSystemProperties", true);
+        hideBuildFields           = o.optBoolean("hideBuildFields", true);
+        scrubShizuPosedProperties = o.optBoolean("scrubShizuPosedProperties", true);
+        scrubThreadNames          = o.optBoolean("scrubThreadNames", true);
+        bridgeEnabled = o.optBoolean("bridgeEnabled", false);
+        methodBaseline = o.optBoolean("methodBaseline", true);
+        unsafeGate     = o.optBoolean("unsafeGate", true);
+
+        hideCachedDetectionValues =
+            o.optBoolean("hideCachedDetectionValues", false);
+
+        Map<String, List<String>> cvk = new HashMap<>();
+        JSONObject cvkObj = o.optJSONObject("cachedValueKeys");
+        if (cvkObj != null) {
+            Iterator<String> it = cvkObj.keys();
+            while (it.hasNext()) {
+                String pkg = it.next();
+                if (pkg == null || pkg.isEmpty()) continue;
+                JSONArray keys = cvkObj.optJSONArray(pkg);
+                if (keys == null) continue;
+                List<String> list = new ArrayList<>(keys.length());
+                for (int i = 0; i < keys.length(); i++) {
+                    String k = keys.optString(i, null);
+                    if (k != null && !k.isEmpty()) list.add(k);
+                }
+                if (!list.isEmpty()) {
+                    cvk.put(pkg, Collections.unmodifiableList(list));
+                }
+            }
+        }
+        cachedValueKeys = Collections.unmodifiableMap(cvk);
 
         Set<String> s = new HashSet<>();
         JSONArray arr = o.optJSONArray("scope");
@@ -109,21 +139,20 @@ public final class XStealthConfig {
         socketDaemons = Collections.unmodifiableSet(d);
     }
 
-    /**
-     * Does XStealth apply to this target package?
-     *
-     *   • empty scope  → true for any package
-     *   • non-empty    → true only if the package is in the scope
-     */
     public boolean shouldApplyTo(String pkg) {
         if (pkg == null || pkg.isEmpty()) return false;
         if (scope.isEmpty()) return true;
         return scope.contains(pkg);
     }
 
-    /** True when the scope is empty — all apps. For diagnostics. */
     public boolean isScopeAllApps() {
         return scope.isEmpty();
+    }
+
+    public List<String> cachedValueKeysFor(String pkg) {
+        if (pkg == null || pkg.isEmpty()) return Collections.emptyList();
+        List<String> list = cachedValueKeys.get(pkg);
+        return list == null ? Collections.emptyList() : list;
     }
 
     private static volatile XStealthConfig sCached;
