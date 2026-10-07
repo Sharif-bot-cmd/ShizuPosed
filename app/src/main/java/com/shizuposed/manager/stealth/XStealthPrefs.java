@@ -54,10 +54,15 @@ public final class XStealthPrefs {
     private static final String KEY_API_PROTECTION    = "api_protection";
     private static final String KEY_DEX_OPTIMIZE      = "dex_optimize";
 
-    /** Package names XStealth applies to. Empty = all apps. */
+    private static final String KEY_HIDE_SYSPROPS     = "hideSystemProperties";
+    private static final String KEY_HIDE_BUILD        = "hideBuildFields";
+    private static final String KEY_SCRUB_PROPERTIES  = "scrubShizuPosedProperties";
+    private static final String KEY_SCRUB_THREADS     = "scrubThreadNames";
+
+    private static final String KEY_BRIDGE_ENABLED = "bridge_enabled";
+
     private static final String KEY_SCOPE             = "scope";
 
-    /** True once we've checked that the legacy "scope" key was migrated. */
     private static final String KEY_SCOPE_LEGACY      = "scope_legacy";
     private static final String KEY_SCOPE_MIGRATION   = "scope_migrated_5_5";
 
@@ -68,17 +73,10 @@ public final class XStealthPrefs {
                 .getSharedPreferences(PREFS, Context.MODE_PRIVATE);
     }
 
-    /**
-     * One-time cleanup for a pre-5.5 "scope" key that some very old
-     * builds wrote but never read. Safe to call repeatedly.
-     */
     private static void migrateIfNeeded(Context c) {
         try {
             SharedPreferences p = prefs(c);
             if (p.getBoolean(KEY_SCOPE_MIGRATION, false)) return;
-            // Remove the legacy key only if it's a String (the old
-            // format). A Set<String> under "scope" is the new format
-            // and must be preserved.
             Object legacy = p.getAll().get(KEY_SCOPE_LEGACY);
             SharedPreferences.Editor e = p.edit();
             if (legacy != null) e.remove(KEY_SCOPE_LEGACY);
@@ -174,14 +172,64 @@ public final class XStealthPrefs {
         prefs(c).edit().putBoolean(KEY_DEX_OPTIMIZE, v).commit();
     }
 
+    // ─── System property / Build / thread hiding ─────────────────
+
+    public static boolean isHideSystemProperties(Context c) {
+        return prefs(c).getBoolean(KEY_HIDE_SYSPROPS, true);
+    }
+
+    public static void setHideSystemProperties(Context c, boolean v) {
+        prefs(c).edit().putBoolean(KEY_HIDE_SYSPROPS, v).commit();
+    }
+
+    public static boolean isHideBuildFields(Context c) {
+        return prefs(c).getBoolean(KEY_HIDE_BUILD, true);
+    }
+
+    public static void setHideBuildFields(Context c, boolean v) {
+        prefs(c).edit().putBoolean(KEY_HIDE_BUILD, v).commit();
+    }
+
+    public static boolean isScrubShizuPosedProperties(Context c) {
+        return prefs(c).getBoolean(KEY_SCRUB_PROPERTIES, true);
+    }
+
+    public static void setScrubShizuPosedProperties(Context c, boolean v) {
+        prefs(c).edit().putBoolean(KEY_SCRUB_PROPERTIES, v).commit();
+    }
+
+    public static boolean isScrubThreadNames(Context c) {
+        return prefs(c).getBoolean(KEY_SCRUB_THREADS, true);
+    }
+
+    public static void setScrubThreadNames(Context c, boolean v) {
+        prefs(c).edit().putBoolean(KEY_SCRUB_THREADS, v).commit();
+    }
+
+    public static boolean isBridgeEnabled(Context c) {
+        return prefs(c).getBoolean(KEY_BRIDGE_ENABLED, false);
+    }
+
+    public static void setBridgeEnabled(Context c, boolean v) {
+        prefs(c).edit().putBoolean(KEY_BRIDGE_ENABLED, v).commit();
+    }
+
+    public static boolean isMethodBaselineEnabled(Context c) {
+        return prefs(c).getBoolean("methodBaseline", true);
+    }
+    public static void setMethodBaselineEnabled(Context c, boolean v) {
+        prefs(c).edit().putBoolean("methodBaseline", v).commit();
+    }
+
+    public static boolean isUnsafeGateEnabled(Context c) {
+        return prefs(c).getBoolean("unsafeGate", true);
+    }
+    public static void setUnsafeGateEnabled(Context c, boolean v) {
+        prefs(c).edit().putBoolean("unsafeGate", v).commit();
+    }
+
     // ─── Scope ────────────────────────────────────────────────────
 
-    /**
-     * Return the current scope. Never null. The returned set is a
-     * copy, safe to mutate without affecting the stored value.
-     *
-     * An empty set means "all apps." See the class javadoc.
-     */
     public static Set<String> getScope(Context c) {
         migrateIfNeeded(c);
         try {
@@ -189,16 +237,10 @@ public final class XStealthPrefs {
             if (stored == null) return new HashSet<>();
             return new HashSet<>(stored);
         } catch (Throwable t) {
-            // Older APIs or a corrupted prefs file. Treat as empty
-            // so the module falls back to the historical behavior.
             return new HashSet<>();
         }
     }
 
-    /**
-     * Replace the scope. An empty set restores "all apps."
-     * Uses commit() for the same reason the toggles do.
-     */
     public static void setScope(Context c, Set<String> scope) {
         HashSet<String> copy = (scope == null)
             ? new HashSet<>()
@@ -206,15 +248,6 @@ public final class XStealthPrefs {
         prefs(c).edit().putStringSet(KEY_SCOPE, copy).commit();
     }
 
-    /**
-     * Does XStealth apply to this target package?
-     *
-     *   • empty scope  → true for any package
-     *   • non-empty    → true only if the package is in the scope
-     *
-     * Never null. A null package name returns false — there's no
-     * "target" to apply to.
-     */
     public static boolean isInScope(Context c, String pkg) {
         if (pkg == null) return false;
         Set<String> scope = getScope(c);
@@ -222,20 +255,14 @@ public final class XStealthPrefs {
         return scope.contains(pkg);
     }
 
-    /**
-     * True when the scope is empty — meaning XStealth applies to
-     * every app ShizuPosed launches. For UI labels.
-     */
     public static boolean isScopeAllApps(Context c) {
         return getScope(c).isEmpty();
     }
 
-    /** Number of explicitly-scoped apps. Zero means "all apps." */
     public static int getScopeCount(Context c) {
         return getScope(c).size();
     }
 
-    /** Convenience for removing one package from the scope. */
     public static void removeFromScope(Context c, String pkg) {
         if (pkg == null) return;
         Set<String> scope = getScope(c);
@@ -244,7 +271,6 @@ public final class XStealthPrefs {
         }
     }
 
-    /** Convenience for adding one package to the scope. */
     public static void addToScope(Context c, String pkg) {
         if (pkg == null) return;
         Set<String> scope = getScope(c);
@@ -253,14 +279,10 @@ public final class XStealthPrefs {
         }
     }
 
-    /** Restore "all apps" by clearing the scope. */
     public static void clearScope(Context c) {
         prefs(c).edit().remove(KEY_SCOPE).commit();
     }
 
-    /**
-     * Snapshot for diagnostics. Returns an unmodifiable view.
-     */
     public static Set<String> getScopeReadonly(Context c) {
         return Collections.unmodifiableSet(getScope(c));
     }

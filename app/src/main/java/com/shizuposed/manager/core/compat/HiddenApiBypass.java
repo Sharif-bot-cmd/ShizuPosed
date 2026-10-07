@@ -21,17 +21,17 @@ import java.lang.reflect.Modifier;
  *      running as shell uid, since hidden-API restrictions apply to
  *      the app domain, not the shell domain.
  *
- *   3. Flip the "override" boolean via Unsafe — the classic API 28-30
- *      approach. On API 31+ the field was removed; Strategy 1 covers
- *      those versions.
+ *   3. Flip the "override" / "flag" boolean via reflection — the
+ *      classic API 28-30 approach. On API 31+ the field was removed;
+ *      Strategy 1 covers those versions.
+ *
+ * The strategies are now gated on the runtime probes in AndroidCompat,
+ * not on the SDK number. If a future Android version reintroduces
+ * VMRuntime exemptions or the override field, the probes will pick
+ * it up and the strategy will run without any code change here.
  *
  * Callers invoke forceAccessible(member) before reading a hidden
  * member. It never throws; it returns false if all strategies fail.
- *
- * Version-specific strategies are gated on AndroidCompat flags so a
- * reader can tell at a glance which Android generations each branch
- * applies to. The gates are advisory — if a future ROM reintroduces a
- * removed mechanism, removing the gate is a one-line change.
  */
 public final class HiddenApiBypass {
 
@@ -42,10 +42,13 @@ public final class HiddenApiBypass {
     private static final int STRATEGY_SETACCESSIBLE = 2;
     private static final int STRATEGY_OVERRIDE = 3;
 
-    /** Best strategy that has worked so far. */
     private static volatile int bestStrategy = STRATEGY_NONE;
 
-    /** The AccessibleObject.override / flag field, if it exists. */
+    /**
+     * Cached reflection handle to the override/flag field. Resolved
+     * on first use, using the field name reported by
+     * AndroidCompat.ACCESSIBLE_OVERRIDE_FIELD_NAME.
+     */
     private static volatile Field overrideField;
     private static volatile boolean overrideFieldResolved = false;
 
@@ -55,10 +58,6 @@ public final class HiddenApiBypass {
     // PUBLIC API
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Try to make the given member usable. Returns true if the caller
-     * can proceed to call get()/set()/invoke() on it.
-     */
     public static boolean forceAccessible(AccessibleObject member) {
         if (member == null) return false;
 
@@ -69,9 +68,9 @@ public final class HiddenApiBypass {
         }
 
         // Strategy 1: process-wide hidden-API exemption.
-        // Gated on API 28+, where setHiddenApiExemptions was introduced.
+        // Gated on the runtime probe, not the SDK number.
         if ((s == STRATEGY_NONE || s == STRATEGY_VMRUNTIME)
-                && AndroidCompat.hasVMRuntimeHiddenApiExemptions()) {
+                && AndroidCompat.HAS_VMRUNTIME_EXEMPTIONS) {
             if (applyVmRuntimeExemptions()) {
                 bestStrategy = STRATEGY_VMRUNTIME;
                 if (trySetAccessible(member)) return true;
@@ -79,19 +78,20 @@ public final class HiddenApiBypass {
         }
 
         // Strategy 2: plain setAccessible.
-        // This is the strategy that works in app_process running as
-        // shell uid, where hidden-API enforcement is not applied.
+        // This works in app_process running as shell uid, where
+        // hidden-API enforcement is not applied.
         if (trySetAccessible(member)) {
-            if (bestStrategy == STRATEGY_NONE) bestStrategy = STRATEGY_SETACCESSIBLE;
+            if (bestStrategy == STRATEGY_NONE) {
+                bestStrategy = STRATEGY_SETACCESSIBLE;
+            }
             return true;
         }
 
-        // Strategy 3: flip the override flag via Unsafe.
-        // Gated on API 28-30, where AccessibleObject still carries the
-        // boolean field. Removed in API 31, so no point attempting the
-        // reflection probe on later versions.
+        // Strategy 3: flip the override flag via reflection.
+        // Gated on the runtime probe — if the field exists, this
+        // works regardless of SDK number.
         if ((s == STRATEGY_NONE || s == STRATEGY_OVERRIDE)
-                && AndroidCompat.hasAccessibleObjectOverrideField()) {
+                && AndroidCompat.HAS_ACCESSIBLE_OBJECT_OVERRIDE) {
             if (flipOverride(member)) {
                 bestStrategy = STRATEGY_OVERRIDE;
                 return true;
@@ -101,10 +101,6 @@ public final class HiddenApiBypass {
         return false;
     }
 
-    /**
-     * Convenience: fetch a hidden field's value, force-accessing it
-     * first. Returns null on any failure.
-     */
     public static Object getFieldValue(Field field, Object target) {
         if (field == null) return null;
         if (!forceAccessible(field)) return null;
@@ -116,12 +112,6 @@ public final class HiddenApiBypass {
         }
     }
 
-    /**
-     * Convenience: fetch a hidden method's return value, force-accessing
-     * it first. Returns null on any failure. Unwraps and logs the cause
-     * of InvocationTargetException so the caller can see what the target
-     * actually threw.
-     */
     public static Object invokeMethod(Method method, Object target, Object... args) {
         if (method == null) return null;
         if (!forceAccessible(method)) return null;
@@ -137,22 +127,10 @@ public final class HiddenApiBypass {
         }
     }
 
-    /**
-     * Look up a hidden field on a class hierarchy. Returns null if not
-     * found anywhere up the chain. Only returns non-static fields,
-     * because static fields need field.get(null) and the caller can't
-     * tell from the returned Field alone — use
-     * {@link #findHiddenField(Class, String, boolean)} if you need
-     * static fields.
-     */
     public static Field findHiddenField(Class<?> clazz, String name) {
         return findHiddenField(clazz, name, false);
     }
 
-    /**
-     * Look up a hidden field. If {@code allowStatic} is true, static
-     * fields are also returned.
-     */
     public static Field findHiddenField(Class<?> clazz, String name, boolean allowStatic) {
         Class<?> c = clazz;
         while (c != null) {
@@ -169,7 +147,6 @@ public final class HiddenApiBypass {
         return null;
     }
 
-    /** Look up a hidden method on a class hierarchy, trying every parameter list. */
     public static Method findHiddenMethod(Class<?> clazz, String name, Class<?>... params) {
         Class<?> c = clazz;
         while (c != null) {
@@ -182,7 +159,6 @@ public final class HiddenApiBypass {
         return null;
     }
 
-    /** Look up a hidden constructor. */
     public static Constructor<?> findHiddenConstructor(Class<?> clazz, Class<?>... params) {
         try {
             Constructor<?> ctor = clazz.getDeclaredConstructor(params);
@@ -191,39 +167,17 @@ public final class HiddenApiBypass {
         return null;
     }
 
-    private static volatile boolean sExemptionsApplied = false;
-
-    private static void applyExemptionsOnce() {
-        if (sExemptionsApplied) return;
-        synchronized (HiddenApiBypass.class) {
-            if (sExemptionsApplied) return;
-            sExemptionsApplied = true;
-            try {
-                Class<?> vmRuntime = Class.forName("dalvik.system.VMRuntime");
-                Method getRuntime = vmRuntime.getDeclaredMethod("getRuntime");
-                getRuntime.setAccessible(true);
-                Object runtime = getRuntime.invoke(null);
-                Method setExemptions = vmRuntime.getDeclaredMethod(
-                    "setHiddenApiExemptions", String[].class);
-                setExemptions.setAccessible(true);
-                // Exempt everything. The alternative is exempting
-                // only the specific members we need, which is more
-                // precise but requires naming them all.
-                setExemptions.invoke(runtime, (Object) new String[]{"L"});
-            } catch (Throwable ignored) {}
-        }
-    }
-
     // ═════════════════════════════════════════════════════════════
     // STRATEGIES
     // ═════════════════════════════════════════════════════════════
 
     /**
-     * The modern bypass: exempt every class from hidden-API enforcement.
-     * The prefix "L" matches every JVM class descriptor, so this
-     * effectively disables enforcement for the process.
+     * The modern bypass: exempt every class from hidden-API
+     * enforcement. The prefix "L" matches every JVM class
+     * descriptor, so this effectively disables enforcement for the
+     * process.
      *
-     * Returns true if the call succeeded (or was already applied).
+     * Returns true if the call succeeded.
      */
     private static boolean applyVmRuntimeExemptions() {
         try {
@@ -239,7 +193,6 @@ public final class HiddenApiBypass {
             setExemptions.invoke(runtime, (Object) new String[]{ "L" });
             return true;
         } catch (Throwable t) {
-            // Not available before API 28 or on locked-down ROMs.
             return false;
         }
     }
@@ -247,9 +200,6 @@ public final class HiddenApiBypass {
     private static boolean trySetAccessible(AccessibleObject member) {
         try {
             member.setAccessible(true);
-            // NOTE: isAccessible() is unreliable on API 28+; it returns
-            // the "override" flag, which setAccessible just wrote. We
-            // trust the call itself rather than the getter.
             return true;
         } catch (Throwable t) {
             return false;
@@ -268,9 +218,9 @@ public final class HiddenApiBypass {
     }
 
     /**
-     * The "override" field was renamed to "flag" in some Android
-     * versions and removed entirely in API 31+. We probe once and
-     * cache the result.
+     * Resolve the override/flag field on AccessibleObject. Uses the
+     * field name discovered by AndroidCompat's probe pass, so we
+     * don't have to guess or re-probe here.
      */
     private static Field resolveOverrideField() {
         if (overrideFieldResolved) return overrideField;
@@ -278,19 +228,23 @@ public final class HiddenApiBypass {
             if (overrideFieldResolved) return overrideField;
             overrideFieldResolved = true;
 
-            String[] names = { "override", "flag" };
-            for (String name : names) {
-                try {
-                    Field f = AccessibleObject.class.getDeclaredField(name);
-                    f.setAccessible(true);
-                    if (f.getType() == boolean.class) {
-                        CompatLog.d(TAG, "override field found: " + name);
-                        overrideField = f;
-                        return f;
-                    }
-                } catch (Throwable ignored) {}
+            String name = AndroidCompat.ACCESSIBLE_OVERRIDE_FIELD_NAME;
+            if (name == null) {
+                CompatLog.d(TAG, "override field not present on this runtime");
+                return null;
             }
-            CompatLog.d(TAG, "override field not found on this Android version");
+            try {
+                Field f = AccessibleObject.class.getDeclaredField(name);
+                f.setAccessible(true);
+                if (f.getType() == boolean.class) {
+                    CompatLog.d(TAG, "override field resolved: " + name);
+                    overrideField = f;
+                    return f;
+                }
+            } catch (Throwable t) {
+                CompatLog.d(TAG, "override field lookup failed: "
+                    + t.getMessage());
+            }
             return null;
         }
     }

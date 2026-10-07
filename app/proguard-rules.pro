@@ -160,6 +160,45 @@
 -keep public class * extends android.app.Fragment
 -keep public class * extends androidx.fragment.app.Fragment
 
+# ── Shizuku binder watcher ──────────────────────────────────
+#
+# ShizukuBinderWatcher is a no-op ContentProvider whose only
+# job is to give the app a component Android creates eagerly
+# and keeps alive for the process lifetime. Inside onCreate it
+# registers Shizuku.addBinderReceivedListenerSticky and
+# addBinderDeadListener, so the app is notified whenever
+# Shizuku's server comes up or goes down. When the binder is
+# received, it starts ShizuPosedService.
+#
+# Why this exists: Shizuku-Next's "ADB without Developer
+# options" switch takes Shizuku's server down while a target
+# app is in the foreground and brings it back when the app
+# exits. Without this watcher, nothing tells ShizuPosed that
+# the server has returned, and the service stays stopped until
+# the user opens the app manually.
+#
+# The generic ContentProvider rule above already covers this
+# class (it extends ContentProvider, and the manifest names it
+# by class name). This explicit rule is here for two reasons:
+#
+#   1. Clarity — the generic rule doesn't say this class
+#      exists, why it exists, or that it must not be renamed.
+#   2. Safety against a future refactor — if the watcher ever
+#      stops being a ContentProvider, the generic rule stops
+#      applying and the class gets renamed. The manifest
+#      reference would then fail with a ClassNotFoundException
+#      at app start, and the failure would be silent until a
+#      banking app happened to trigger the case the watcher
+#      was written for.
+#
+# The class body is kept whole. It has no member worth
+# shrinking, and the Shizuku listener fields must survive R8's
+# single-pass analysis so the SAM interfaces they reference
+# (Shizuku.OnBinderReceivedListener, Shizuku.OnBinderDeadListener)
+# are resolved at class-load time. rikka.shizuku.** is kept
+# above, so those interfaces survive with their method names.
+-keep class com.shizuposed.manager.watcher.ShizukuBinderWatcher { *; }
+
 # ── Custom Views / ViewBinding ──────────────────────────────
 #
 # Two rules here, and both are needed.
@@ -485,3 +524,16 @@
 #   R8 will rename the class and its members; only the
 #   interface it exposes to the two callers matters at compile
 #   time, and R8 resolves those call sites statically.
+
+# -keep,allowobfuscation on com.shizuposed.manager.watcher:
+#   Considered and rejected. The watcher's class name appears
+#   in AndroidManifest.xml as
+#       android:name=".watcher.ShizukuBinderWatcher"
+#   and R8 does not treat manifest attributes as class
+#   references. Renaming it would produce a
+#   ClassNotFoundException at app start, before any of the
+#   watcher's runtime checks could report what went wrong.
+#   Unlike the stealth package (where a runtime mapping file
+#   could translate names), the watcher is instantiated by the
+#   Android framework, so there is no place to insert a
+#   lookup. Keep it whole.

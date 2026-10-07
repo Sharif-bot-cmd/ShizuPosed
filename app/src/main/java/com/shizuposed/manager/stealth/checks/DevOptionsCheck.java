@@ -1,11 +1,14 @@
 package com.shizuposed.manager.stealth.checks;
 
 import android.content.ContentResolver;
-import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
+import android.os.Parcel;
 
+import com.shizuposed.manager.stealth.XStealthConfig;
 import com.shizuposed.manager.stealth.XStealthRegistry;
+
+import java.util.concurrent.atomic.AtomicLong;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -18,9 +21,19 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Hides that Developer Options are enabled. Hooks every common
  * path an app uses to read the setting:
  *
- *   • Settings.Global.getInt / getString / getLong
- *   • Settings.Global.getIntForUser / getStringForUser / getLongForUser
- *   • ContentResolver.query on content://settings/global/<key>
+ *   Level 1 — Java API
+ *     • Settings.Global.getInt / getString / getLong / getFloat
+ *     • Settings.Global.getIntForUser / getStringForUser /
+ *       getLongForUser
+ *     • ContentResolver.query on content://settings/global/<key>
+ *
+ *   Level 2 — Binder.transact
+ *     • IContentProvider.query — refuses a query against a hidden
+ *       key. Same shape as AdbCheck's hook; the two install
+ *       independently so a device with hideDevOptions on and
+ *       hideAdb off still covers the DevOptions keys over Binder.
+ *     • DUMP_TRANSACTION — refuses `dumpsys settings get global
+ *       <key>` for hidden keys. Same shape as AdbCheck.
  *
  * Keys hidden:
  *   • development_settings_enabled
@@ -28,22 +41,29 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *   • adb_wifi_enabled
  *   • development_enable_adi
  *
- * The hook preserves all other key lookups. It does not modify the
- * actual settings; only what the caller sees.
+ * This class is the canonical source of the hidden-key list.
+ * AdbCheck delegates to hidesKey() so the two checks can never
+ * disagree about what is hidden.
  *
- * The direct ContentResolver.query path is the one that defeats a
- * naive hook-only approach. Most banking apps use it in addition
- * to the static getters, so hooking only the getters is not enough.
- *
- * Return values from query() are a MatrixCursor shaped like the
- * real settings cursor: columns "name" and "value". Apps that
- * expect those columns find them. Apps that expect columns we
- * don't provide fall through to their own error handling, which
- * for a detection check means "not detected" — the desired outcome.
+ * No state change. The class sanitizes reads only. The underlying
+ * value in the settings database is unchanged.
  */
 public final class DevOptionsCheck {
 
     private static final String TAG = "XStealth";
+
+    /** Binder descriptor for the content provider interface. */
+    private static final String PROVIDER_DESCRIPTOR =
+        "android.content.IContentProvider";
+
+    /**
+     * IContentProvider.query's transaction code. Stable across
+     * Android versions — query is the first method in the table.
+     */
+    private static final int QUERY_TRANSACTION = 1;
+
+    /** IBinder.DUMP_TRANSACTION. */
+    private static final int DUMP_TRANSACTION = 1598311760;
 
     private static final String[] HIDDEN_KEYS = {
         "development_settings_enabled",
@@ -52,19 +72,162 @@ public final class DevOptionsCheck {
         "development_enable_adi",
     };
 
+    /** Diagnostics counters, per-process. */
+    private static final AtomicLong sTransactRefused = new AtomicLong();
+    private static final AtomicLong sDumpRefused     = new AtomicLong();
+
     private DevOptionsCheck() {}
 
-    public static void install(XC_LoadPackage.LoadPackageParam lpparam) {
+    public static void install(XC_LoadPackage.LoadPackageParam lpparam,
+                               XStealthConfig config) {
+        if (lpparam == null || config == null) return;
+        if (!config.hideDevOptions) return;
+
+        // ── Level 1: Java API ──────────────────────────────────
         Class<?> settingsGlobal = XposedHelpers.findClassIfExists(
             "android.provider.Settings$Global", lpparam.classLoader);
-        if (settingsGlobal == null) return;
-
-        hookStaticGetters(settingsGlobal);
-        hookForUserGetters(settingsGlobal);
+        if (settingsGlobal != null) {
+            hookStaticGetters(settingsGlobal);
+            hookForUserGetters(settingsGlobal);
+        }
         hookContentResolverQuery();
 
-        XposedBridge.log(TAG + ": DevOptionsCheck installed");
+        // ── Level 2: Binder ────────────────────────────────────
+        hookBinderTransact();
+
+        XposedBridge.log(TAG + ": DevOptionsCheck installed "
+            + "(java+binder)");
         XStealthRegistry.record("DevOptionsCheck");
+    }
+
+    /** Snapshot for the detail sheet. */
+    public static String describeBinder() {
+        return "queryRefused=" + sTransactRefused.get()
+            + " dumpRefused=" + sDumpRefused.get();
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // LEVEL 2 — BINDER TRANSACT HOOK
+    // ═════════════════════════════════════════════════════════════
+
+    private static void hookBinderTransact() {
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.os.BinderProxy", null, "transact",
+                int.class, Parcel.class, Parcel.class, int.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam p)
+                            throws Throwable {
+                        int code = (Integer) p.args[0];
+                        Parcel data = (Parcel) p.args[1];
+                        if (data == null) return;
+
+                        // ── DUMP_TRANSACTION ────────────────────
+                        if (code == DUMP_TRANSACTION) {
+                            checkDump(data);
+                            return;
+                        }
+
+                        // ── IContentProvider.query ──────────────
+                        if (code != QUERY_TRANSACTION) return;
+
+                        String descriptor = readInterfaceDescriptor(data);
+                        if (descriptor == null
+                                || !descriptor.equals(PROVIDER_DESCRIPTOR)) {
+                            return;
+                        }
+
+                        int pos = data.dataPosition();
+                        try {
+                            data.readString();   // callingPackage
+                            data.readString();   // attributionTag (nullable)
+                            Uri uri = data.readTypedObject(Uri.CREATOR);
+                            if (uri == null) return;
+
+                            String key = extractSettingsKey(uri);
+                            if (key == null) return;
+                            if (!hidesKey(key)) return;
+
+                            sTransactRefused.incrementAndGet();
+                            XposedBridge.log(TAG + ": Binder "
+                                + "IContentProvider.query refused for key "
+                                + key);
+                            throw new android.os.RemoteException(
+                                "settings query denied");
+                        } catch (android.os.RemoteException re) {
+                            throw re;
+                        } catch (Throwable parseErr) {
+                            // Parcel shape not what we expected.
+                        } finally {
+                            try { data.setDataPosition(pos); }
+                            catch (Throwable ignored) {}
+                        }
+                    }
+                });
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": DevOptionsCheck Binder.transact "
+                + "hook failed: " + t);
+        }
+    }
+
+    /**
+     * Parse a DUMP_TRANSACTION parcel and refuse if the args array
+     * names a hidden settings key alongside a settings service.
+     *
+     * Uses Parcel.createStringArray() rather than
+     * readStringArray(): readStringArray takes a pre-allocated
+     * out-parameter on some Android versions and returns an array
+     * on others, and the stub the compiler sees is inconsistent
+     * about which overload is available.
+     */
+    private static void checkDump(Parcel data)
+            throws android.os.RemoteException {
+        int pos = data.dataPosition();
+        try {
+            try { data.readString(); } catch (Throwable ignored) {}
+            try { data.readFileDescriptor(); } catch (Throwable ignored) {}
+
+            String[] args = null;
+            try { args = data.createStringArray(); } catch (Throwable ignored) {}
+            if (args == null || args.length == 0) return;
+
+            boolean isSettingsDump = false;
+            for (String a : args) {
+                if ("settings".equals(a)) { isSettingsDump = true; break; }
+            }
+            if (!isSettingsDump) return;
+
+            String hit = null;
+            for (String a : args) {
+                if (a == null) continue;
+                if (hidesKey(a)) { hit = a; break; }
+            }
+            if (hit == null) return;
+
+            sDumpRefused.incrementAndGet();
+            XposedBridge.log(TAG + ": Binder DUMP refused for key " + hit);
+            throw new android.os.RemoteException(
+                "settings key " + hit + " not found");
+        } catch (android.os.RemoteException re) {
+            throw re;
+        } catch (Throwable parseErr) {
+            // Pass through.
+        } finally {
+            try { data.setDataPosition(pos); }
+            catch (Throwable ignored) {}
+        }
+    }
+
+    private static String readInterfaceDescriptor(Parcel data) {
+        int pos = data.dataPosition();
+        try {
+            return data.readString();
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            try { data.setDataPosition(pos); } catch (Throwable ignored) {}
+        }
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -72,56 +235,52 @@ public final class DevOptionsCheck {
     // ═════════════════════════════════════════════════════════════
 
     private static void hookStaticGetters(Class<?> settingsGlobal) {
-        // int getInt(ContentResolver cr, String name, int def)
         try {
             XposedHelpers.findAndHookMethod(
                 settingsGlobal, "getInt",
                 ContentResolver.class, String.class, int.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult(0);
+                        if (hidesKey((String) p.args[1])) p.setResult(0);
                     }
                 });
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": Global.getInt hook failed: " + t);
         }
 
-        // String getString(ContentResolver cr, String name)
         try {
             XposedHelpers.findAndHookMethod(
                 settingsGlobal, "getString",
                 ContentResolver.class, String.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult("0");
+                        if (hidesKey((String) p.args[1])) p.setResult("0");
                     }
                 });
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": Global.getString hook failed: " + t);
         }
 
-        // long getLong(ContentResolver cr, String name, long def)
         try {
             XposedHelpers.findAndHookMethod(
                 settingsGlobal, "getLong",
                 ContentResolver.class, String.class, long.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult(0L);
+                        if (hidesKey((String) p.args[1])) p.setResult(0L);
                     }
                 });
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": Global.getLong hook failed: " + t);
         }
 
-        // float getFloat(ContentResolver cr, String name, float def)
         try {
             XposedHelpers.findAndHookMethod(
                 settingsGlobal, "getFloat",
                 ContentResolver.class, String.class, float.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult(0f);
+                        if (hidesKey((String) p.args[1])) p.setResult(0f);
                     }
                 });
         } catch (Throwable t) {
@@ -134,42 +293,39 @@ public final class DevOptionsCheck {
     // ═════════════════════════════════════════════════════════════
 
     private static void hookForUserGetters(Class<?> settingsGlobal) {
-        // int getIntForUser(ContentResolver cr, String name, int def, int userId)
         try {
             XposedHelpers.findAndHookMethod(
                 settingsGlobal, "getIntForUser",
                 ContentResolver.class, String.class, int.class, int.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult(0);
+                        if (hidesKey((String) p.args[1])) p.setResult(0);
                     }
                 });
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": Global.getIntForUser hook failed: " + t);
         }
 
-        // String getStringForUser(ContentResolver cr, String name, int userId)
         try {
             XposedHelpers.findAndHookMethod(
                 settingsGlobal, "getStringForUser",
                 ContentResolver.class, String.class, int.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult("0");
+                        if (hidesKey((String) p.args[1])) p.setResult("0");
                     }
                 });
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": Global.getStringForUser hook failed: " + t);
         }
 
-        // long getLongForUser(ContentResolver cr, String name, long def, int userId)
         try {
             XposedHelpers.findAndHookMethod(
                 settingsGlobal, "getLongForUser",
                 ContentResolver.class, String.class, long.class, int.class,
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
-                        if (isHiddenKey((String) p.args[1])) p.setResult(0L);
+                        if (hidesKey((String) p.args[1])) p.setResult(0L);
                     }
                 });
         } catch (Throwable t) {
@@ -178,24 +334,9 @@ public final class DevOptionsCheck {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // ContentResolver.query — the direct path most apps use
+    // ContentResolver.query
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Intercept direct queries against content://settings/global/<key>
-     * and content://settings/secure/<key>. If the requested key is
-     * one of the hidden ones, return a synthetic cursor whose value
-     * column reads 0.
-     *
-     * The cursor shape matches what SettingsProvider returns: columns
-     * "_id", "name", "value". Apps that expect those columns find
-     * them.
-     *
-     * If the query has a WHERE clause filtering on name, we check
-     * the name we're returning is consistent with the filter. If not,
-     * we return an empty cursor. The app then reads zero rows and
-     * treats the setting as absent, which is the desired outcome.
-     */
     private static void hookContentResolverQuery() {
         try {
             XposedHelpers.findAndHookMethod(
@@ -210,13 +351,12 @@ public final class DevOptionsCheck {
                         if (uri == null) return;
                         String key = extractSettingsKey(uri);
                         if (key == null) return;
-                        if (!isHiddenKey(key)) return;
+                        if (!hidesKey(key)) return;
 
                         String selection = (String) p.args[2];
-                        if (selection != null && !selectionMatches(selection, key)) {
-                            // The query filters on a different name.
-                            // Return an empty cursor so the caller
-                            // sees no rows.
+                        String[] selArgs = (String[]) p.args[3];
+                        if (!AdbCheck.selectionReferencesKey(
+                                selection, selArgs, key)) {
                             p.setResult(new MatrixCursor(
                                 new String[]{"_id", "name", "value"}));
                             return;
@@ -233,17 +373,12 @@ public final class DevOptionsCheck {
         }
     }
 
-    /**
-     * Extract the setting key from a settings URI. Returns null for
-     * any URI that isn't content://settings/{global,secure,<namespace>}/<key>.
-     */
     private static String extractSettingsKey(Uri uri) {
         if (uri == null) return null;
         String authority = uri.getAuthority();
         if (!"settings".equals(authority)) return null;
         String path = uri.getPath();
         if (path == null) return null;
-        // Paths look like /global/<key> or /secure/<key>.
         if (!path.startsWith("/global/") && !path.startsWith("/secure/")) {
             return null;
         }
@@ -252,36 +387,11 @@ public final class DevOptionsCheck {
         return path.substring(slash + 1);
     }
 
-    /**
-     * Does the caller's WHERE clause reference the key we want to
-     * hide? If it does, we can return a fake row. If it references
-     * a different key, we should return no rows.
-     */
-    private static boolean selectionMatches(String selection, String key) {
-        if (selection == null || key == null) return false;
-        // Cheap check: does the selection contain the key name?
-        // Full SQL parsing isn't needed here — SettingsProvider
-        // queries typically use "name=?" or "name = ?" patterns.
-        return selection.contains(key) || selection.contains("name");
-    }
-
     // ═════════════════════════════════════════════════════════════
-    // Key matching
+    // Key matching — canonical for the whole package
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Is this string one of the hidden keys?
-     *
-     * Accepts three forms:
-     *   • "development_settings_enabled"
-     *   • "content://settings/global/development_settings_enabled"
-     *   • "/global/development_settings_enabled"
-     *
-     * The last two are useful when a caller passes a URI-shaped
-     * string where a plain key was expected. Some apps do this by
-     * mistake, or by design to sidestep naive hooks.
-     */
-    private static boolean isHiddenKey(String keyOrUri) {
+    static boolean hidesKey(String keyOrUri) {
         if (keyOrUri == null) return false;
         String key = keyOrUri;
         int slash = keyOrUri.lastIndexOf('/');
@@ -292,5 +402,9 @@ public final class DevOptionsCheck {
             if (k.equalsIgnoreCase(key)) return true;
         }
         return false;
+    }
+
+    static String[] hiddenKeys() {
+        return HIDDEN_KEYS.clone();
     }
 }

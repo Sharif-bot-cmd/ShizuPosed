@@ -19,6 +19,8 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AlertDialog;
 import androidx.fragment.app.Fragment;
+import androidx.fragment.app.FragmentActivity;
+import androidx.fragment.app.FragmentManager;
 
 import com.google.android.material.bottomsheet.BottomSheetDialogFragment;
 import com.shizuposed.manager.R;
@@ -34,6 +36,27 @@ import com.shizuposed.manager.utils.ModuleActivityResolver;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * ModuleDetailSheet
+ *
+ * Bottom sheet showing a module's metadata, scope, and actions.
+ *
+ * HOST LOOKUP
+ * -----------
+ * The sheet is shown via show(getParentFragmentManager(), tag),
+ * which attaches it to the ACTIVITY's FragmentManager — not to
+ * the calling fragment's childFragmentManager. This means
+ * getParentFragment() returns null even though the caller is
+ * ModulesFragment.
+ *
+ * tryLaunchThroughShizuPosed() therefore uses
+ * findHostModulesFragment() to locate the ModulesFragment by
+ * walking the activity's fragment tree. Without this, the routed
+ * launch path is skipped and self-hook activation never installs.
+ *
+ * The search recurses into child FragmentManagers so it also works
+ * if ModulesFragment is nested inside a tab host or ViewPager2.
+ */
 public class ModuleDetailSheet extends BottomSheetDialogFragment {
 
     private static final String ARG_PACKAGE = "packageName";
@@ -84,19 +107,22 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             return;
         }
 
-        // Force a fresh load so cachedDexPath reflects the current
-        // disk state. Otherwise we can read a stale in-memory record
-        // and skip the ShizuPosed launch path for no good reason.
+        // Look up the module from the current cache first. Only fall
+        // back to a disk reload if the cache doesn't have it — the
+        // disk reload is expensive and forces a full JSON re-parse.
         if (moduleLoader != null) {
-            try {
-                moduleLoader.loadModules();
-            } catch (Throwable t) {
-                if (logger != null) {
-                    logger.w("ModuleDetailSheet: loadModules failed: "
-                        + t.getMessage());
-                }
-            }
             module = moduleLoader.getModule(pkg);
+            if (module == null) {
+                try {
+                    moduleLoader.loadModules();
+                } catch (Throwable t) {
+                    if (logger != null) {
+                        logger.w("ModuleDetailSheet: loadModules failed: "
+                            + t.getMessage());
+                    }
+                }
+                module = moduleLoader.getModule(pkg);
+            }
         } else {
             module = null;
         }
@@ -119,6 +145,87 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
         super.onDestroyView();
         viewReady = false;
         resolvedActivity = null;
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // HOST LOOKUP
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Locate the ModulesFragment that owns this sheet.
+     *
+     * The sheet is added via show(getParentFragmentManager(), tag),
+     * which puts it in the ACTIVITY's FragmentManager as a sibling
+     * of ModulesFragment. So getParentFragment() returns null. We
+     * have to search the activity's fragment tree instead.
+     *
+     * Order of preference:
+     *   1. getParentFragment() — works if someone nested us via
+     *      childFragmentManager.
+     *   2. Any ModulesFragment in the activity's FragmentManager,
+     *      recursing into child FragmentManagers up to depth 3.
+     */
+    @Nullable
+    private ModulesFragment findHostModulesFragment() {
+        // 1. Direct parent
+        Fragment parent = getParentFragment();
+        if (parent instanceof ModulesFragment) {
+            if (logger != null) {
+                logger.d("findHostModulesFragment: found via getParentFragment");
+            }
+            return (ModulesFragment) parent;
+        }
+
+        // 2. Scan the activity's fragment tree
+        try {
+            FragmentActivity activity = getActivity();
+            if (activity == null) return null;
+
+            FragmentManager fm = activity.getSupportFragmentManager();
+            List<Fragment> all = fm.getFragments();
+            ModulesFragment found = searchFragmentsForModules(all, 0);
+            if (found != null) {
+                if (logger != null) {
+                    logger.d("findHostModulesFragment: found in "
+                        + "activity FM (" + all.size() + " top-level fragments)");
+                }
+                return found;
+            }
+
+            if (logger != null) {
+                logger.i("findHostModulesFragment: no ModulesFragment in "
+                    + "activity FM or any child FMs");
+            }
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.w("findHostModulesFragment failed: " + t.getMessage());
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Recursively search a fragment list and its children for a
+     * ModulesFragment. Depth-bounded to avoid pathological cases.
+     */
+    @Nullable
+    private ModulesFragment searchFragmentsForModules(List<Fragment> fragments,
+                                                     int depth) {
+        if (fragments == null || depth > 3) return null;
+        for (Fragment f : fragments) {
+            if (f == null) continue;
+            if (f instanceof ModulesFragment) return (ModulesFragment) f;
+
+            // Recurse into child fragments
+            try {
+                FragmentManager childFm = f.getChildFragmentManager();
+                ModulesFragment nested = searchFragmentsForModules(
+                    childFm.getFragments(), depth + 1);
+                if (nested != null) return nested;
+            } catch (Throwable ignored) {}
+        }
+        return null;
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -196,23 +303,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
     // OPEN MODULE APP
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Launch the module's own configuration UI.
-     *
-     * Three paths, in order of preference:
-     *
-     *   1. Launch through ShizuPosed. This runs the module's UI
-     *      inside app_process with hooks installed, which is what
-     *      self-hook-based activation checks need to see.
-     *
-     *   2. Exported activity, launched directly. Fast, no Shizuku
-     *      round-trip. The module's UI will open, but its own
-     *      process has no hooks — self-hook checks return the
-     *      original value. The user is warned.
-     *
-     *   3. Non-exported activity, launched via Shizuku's `am start`.
-     *      Same caveat as path 2.
-     */
     private void launchModuleActivity() {
         if (!isAdded()) return;
         if (resolvedActivity == null || resolvedActivity.component == null) {
@@ -222,9 +312,7 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             return;
         }
 
-        // Path 1: launch through ShizuPosed. This is the one that
-        // installs the self-hook for modules that check their own
-        // activation state.
+        // Path 1: launch through ShizuPosed (installs the self-hook).
         if (tryLaunchThroughShizuPosed()) {
             return;
         }
@@ -276,33 +364,25 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
     /**
      * Try to launch the module's own UI through ShizuPosed.
      *
-     * Returns true if the launch was dispatched successfully. When
-     * it returns true, the caller must not launch the UI by any
-     * other path.
+     * Returns true if the launch was dispatched. When true, the
+     * caller MUST NOT launch the UI by any other path.
      *
-     * The cachedDexPath guard runs through ensureCachedDex() so a
-     * stale or missing record is repaired against the actual disk
-     * contents before we decide whether ShizuPosed can handle it.
+     * Uses findHostModulesFragment() rather than getParentFragment()
+     * because the sheet is added to the activity's FragmentManager,
+     * not nested inside ModulesFragment.
      */
     private boolean tryLaunchThroughShizuPosed() {
         try {
-            Fragment parent = getParentFragment();
-            if (!(parent instanceof ModulesFragment)) {
+            if (module == null) {
                 if (logger != null) {
-                    logger.d("tryLaunchThroughShizuPosed: no ModulesFragment parent");
+                    logger.d("tryLaunchThroughShizuPosed: module is null");
                 }
                 return false;
             }
 
-            if (module == null) {
-                return false;
-            }
-
             // Repair cachedDexPath from disk if the in-memory record
-            // is stale or missing. Without this, a valid module can
-            // silently fall through to the direct-launch path and
-            // the user gets the "self-hook not installed" warning
-            // for no real reason.
+            // is stale. Without this, a valid module can silently
+            // fall through to the direct-launch path.
             boolean dexOk = module.cachedDexPath != null
                 && !module.cachedDexPath.isEmpty()
                 && new java.io.File(module.cachedDexPath).exists();
@@ -313,9 +393,21 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
 
             if (!dexOk) {
                 if (logger != null) {
-                    logger.d("tryLaunchThroughShizuPosed: no dex available for "
+                    logger.i("tryLaunchThroughShizuPosed: no dex available for "
                         + module.packageName
                         + " (apkPath=" + module.apkPath + ")");
+                }
+                return false;
+            }
+
+            // Locate the host fragment. This is the fix — the old code
+            // used getParentFragment(), which returned null.
+            ModulesFragment host = findHostModulesFragment();
+            if (host == null) {
+                if (logger != null) {
+                    logger.i("tryLaunchThroughShizuPosed: no ModulesFragment "
+                        + "host for " + module.packageName
+                        + " — cannot route");
                 }
                 return false;
             }
@@ -323,7 +415,8 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             ShizukuHelper sh = ShizukuHelper.getInstance(requireContext());
             if (sh == null || !sh.isAvailable() || !sh.isAuthorized()) {
                 if (logger != null) {
-                    logger.d("tryLaunchThroughShizuPosed: Shizuku not available");
+                    logger.i("tryLaunchThroughShizuPosed: Shizuku not "
+                        + "available for " + module.packageName);
                 }
                 return false;
             }
@@ -333,7 +426,7 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                     + " under ShizuPosed (self-hook activation)");
             }
 
-            ((ModulesFragment) parent).launchUnderShizuPosed(module.packageName);
+            host.launchUnderShizuPosed(module.packageName);
             dismissAllowingStateLoss();
             return true;
 
@@ -349,12 +442,15 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
     // SCOPE
     // ═════════════════════════════════════════════════════════════
 
+    // ═════════════════════════════════════════════════════════════
+    // SCOPE (read-only summary)
+    // ═════════════════════════════════════════════════════════════
+
     private void bindScope(View v) {
         if (!viewReady || module == null) return;
 
         TextView count = v.findViewById(R.id.tvScopeCount);
         TextView list = v.findViewById(R.id.tvScopeList);
-        Button edit = v.findViewById(R.id.btnEditScope);
 
         List<String> apps = module.hookedApps != null
             ? new ArrayList<>(module.hookedApps)
@@ -381,20 +477,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                 list.setText(sb.toString());
             }
         }
-
-        if (edit != null) {
-            edit.setOnClickListener(x -> {
-                Fragment parent = getParentFragment();
-                if (parent instanceof ModulesFragment) {
-                    dismissAllowingStateLoss();
-                    ((ModulesFragment) parent).openScopeEditor(module);
-                } else if (isAdded()) {
-                    Toast.makeText(requireContext(),
-                        "Edit scope from the Modules tab",
-                        Toast.LENGTH_SHORT).show();
-                }
-            });
-        }
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -407,7 +489,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
         Button remove = v.findViewById(R.id.btnRemoveModule);
         if (remove == null) return;
 
-        // XStealth is built-in — no removal.
         if (XStealthModule.PACKAGE.equals(module.packageName)) {
             remove.setVisibility(View.GONE);
             return;
@@ -436,7 +517,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
         if (!isAdded() || module == null || moduleLoader == null) return;
 
         final String pkg = module.packageName;
-        final Fragment parent = getParentFragment();
 
         moduleLoader.uninstallModuleCompletely(
             requireActivity(),
@@ -444,9 +524,9 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             (code, message) -> mainHandler.post(() -> {
                 if (!isAdded()) return;
 
-                // Drop the row from the Modules tab immediately.
-                if (parent instanceof ModulesFragment) {
-                    ((ModulesFragment) parent).onModuleRemoved(pkg);
+                ModulesFragment host = findHostModulesFragment();
+                if (host != null) {
+                    host.onModuleRemoved(pkg);
                 }
 
                 if (message != null) {

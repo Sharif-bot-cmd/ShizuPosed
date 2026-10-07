@@ -22,10 +22,6 @@ import java.util.Set;
  *
  * Called by ShizuPosedService on every module repush so the shell
  * side is never out of date.
- *
- * The config now includes the scope. An absent or empty "scope"
- * array means "all apps" — the shell side treats it the same way
- * the manager does.
  */
 public final class XStealthStatusWriter {
 
@@ -34,25 +30,30 @@ public final class XStealthStatusWriter {
 
     private XStealthStatusWriter() {}
 
-    /**
-     * Serialize prefs to JSON. Public so the detail sheet can show
-     * exactly what will be written.
-     */
     public static JSONObject buildConfig(Context c) throws Exception {
         JSONObject o = new JSONObject();
+
         o.put("enabled",              XStealthPrefs.isEnabled(c));
         o.put("nextEnabled",          XStealthPrefs.isNextEnabled(c));
+        o.put("bridgeEnabled",        XStealthPrefs.isBridgeEnabled(c));
+
         o.put("hideDevOptions",       XStealthPrefs.isHideDevOptions(c));
         o.put("hideAdb",              XStealthPrefs.isHideAdb(c));
         o.put("hideShizukuPackage",   XStealthPrefs.isHideShizukuPackage(c));
         o.put("hideShizuPosedPackage",XStealthPrefs.isHideShizuPosedPackage(c));
         o.put("hideRunningProcesses", XStealthPrefs.isHideRunningProcesses(c));
         o.put("hideProcFs",           XStealthPrefs.isHideProcFs(c));
+
+        o.put("hideSystemProperties",       XStealthPrefs.isHideSystemProperties(c));
+        o.put("hideBuildFields",            XStealthPrefs.isHideBuildFields(c));
+        o.put("scrubShizuPosedProperties",  XStealthPrefs.isScrubShizuPosedProperties(c));
+        o.put("scrubThreadNames",           XStealthPrefs.isScrubThreadNames(c));
+        o.put("methodBaseline", XStealthPrefs.isMethodBaselineEnabled(c));
+        o.put("unsafeGate",     XStealthPrefs.isUnsafeGateEnabled(c));
+
         o.put("apiProtection",        XStealthPrefs.isApiProtectionEnabled(c));
         o.put("dexOptimize",          XStealthPrefs.isDexOptimizeEnabled(c));
 
-        // Scope. Always present so the shell side can distinguish
-        // "no scope file" (old config) from "empty scope" (all apps).
         JSONArray scopeArr = new JSONArray();
         Set<String> scope = XStealthPrefs.getScope(c);
         if (scope != null) {
@@ -65,10 +66,6 @@ public final class XStealthStatusWriter {
         return o;
     }
 
-    /**
-     * Write the config to a local file in external app storage.
-     * Returns the local file, or null on failure.
-     */
     public static File writeLocal(Context c) {
         try {
             File external = c.getExternalFilesDir(null);
@@ -89,9 +86,6 @@ public final class XStealthStatusWriter {
         }
     }
 
-    /**
-     * Write locally, then push to the shell side via Shizuku.
-     */
     public static boolean push(Context c, String shellBase,
                                ShizukuHelper shizuku, Logger logger) {
         File local = writeLocal(c);

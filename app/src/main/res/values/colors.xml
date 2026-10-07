@@ -59,4 +59,24 @@
     <color name="md_theme_dark_inverseSurface">#E0E0E0</color>
     <color name="md_theme_dark_inverseOnSurface">#212121</color>
     <color name="md_theme_dark_inversePrimary">#4CAF50</color>
+
+    <!-- ─── Launcher icon ────────────────────────────────────
+         Colors for the adaptive launcher icon.
+
+         The composition is the LSPosed composition: a solid
+         background with a pure-white mark on top. That is what
+         makes the icon read as the "hook framework" family.
+
+         The background color is what distinguishes one framework
+         from another. LSPosed uses pink (#F48FB1). ShizuPosed
+         uses green, matching its own Material theme, so the icon
+         is immediately its own without losing the family look.
+
+         If you ever want the exact LSPosed look instead, set
+         ic_launcher_background to #F48FB1. Keeping the green is
+         the recommendation: same composition, different
+         identity.
+         ──────────────────────────────────────────────────── -->
+    <color name="ic_launcher_background">#2E7D32</color>
+    <color name="ic_launcher_foreground">#FFFFFF</color>
 </resources>
