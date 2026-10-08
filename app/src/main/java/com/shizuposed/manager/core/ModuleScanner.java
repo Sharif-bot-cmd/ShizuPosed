@@ -2,6 +2,7 @@ package com.shizuposed.manager.core;
 
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
@@ -14,6 +15,7 @@ import java.io.File;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -41,6 +43,22 @@ import java.util.zip.ZipFile;
  * flag is set. Users who add a module by hand via the Add Module
  * dialog are never subject to automatic cleanup — that intent
  * takes precedence over the apkExists / packageInstalled checks.
+ *
+ * "NEWLY REGISTERED" IS PERSISTENT (8.0+)
+ * --------------------------------------
+ * The scanner tracks which module packages it has ever reported in
+ * a SharedPreferences file, so a cold-start scan does not treat
+ * every installed module as newly discovered. Without this, the
+ * UI showed "N new modules detected" every time the app was
+ * opened, because the in-memory "already registered" set was
+ * empty at process start.
+ *
+ * The persisted set is a union: each scan adds the packages it
+ * found to the set. A module that was uninstalled and reinstalled
+ * counts as new again only if it was removed from the set between
+ * the two scans. The manager's "clean all caches" action calls
+ * resetSeenPackages() to clear the set when the user explicitly
+ * asks for a full reset.
  */
 public final class ModuleScanner {
 
@@ -51,6 +69,10 @@ public final class ModuleScanner {
     private static final int MIN_PLAUSIBLE_PACKAGE_COUNT = 30;
 
     private static final long PURGE_GRACE_PERIOD_MS = 60_000L;
+
+    /** SharedPreferences file for scan state. */
+    private static final String PREFS_NAME = "module_scanner_state";
+    private static final String KEY_SEEN_PACKAGES = "seen_packages";
 
     private static final ConcurrentHashMap<String, Integer> missedCounts =
         new ConcurrentHashMap<>();
@@ -64,10 +86,68 @@ public final class ModuleScanner {
         public int purgedCount = 0;
         public int refreshedPaths = 0;
         public int purgeDeferred = 0;
+
+        /** Packages already known before this scan. Diagnostic only. */
+        public int alreadyKnown = 0;
+
         public final List<String> newlyRegisteredPackages = new ArrayList<>();
         public final List<String> purgedPackages = new ArrayList<>();
         public final Set<String> installedPackagesSeen = new HashSet<>();
     }
+
+    // ═════════════════════════════════════════════════════════════
+    // SEEN-PACKAGE PERSISTENCE
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Load the set of module packages that previous scans have
+     * already reported. Returns an empty set on first run.
+     */
+    private static Set<String> loadSeenPackages(Context context) {
+        try {
+            SharedPreferences prefs = context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            Set<String> stored = prefs.getStringSet(
+                KEY_SEEN_PACKAGES, Collections.<String>emptySet());
+            return new HashSet<>(stored);
+        } catch (Throwable t) {
+            return new HashSet<>();
+        }
+    }
+
+    /**
+     * Persist the union of the previous seen set and the packages
+     * found in this scan. Uses commit() so the write survives a
+     * process kill immediately after the scan.
+     */
+    private static void saveSeenPackages(Context context, Set<String> updated) {
+        try {
+            SharedPreferences prefs = context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            prefs.edit()
+                 .putStringSet(KEY_SEEN_PACKAGES, new HashSet<>(updated))
+                 .commit();
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * Clear the persisted seen-package set. Called by the manager's
+     * "clean all caches" action so that the next scan treats every
+     * module as newly discovered again (which is what a full cache
+     * reset should look like).
+     */
+    public static void resetSeenPackages(Context context) {
+        if (context == null) return;
+        try {
+            SharedPreferences prefs = context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            prefs.edit().remove(KEY_SEEN_PACKAGES).commit();
+        } catch (Throwable ignored) {}
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // MAIN SCAN
+    // ═════════════════════════════════════════════════════════════
 
     public static ScanResult scanInstalledModules(Context context) {
         ScanResult result = new ScanResult();
@@ -92,12 +172,25 @@ public final class ModuleScanner {
             return result;
         }
 
+        // Two independent notions of "already known":
+        //
+        //   • alreadyRegistered — what ModuleLoader currently has in
+        //     its cache. Used to decide whether to re-register or
+        //     refresh a module's apkPath.
+        //
+        //   • seenPackages — what we've ever reported as newly
+        //     registered, persisted across process restarts. Used to
+        //     decide whether to *report* a module as new. Without
+        //     this, a cold-start scan reports every module as new
+        //     because alreadyRegistered starts empty.
         Set<String> alreadyRegistered = new HashSet<>();
         for (ModuleInfo m : loader.getCachedModules()) {
             if (m != null && m.packageName != null) {
                 alreadyRegistered.add(m.packageName);
             }
         }
+        Set<String> seenPackages = loadSeenPackages(context);
+        Set<String> presentThisScan = new HashSet<>();
 
         for (ApplicationInfo ai : installed) {
             if (ai == null || ai.packageName == null) continue;
@@ -120,6 +213,10 @@ public final class ModuleScanner {
                         boolean pathMatches = existing.apkPath != null
                                 && existing.apkPath.equals(apkPath);
                         if (pathMatches) {
+                            presentThisScan.add(ai.packageName);
+                            if (seenPackages.contains(ai.packageName)) {
+                                result.alreadyKnown++;
+                            }
                             continue;
                         }
                         logger.i("[" + TAG + "] Refreshing apkPath for "
@@ -128,6 +225,10 @@ public final class ModuleScanner {
                         existing.apkPath = apkPath;
                         loader.saveModule(existing);
                         result.refreshedPaths++;
+                        presentThisScan.add(ai.packageName);
+                        if (seenPackages.contains(ai.packageName)) {
+                            result.alreadyKnown++;
+                        }
                         continue;
                     }
                     logger.w("[" + TAG + "] " + ai.packageName
@@ -138,6 +239,9 @@ public final class ModuleScanner {
                 if (entry == null) continue;
 
                 result.xposedModulesFound++;
+                presentThisScan.add(ai.packageName);
+
+                boolean isFirstTimeReporting = !seenPackages.contains(ai.packageName);
 
                 ModuleInfo module = new ModuleInfo();
                 module.packageName = ai.packageName;
@@ -153,20 +257,38 @@ public final class ModuleScanner {
 
                 boolean ok = loader.installModule(module);
                 if (ok) {
-                    result.newlyRegistered++;
-                    result.newlyRegisteredPackages.add(ai.packageName);
-                    logger.i("[" + TAG + "] Auto-detected module: "
-                        + ai.packageName
-                        + " (entry=" + (entry.isEmpty()
-                            ? "<auto-detect>" : entry)
-                        + ", hasUi=" + module.hasUi
-                        + ", recommended=" + module.getRecommendedAppCount() + ")");
+                    if (isFirstTimeReporting) {
+                        // First time we've reported this package. Count
+                        // it as newly registered.
+                        result.newlyRegistered++;
+                        result.newlyRegisteredPackages.add(ai.packageName);
+                        logger.i("[" + TAG + "] Auto-detected module: "
+                            + ai.packageName
+                            + " (entry=" + (entry.isEmpty()
+                                ? "<auto-detect>" : entry)
+                            + ", hasUi=" + module.hasUi
+                            + ", recommended=" + module.getRecommendedAppCount() + ")");
+                    } else {
+                        // Seen before, still present. Not news.
+                        result.alreadyKnown++;
+                        logger.d("[" + TAG + "] Module still present: "
+                            + ai.packageName);
+                    }
                 }
 
             } catch (Throwable t) {
                 logger.d("[" + TAG + "] Skipping " + ai.packageName
                     + ": " + t.getMessage());
             }
+        }
+
+        // Persist the union. This runs even if the scan found no new
+        // modules, so the persisted set catches up with the device's
+        // current package list.
+        Set<String> updatedSeen = new HashSet<>(seenPackages);
+        updatedSeen.addAll(presentThisScan);
+        if (!updatedSeen.equals(seenPackages)) {
+            saveSeenPackages(context, updatedSeen);
         }
 
         if (result.installedPackages < MIN_PLAUSIBLE_PACKAGE_COUNT) {
@@ -188,6 +310,7 @@ public final class ModuleScanner {
             + result.installedPackages + " installed packages checked, "
             + result.xposedModulesFound + " Xposed modules found, "
             + result.newlyRegistered + " registered, "
+            + result.alreadyKnown + " already known, "
             + result.refreshedPaths + " path(s) refreshed, "
             + result.purgedCount + " purged, "
             + result.purgeDeferred + " purge(s) deferred");
@@ -245,11 +368,6 @@ public final class ModuleScanner {
         for (ModuleInfo m : snapshot) {
             if (m == null || m.packageName == null) continue;
 
-            // ── Never purge modules the user added manually. ──
-            // The user's explicit intent takes precedence over the
-            // apkExists / packageInstalled checks. A manually-added
-            // module often has a package name that doesn't resolve
-            // through PackageManager.
             if (m.manuallyAdded) {
                 resetMissedCount(m.packageName);
                 continue;
@@ -441,12 +559,6 @@ public final class ModuleScanner {
         return new HashSet<>();
     }
 
-    /**
-     * Preserve the manuallyAdded flag across scanner re-registration.
-     * If the user added this module by hand before, a subsequent
-     * auto-detection must not clear the flag and re-expose the
-     * module to the purge pass.
-     */
     private static boolean existingManuallyAdded(ModuleLoader loader, String pkg) {
         ModuleInfo existing = loader.getModule(pkg);
         return existing != null && existing.manuallyAdded;

@@ -7,9 +7,11 @@ import com.shizuposed.manager.core.compat.HiddenApiBypass;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
@@ -54,6 +56,24 @@ import dalvik.system.InMemoryDexClassLoader;
  * strategies were tried and why each one failed. The caller (the
  * module load path in XposedHook) treats null as "skip this module"
  * rather than crashing the target.
+ *
+ * RELATIONSHIP TO ClassLoadingBridge
+ * ----------------------------------
+ * ClassLoadingBridge observes and hooks what the TARGET loads. This
+ * class loads the MODULE's own code. They do not overlap and neither
+ * has a fallback that would help the other:
+ *
+ *   • DexLoadingBridge needs a ladder because loading a dex can fail
+ *     for many reasons (missing file, hidden API block, ROM quirk).
+ *
+ *   • ClassLoadingBridge does not need a ladder because each of its
+ *     capabilities (loadClass hook, loader constructor hook,
+ *     component pre-load) is independent and fail-open.
+ *
+ * If the target constructs an InMemoryDexClassLoader, neither of
+ * these classes sees it. ClassLoadingBridge hooks DexClassLoader and
+ * PathClassLoader construction only. Adding InMemoryDexClassLoader
+ * to that list is a separate change.
  */
 public final class DexLoadingBridge {
 
@@ -164,9 +184,6 @@ public final class DexLoadingBridge {
 
     private static LoadResult tryInMemory(File dexFile, ClassLoader parentLoader) {
         try {
-            // Read the dex into memory. For a typical module dex this
-            // is a few hundred KB; well within heap for any modern
-            // process.
             long size = dexFile.length();
             if (size <= 0 || size > 64L * 1024 * 1024) {
                 return new LoadResult(null, STRATEGY_NONE,
@@ -189,7 +206,6 @@ public final class DexLoadingBridge {
 
             ByteBuffer buffer = ByteBuffer.wrap(bytes);
 
-            // InMemoryDexClassLoader(ByteBuffer, ClassLoader)
             Constructor<InMemoryDexClassLoader> ctor =
                 InMemoryDexClassLoader.class.getDeclaredConstructor(
                     ByteBuffer.class, ClassLoader.class);
@@ -213,10 +229,6 @@ public final class DexLoadingBridge {
                                                 ClassLoader parentLoader) {
         try {
             if (optDir == null || optDir.isEmpty()) {
-                // Without an opt dir, DexClassLoader falls back to
-                // the system's default for the target app. Give it
-                // a directory under the target's cache if we can
-                // reach one, otherwise leave it null.
                 optDir = parentLoader == null ? null
                     : System.getProperty("java.io.tmpdir");
             }
@@ -243,20 +255,6 @@ public final class DexLoadingBridge {
     // STRATEGY 3 — BaseDexClassLoader injection
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Inject the module's dex into the target's existing classloader
-     * by appending to its DexPathList.dexElements array.
-     *
-     * This is the technique LSPosed uses to add its own dex to a
-     * target process. It's the deepest fallback because it reaches
-     * into hidden internals, but it's also the most universal: it
-     * works on any classloader that extends BaseDexClassLoader,
-     * which both DexClassLoader and PathClassLoader do.
-     *
-     * Returns a LoadResult wrapping the modified loader on success.
-     * The "loader" is the same object the caller passed in, now
-     * augmented to find the module's classes.
-     */
     private static LoadResult tryClassLoaderInjection(File dexFile,
                                                       String optDir,
                                                       ClassLoader parentLoader) {
@@ -265,8 +263,6 @@ public final class DexLoadingBridge {
                 "no parent loader for injection");
         }
         try {
-            // The target loader must be a BaseDexClassLoader. On
-            // modern Android this is always true for app loaders.
             Class<?> baseDexClass = Class.forName("dalvik.system.BaseDexClassLoader");
             if (!baseDexClass.isAssignableFrom(parentLoader.getClass())) {
                 return new LoadResult(null, STRATEGY_NONE,
@@ -274,7 +270,6 @@ public final class DexLoadingBridge {
                     + parentLoader.getClass().getName());
             }
 
-            // Reach the pathList field.
             Field pathListField = baseDexClass.getDeclaredField("pathList");
             HiddenApiBypass.forceAccessible(pathListField);
             Object dexPathList = pathListField.get(parentLoader);
@@ -283,14 +278,12 @@ public final class DexLoadingBridge {
                     "pathList is null");
             }
 
-            // Reach the dexElements array inside pathList.
             Class<?> dexPathListClass = dexPathList.getClass();
             Field elementsField = dexPathListClass.getDeclaredField("dexElements");
             HiddenApiBypass.forceAccessible(elementsField);
             Object[] existingElements = (Object[]) elementsField.get(dexPathList);
             if (existingElements == null) existingElements = new Object[0];
 
-            // Construct new Elements for the module dex.
             Object[] newElements = makeDexElements(
                 dexPathList, dexFile.getAbsolutePath(), optDir);
             if (newElements == null || newElements.length == 0) {
@@ -298,9 +291,6 @@ public final class DexLoadingBridge {
                     "makeDexElements produced no output");
             }
 
-            // Concatenate. Existing first, new after, so the
-            // target's own classes take priority over ours if
-            // there are any collisions.
             Object[] combined = new Object[
                 existingElements.length + newElements.length];
             System.arraycopy(existingElements, 0, combined, 0,
@@ -308,7 +298,6 @@ public final class DexLoadingBridge {
             System.arraycopy(newElements, 0, combined,
                 existingElements.length, newElements.length);
 
-            // Write the combined array back.
             elementsField.set(dexPathList, combined);
 
             return new LoadResult(parentLoader, STRATEGY_INJECT,
@@ -324,19 +313,28 @@ public final class DexLoadingBridge {
      * Build DexPathList.Element[] for the given dex path. Uses
      * reflection to call DexPathList.makeDexElements because its
      * signature has changed across Android versions.
+     *
+     * The parameter list varies. On Android 8-9 the 4-arg form is
+     * (List<File>, File, List<IOException>, ClassLoader). On
+     * Android 10+ a fifth boolean (isTrusted) is sometimes added.
+     * Rather than matching on a specific signature, we try every
+     * declared overload of makeDexElements and use the first that
+     * succeeds with arguments built from the parameter types by
+     * POSITION, not just by class.
      */
     private static Object[] makeDexElements(Object dexPathList,
                                             String dexPath,
                                             String optDir) {
         try {
             Class<?> dexPathListClass = dexPathList.getClass();
-            for (Method m : dexPathListClass.getDeclaredMethods()) {
+            Method[] candidates = dexPathListClass.getDeclaredMethods();
+            for (Method m : candidates) {
                 if (!"makeDexElements".equals(m.getName())) continue;
-                if (!java.lang.reflect.Modifier.isStatic(m.getModifiers())) continue;
+                if (!Modifier.isStatic(m.getModifiers())) continue;
+
                 try {
                     HiddenApiBypass.forceAccessible(m);
-                    Object[] args = buildMakeDexElementsArgs(m, dexPath, optDir,
-                        dexPathList);
+                    Object[] args = buildMakeDexElementsArgs(m, dexPath, optDir);
                     if (args == null) continue;
                     Object result = m.invoke(null, args);
                     if (result instanceof Object[]) {
@@ -344,7 +342,7 @@ public final class DexLoadingBridge {
                         if (arr.length > 0) return arr;
                     }
                 } catch (Throwable ignored) {
-                    // Try the next overload. There's usually one.
+                    // Try the next overload.
                 }
             }
             return null;
@@ -354,33 +352,61 @@ public final class DexLoadingBridge {
     }
 
     /**
-     * Construct the argument array for a makeDexElements call,
-     * filling each position based on its declared type. The
-     * parameter list has varied across versions, so we handle each
-     * observed shape generically.
+     * Construct the argument array for a makeDexElements call.
+     *
+     * Parameter lists observed across Android versions:
+     *
+     *   (List<File>, File, List<IOException>, ClassLoader)              Android 8-9
+     *   (List<File>, File, List<IOException>, ClassLoader, boolean)     Android 10+
+     *
+     * The first List is the dex files to load. The File is the opt
+     * directory. The second List is for suppressed IOExceptions — we
+     * pass an empty one. The ClassLoader is the parent. The boolean
+     * is isTrusted, which we pass false.
+     *
+     * We distinguish the two List parameters by POSITION rather than
+     * by their erased class (both are java.util.List). A List at
+     * position 0 is the files list; a List at a later position is
+     * the exceptions list.
      */
     private static Object[] buildMakeDexElementsArgs(Method m,
                                                      String dexPath,
-                                                     String optDir,
-                                                     Object dexPathList) {
+                                                     String optDir) {
         try {
             Class<?>[] types = m.getParameterTypes();
             Object[] args = new Object[types.length];
+            boolean sawFileList = false;
+            boolean sawExceptionList = false;
+
             for (int i = 0; i < types.length; i++) {
                 Class<?> t = types[i];
-                if (t == java.util.List.class) {
-                    List<File> files = new ArrayList<>(1);
-                    files.add(new File(dexPath));
-                    args[i] = files;
+
+                if (t == List.class) {
+                    // Position-based disambiguation.
+                    if (!sawFileList) {
+                        List<File> files = new ArrayList<>(1);
+                        files.add(new File(dexPath));
+                        args[i] = files;
+                        sawFileList = true;
+                    } else if (!sawExceptionList) {
+                        // An empty list of IOException. The generic
+                        // type is erased, so an empty ArrayList is
+                        // valid for any List<...> parameter.
+                        args[i] = new ArrayList<IOException>(0);
+                        sawExceptionList = true;
+                    } else {
+                        // A third List we don't recognize. Pass an
+                        // empty one and hope for the best.
+                        args[i] = new ArrayList<>();
+                    }
                 } else if (t == File.class) {
                     args[i] = (optDir != null && !optDir.isEmpty())
-                        ? new File(optDir) : null;
+                        ? new File(optDir)
+                        : null;
                 } else if (t == ClassLoader.class) {
-                    args[i] = dexPathList.getClass().getClassLoader();
+                    args[i] = DexLoadingBridge.class.getClassLoader();
                 } else if (t == boolean.class) {
                     args[i] = Boolean.FALSE;
-                } else if (t == java.util.List.class) {
-                    args[i] = new ArrayList<>();
                 } else {
                     // Unknown parameter. If the type is primitive we
                     // can't pass null; skip this overload.

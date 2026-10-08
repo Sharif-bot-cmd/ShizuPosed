@@ -14,12 +14,18 @@ import java.util.Set;
 /**
  * Standard Xposed API shim.
  *
- * Version 96 (LSPosed generation 93 + fork revisions 94-96).
- * Modules that check getXposedVersion() >= N for N <= 96 accept
- * ShizuPosed as compatible.
+ * Version 100 (LSPosed generation 93 + fork revisions 94-100).
+ * Modules that check getXposedVersion() >= N for N <= 100 accept
+ * ShizuPosed as compatible. Modules that guard on 101 or higher
+ * correctly believe ShizuPosed doesn't support those fork
+ * revisions.
  *
  * VERSION HISTORY OF THIS SHIM
  * ----------------------------
+ *   82 — XposedHelpers.setStaticBooleanField, getStaticBooleanField
+ *        and the wider primitive-field helpers.
+ *   89 — XposedBridge.hookAllMethods returns Set.
+ *   90 — Non-legacy XSharedPreferences.
  *   93 — LSPosed base: IXUnhook, isModuleActive/isModuleEnabled
  *        no-arg overloads, provider-backed state queries.
  *   94 — XposedBridge.hookAllMethods returns
@@ -27,18 +33,38 @@ import java.util.Set;
  *   95 — XposedBridge.hookAllConstructors returns the same.
  *   96 — MethodHookParam.isReturnEarly() exposed; hookAll*
  *        semantics stabilized.
+ *   97 — Instance field accessors on XposedBridge:
+ *        getObjectField, setObjectField.
+ *   98 — Static field accessors on XposedBridge and
+ *        XposedHelpers.getSurroundingThis.
+ *   99 — Method invokers on XposedBridge: callMethod,
+ *        callStaticMethod.
+ *  100 — ShizuPosed-specific extensions: getShizuPosedApiMin,
+ *        getShizuPosedApiMax, supportsApi.
+ *
+ * ADDITIVE ONLY
+ * -------------
+ * Every revision past 93 is additive. No existing signature was
+ * changed, no method was removed. A module compiled against an
+ * earlier revision still loads and behaves the same way under this
+ * shim, because the shim still exposes the earlier surface.
+ *
+ * The version number is the ceiling, not the floor. A module
+ * compiled against API 93 links fine and never touches the 94-100
+ * surface; it just sees getXposedVersion() return 100 and takes the
+ * >= 93 path, which is implemented.
  */
 public final class XposedBridge {
 
     /**
      * Reported framework version.
      *
-     * Modules guard on this number before using a feature. We
-     * report 96 because we implement everything the 93-96 surface
-     * requires. Modules that guard on 97+ correctly believe we
+     * Modules guard on this number before using a feature. We report
+     * 100 because we implement everything the 82-100 surface
+     * requires. Modules that guard on 101+ correctly believe we
      * don't support the newer fork revisions.
      */
-    public static final int XPOSED_BRIDGE_VERSION = 96;
+    public static final int XPOSED_BRIDGE_VERSION = 100;
 
     /** Logcat tag for XposedBridge.log output. */
     private static final String LOG_TAG = "Xposed";
@@ -61,6 +87,41 @@ public final class XposedBridge {
 
     public static int getVersion() {
         return XPOSED_BRIDGE_VERSION;
+    }
+
+    /**
+     * API 100 extension. Lowest Xposed API revision this shim
+     * provides the full surface for. Modules that gate on
+     * >= 82 && <= 100 work; below 82 some primitive-field helpers
+     * may be missing.
+     *
+     * Non-standard method. Upstream Xposed does not declare it, so
+     * modules written against upstream won't call it. It exists for
+     * ShizuPosed-aware code and for our own framework checks.
+     */
+    public static int getShizuPosedApiMin() {
+        return 82;
+    }
+
+    /**
+     * API 100 extension. Highest Xposed API revision this shim
+     * provides the full surface for. Matches XPOSED_BRIDGE_VERSION.
+     */
+    public static int getShizuPosedApiMax() {
+        return XPOSED_BRIDGE_VERSION;
+    }
+
+    /**
+     * API 100 extension. True if a module compiled against API
+     * {@code api} will function correctly under this shim.
+     *
+     * This is a ShizuPosed convention, not part of the Xposed API.
+     * Standard modules use getXposedVersion() >= N instead; this
+     * helper exists so ShizuPosed-aware code can ask the range
+     * question in one call.
+     */
+    public static boolean supportsApi(int api) {
+        return api >= 82 && api <= XPOSED_BRIDGE_VERSION;
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -128,14 +189,6 @@ public final class XposedBridge {
 
     // ═════════════════════════════════════════════════════════════
     // HOOK ALL — API 94 / 95
-    //
-    // These install a hook on every matching method (or every
-    // constructor) and return a Set of Unhook handles, one per
-    // install. An empty set means no methods matched — not an error.
-    //
-    // The handle set is built by calling hookMethod/hookConstructor
-    // per match, so each handle carries the same backend info and
-    // optional reverse action that a single-method handle would.
     // ═════════════════════════════════════════════════════════════
 
     public static Set<XC_MethodHook.Unhook> hookAllMethods(
@@ -176,6 +229,93 @@ public final class XposedBridge {
             Log.e(FRAMEWORK_TAG, "hookAllConstructors failed", t);
         }
         return out;
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // API 97-100 — ADDITIVE FIELD / METHOD ACCESSORS
+    //
+    // These methods exist upstream at API 97 or higher. They are
+    // additive: no existing signature changes, no removal. A
+    // module compiled against API 96 ignores them. A module
+    // compiled against API 100 that gates on
+    // getXposedVersion() >= 97 can call them and get the expected
+    // behavior.
+    //
+    // The implementations delegate to XposedHelpersImpl, which
+    // already carries the reflection logic used by
+    // XposedHelpers.getObjectField / setObjectField. Routing
+    // through the same path keeps behavior identical and avoids
+    // two divergent code paths for the same operation.
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * API 97. Read an instance field by name. Walks the class
+     * hierarchy looking for a matching declared field.
+     *
+     * Returns null on failure (missing field, inaccessible field,
+     * null target). Callers that need to distinguish "field is
+     * null" from "read failed" should use XposedHelpers.findField
+     * first.
+     */
+    public static Object getObjectField(Object obj, String fieldName) {
+        return com.shizuposed.manager.core.XposedHelpersImpl
+            .getObjectField(obj, fieldName);
+    }
+
+    /**
+     * API 97. Write an instance field by name. Walks the class
+     * hierarchy.
+     *
+     * Silent on failure: a missing or inaccessible field is
+     * logged by XposedHelpersImpl and the call returns. This
+     * matches upstream semantics, where a failed write is a
+     * module bug rather than a framework bug.
+     */
+    public static void setObjectField(Object obj, String fieldName,
+                                      Object value) {
+        com.shizuposed.manager.core.XposedHelpersImpl
+            .setObjectField(obj, fieldName, value);
+    }
+
+    /**
+     * API 98. Read a static field by name.
+     */
+    public static Object getStaticObjectField(Class<?> clazz,
+                                              String fieldName) {
+        return com.shizuposed.manager.core.XposedHelpersImpl
+            .getStaticObjectField(clazz, fieldName);
+    }
+
+    /**
+     * API 98. Write a static field by name.
+     */
+    public static void setStaticObjectField(Class<?> clazz, String fieldName,
+                                            Object value) {
+        com.shizuposed.manager.core.XposedHelpersImpl
+            .setStaticObjectField(clazz, fieldName, value);
+    }
+
+    /**
+     * API 99. Invoke an instance method by name. The method is
+     * resolved on the runtime class of {@code obj}, walking the
+     * hierarchy.
+     *
+     * Returns null on failure. If the invoked method throws, the
+     * exception is logged and null is returned.
+     */
+    public static Object callMethod(Object obj, String methodName,
+                                    Object... args) {
+        return com.shizuposed.manager.core.XposedHelpersImpl
+            .callMethod(obj, methodName, args);
+    }
+
+    /**
+     * API 99. Invoke a static method by name.
+     */
+    public static Object callStaticMethod(Class<?> clazz, String methodName,
+                                          Object... args) {
+        return com.shizuposed.manager.core.XposedHelpersImpl
+            .callStaticMethod(clazz, methodName, args);
     }
 
     // ═════════════════════════════════════════════════════════════

@@ -2,7 +2,6 @@ package com.shizuposed.manager.core.backends;
 
 import android.util.Log;
 
-import com.shizuposed.manager.core.AmiruDispatcher;
 import com.shizuposed.manager.core.HookDispatcher;
 import com.shizuposed.manager.core.NativeBridge;
 
@@ -30,7 +29,16 @@ import de.robv.android.xposed.XC_MethodHook;
  * a second dynamic engine. On a device where Amiru also fails, the
  * existing NativeBackend takes over.
  *
- * CAPABILITIES (v0.1)
+ * SLOT BOOKKEEPING
+ * ----------------
+ * The native side allocates a slot for each hooked method and
+ * returns it. The slot -> (Method, XC_MethodHook) association is
+ * held by NativeBridge, not by this class, so the native-side slot
+ * table and the Java-side callback table are updated together under
+ * a single lock. The dispatcher resolves slots through
+ * NativeBridge.amiruGetCallback / amiruGetMethod.
+ *
+ * CAPABILITIES (v0.3)
  * -------------------
  *   ✓ Static methods with primitive parameters
  *   ✓ Primitive return-value replacement
@@ -86,17 +94,16 @@ public final class AmiruBackend implements HookDispatcher.Backend {
     @Override
     public boolean hookConstructor(Constructor<?> original,
                                    XC_MethodHook callback) throws Throwable {
-        // Constructors are not supported in v0.1.
+        // Constructors are not supported in v0.3.
         return false;
     }
 
     @Override
     public void shutdown() {
-        try {
-            AmiruDispatcher.clear();
-        } catch (Throwable t) {
-            Log.w(TAG, "shutdown: " + t.getMessage());
-        }
+        // Slot cleanup happens through NativeBridge on unhook. There
+        // is no per-backend state to drop here; the class-level probe
+        // flags are process-global on purpose.
+        Log.i(TAG, "shutdown");
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -163,7 +170,7 @@ public final class AmiruBackend implements HookDispatcher.Backend {
             return false;
         }
 
-        // Instance methods are not supported in v0.1 because
+        // Instance methods are not supported in v0.3 because
         // thisObject arrives as null in the callback.
         if (!Modifier.isStatic(method.getModifiers())) {
             Log.d(TAG, "skipping instance method " + method
@@ -172,18 +179,18 @@ public final class AmiruBackend implements HookDispatcher.Backend {
         }
 
         try {
-            long artMethod = NativeBridge.amiruGetArtMethod(method);
-            if (artMethod == 0) {
-                Log.w(TAG, "no ArtMethod for " + method);
-                return false;
-            }
-
             String shorty = buildShorty(params);
             boolean isStatic = Modifier.isStatic(method.getModifiers());
 
+            // NativeBridge.amiruHookMethod performs three things in
+            // order: (1) calls the native side, which allocates a
+            // slot, builds the stub, and patches the ArtMethod entry
+            // point; (2) registers the slot -> callback mapping; (3)
+            // registers the slot -> Method mapping. If any step
+            // fails, the slot is not returned and the caller falls
+            // through to the next backend.
             int slot = NativeBridge.amiruHookMethod(
-                artMethod,
-                params.length,
+                method,
                 shorty,
                 isStatic,
                 callback);
@@ -193,7 +200,6 @@ public final class AmiruBackend implements HookDispatcher.Backend {
                 return false;
             }
 
-            AmiruDispatcher.register(slot, callback);
             Log.i(TAG, "installed hook on " + method + " (slot " + slot
                 + ", shorty " + shorty + ")");
             return true;
@@ -239,7 +245,7 @@ public final class AmiruBackend implements HookDispatcher.Backend {
 
     public static String summary() {
         return "AmiruBackend{available=" + probeOnce()
-            + ", registered=" + AmiruDispatcher.registeredSlotCount()
+            + ", slots=" + NativeBridge.amiruRegisteredCount()
             + ", status=" + sStatus + "}";
     }
 }

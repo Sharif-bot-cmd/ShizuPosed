@@ -28,11 +28,12 @@ import com.shizuposed.manager.stealth.XStealthPrefs;
  *
  * SHEET HEIGHT
  * ------------
- * The sheet has ten toggles plus descriptions, which exceeds the
- * default BottomSheet height on most devices. onStart expands the
- * sheet to the full available height so the NestedScrollView inside
- * the layout has room to scroll. Without this, the bottom toggles
- * are clipped and taps land on the scrim instead of the switch.
+ * The sheet has fifteen toggles plus descriptions, which exceeds
+ * the default BottomSheet height on most devices. onStart expands
+ * the sheet to the full available height so the NestedScrollView
+ * inside the layout has room to scroll. Without this, the bottom
+ * toggles are clipped and taps land on the scrim instead of the
+ * switch.
  *
  * SUB-TOGGLE STATE
  * ----------------
@@ -45,10 +46,17 @@ import com.shizuposed.manager.stealth.XStealthPrefs;
  * is turned off. Turning the master back on restores them to
  * whatever the user last set.
  *
- * SCOPE
- * -----
- * XStealth applies to every app ShizuPosed launches. It has no
- * per-app scope, and this sheet does not offer one.
+ * TOGGLE LAYERS
+ * -------------
+ *   Master          — enabled
+ *   Next            — nextEnabled
+ *   Bridge          — bridgeEnabled
+ *   Settings        — hideDevOptions, hideAdb
+ *   System props    — hideSystemProperties, hideBuildFields
+ *   Framework props — scrubShizuPosedProperties, scrubThreadNames
+ *   Package/process — hideShizukuPackage, hideShizuPosedPackage,
+ *                     hideRunningProcesses, hideProcFs
+ *   API/dex         — apiProtection, dexOptimize
  */
 public class XStealthDetailSheet extends BottomSheetDialogFragment {
 
@@ -118,7 +126,30 @@ public class XStealthDetailSheet extends BottomSheetDialogFragment {
             });
         }
 
-        // ─── Per-check toggles ────────────────────────────────────
+        // ─── Bridge toggle ────────────────────────────────────────
+        MaterialSwitch bridgeSwitch = view.findViewById(R.id.switchBridge);
+        if (bridgeSwitch != null) {
+            bridgeSwitch.setOnCheckedChangeListener(null);
+            bridgeSwitch.setChecked(XStealthPrefs.isBridgeEnabled(ctx));
+            bridgeSwitch.setOnCheckedChangeListener((v, checked) -> {
+                if (!sheetReady) return;
+                if (!isAdded()) return;
+                Log.i(TAG, "bridge toggle: " + checked);
+                XStealthPrefs.setBridgeEnabled(ctx, checked);
+                XStealthPushHelper.requestPush(ctx);
+                refresh(view);
+                Toast.makeText(ctx,
+                    checked ? "Bridge enabled" : "Bridge disabled",
+                    Toast.LENGTH_SHORT).show();
+                try {
+                    ctx.getContentResolver().notifyChange(
+                        com.shizuposed.manager.status.ModuleStatusProvider.MODULES_URI,
+                        null);
+                } catch (Throwable ignored) {}
+            });
+        }
+
+        // ─── Settings-based checks ────────────────────────────────
         bindSwitch(view, R.id.switchHideDev,
             XStealthPrefs.isHideDevOptions(ctx), checked -> {
                 if (!sheetReady) return;
@@ -133,6 +164,37 @@ public class XStealthDetailSheet extends BottomSheetDialogFragment {
                 XStealthPushHelper.requestPush(ctx);
             });
 
+        // ─── System property / Build sanitization ─────────────────
+        bindSwitch(view, R.id.switchHideSystemProperties,
+            XStealthPrefs.isHideSystemProperties(ctx), checked -> {
+                if (!sheetReady) return;
+                XStealthPrefs.setHideSystemProperties(ctx, checked);
+                XStealthPushHelper.requestPush(ctx);
+            });
+
+        bindSwitch(view, R.id.switchHideBuildFields,
+            XStealthPrefs.isHideBuildFields(ctx), checked -> {
+                if (!sheetReady) return;
+                XStealthPrefs.setHideBuildFields(ctx, checked);
+                XStealthPushHelper.requestPush(ctx);
+            });
+
+        // ─── Framework property / thread scrubbing ────────────────
+        bindSwitch(view, R.id.switchScrubProperties,
+            XStealthPrefs.isScrubShizuPosedProperties(ctx), checked -> {
+                if (!sheetReady) return;
+                XStealthPrefs.setScrubShizuPosedProperties(ctx, checked);
+                XStealthPushHelper.requestPush(ctx);
+            });
+
+        bindSwitch(view, R.id.switchScrubThreads,
+            XStealthPrefs.isScrubThreadNames(ctx), checked -> {
+                if (!sheetReady) return;
+                XStealthPrefs.setScrubThreadNames(ctx, checked);
+                XStealthPushHelper.requestPush(ctx);
+            });
+
+        // ─── Package / process / /proc ────────────────────────────
         bindSwitch(view, R.id.switchHideShizuku,
             XStealthPrefs.isHideShizukuPackage(ctx), checked -> {
                 if (!sheetReady) return;
@@ -161,6 +223,7 @@ public class XStealthDetailSheet extends BottomSheetDialogFragment {
                 XStealthPushHelper.requestPush(ctx);
             });
 
+        // ─── API protection / dex optimization ────────────────────
         bindSwitch(view, R.id.switchApiProtection,
             XStealthPrefs.isApiProtectionEnabled(ctx), checked -> {
                 if (!sheetReady) return;
@@ -178,10 +241,6 @@ public class XStealthDetailSheet extends BottomSheetDialogFragment {
         refresh(view);
         sheetReady = true;
     }
-
-    // ═════════════════════════════════════════════════════════════
-    // SHEET BEHAVIOR
-    // ═════════════════════════════════════════════════════════════
 
     @Override
     public void onStart() {
@@ -221,16 +280,13 @@ public class XStealthDetailSheet extends BottomSheetDialogFragment {
         if (view != null) refresh(view);
     }
 
-    // ═════════════════════════════════════════════════════════════
-    // STATUS + ENABLED STATE
-    // ═════════════════════════════════════════════════════════════
-
     private void refresh(View view) {
         if (!isAdded()) return;
         Context ctx = requireContext();
 
         boolean enabled = XStealthPrefs.isEnabled(ctx);
         boolean next    = XStealthPrefs.isNextEnabled(ctx);
+        boolean bridge  = XStealthPrefs.isBridgeEnabled(ctx);
         boolean active  = XStealthStatusQuery.isActiveInAnyTarget(ctx);
 
         applyEnabledState(view, enabled);
@@ -238,24 +294,37 @@ public class XStealthDetailSheet extends BottomSheetDialogFragment {
         MaterialTextView statusText = view.findViewById(R.id.tvXStealthStatus);
         if (statusText == null) return;
 
+        StringBuilder layers = new StringBuilder();
+        if (next)   layers.append("Next");
+        if (bridge) {
+            if (layers.length() > 0) layers.append(" + ");
+            layers.append("Bridge");
+        }
+        String layersSuffix = (layers.length() > 0)
+            ? " (" + layers + ")"
+            : "";
+
         if (!enabled) {
             statusText.setText("Inactive — turn the master toggle on");
         } else if (active) {
-            statusText.setText(next
-                ? "Active (Next) — running in at least one target"
-                : "Active — running in at least one target process");
+            statusText.setText("Active" + layersSuffix
+                + " — running in at least one target");
         } else {
-            statusText.setText(next
-                ? "Enabled (Next) — will activate on the next launch"
-                : "Enabled — will activate on the next launch under ShizuPosed");
+            statusText.setText("Enabled" + layersSuffix
+                + " — will activate on the next launch");
         }
     }
 
     private void applyEnabledState(View view, boolean masterOn) {
         int[] ids = {
             R.id.switchNext,
+            R.id.switchBridge,
             R.id.switchHideDev,
             R.id.switchHideAdb,
+            R.id.switchHideSystemProperties,
+            R.id.switchHideBuildFields,
+            R.id.switchScrubProperties,
+            R.id.switchScrubThreads,
             R.id.switchHideShizuku,
             R.id.switchHideShizuPosed,
             R.id.switchHideProcesses,
