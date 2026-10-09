@@ -35,7 +35,6 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 import dalvik.system.DexClassLoader;
-import de.robv.android.xposed.IXposedHookCmdInit;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XResources;
 import de.robv.android.xposed.callbacks.XC_InitPackageResources;
@@ -137,6 +136,15 @@ public class XposedHook {
 
             initDirectories();
 
+            // Load XStealth native engines before anything else.
+            preloadXStealthNative();
+
+            try {
+                com.shizuposed.manager.stealth.ThreadNameScrub.scrub();
+            } catch (Throwable t) {
+                log("ThreadNameScrub failed: " + t.getMessage());
+            }
+
             logBox("XposedHook", "pid=" + myPid + " uid=" + myUid
                 + " " + AndroidCompat.describe()
                 + " args=" + java.util.Arrays.toString(args));
@@ -171,27 +179,12 @@ public class XposedHook {
                 return;
             }
 
-            // ── Load native engines ───────────────────────────────────
             loadNativeLibs();
 
             boolean useBootstrap = (targetUid > 0);
 
             HookEngine.ensureBackendInstalled();
 
-            // ── IXposedHookCmdInit dispatch ───────────────────────────
-            dispatchCmdInit(args, targetPackage);
-
-            ResourceHooking.getInstanceSafe().init();
-
-            // ── Hook delay ────────────────────────────────────────────
-            // An optional pause between when the framework starts in
-            // the target process and when it begins driving the
-            // target's bootstrap. Set by ShizuPosedService via
-            // -Dshizuposed.hook.delay=<ms>. Default is 0 — no delay.
-            //
-            // A small delay helps on ROMs where the framework races
-            // the target's own initialization. Higher values add
-            // launch latency. Bounded in RuntimePrefs to [0, 2000].
             try {
                 int hookDelayMs = Integer.parseInt(
                     System.getProperty("shizuposed.hook.delay", "0"));
@@ -231,6 +224,47 @@ public class XposedHook {
     // NATIVE LIBRARY LOADING
     // ═════════════════════════════════════════════════════════════════
 
+    private static void preloadXStealthNative() {
+        String libDir = System.getProperty("shizuposed.shell.libs", LIBS_DIR);
+        log("Preloading XStealth native engines from: " + libDir);
+
+        try {
+            boolean ok = com.shizuposed.manager.stealth.XStealthNative.load(libDir);
+            if (ok) {
+                com.shizuposed.manager.stealth.XStealthNative.setActive(true);
+                log("Preloaded libxstealth.so");
+            } else {
+                log("libxstealth.so preload returned false");
+            }
+        } catch (Throwable t) {
+            log("libxstealth.so preload failed: " + t.getMessage());
+        }
+
+        try {
+            boolean ok = com.shizuposed.manager.stealth.XStealthNativeNext.load(libDir);
+            if (ok) {
+                com.shizuposed.manager.stealth.XStealthNativeNext.setActive(true);
+                log("Preloaded libxstealth_next.so");
+            } else {
+                log("libxstealth_next.so preload returned false");
+            }
+        } catch (Throwable t) {
+            log("libxstealth_next.so preload failed: " + t.getMessage());
+        }
+
+        try {
+            boolean ok = com.shizuposed.manager.stealth.XStealthBridge.load(libDir);
+            if (ok) {
+                com.shizuposed.manager.stealth.XStealthBridge.setActive(true);
+                log("Preloaded libxstealth_bridge.so");
+            } else {
+                log("libxstealth_bridge.so preload returned false");
+            }
+        } catch (Throwable t) {
+            log("libxstealth_bridge.so preload failed: " + t.getMessage());
+        }
+    }
+
     private static void loadNativeLibs() {
         String libDir = System.getProperty("shizuposed.shell.libs", LIBS_DIR);
         log("Loading native libs from: " + libDir);
@@ -266,81 +300,6 @@ public class XposedHook {
 
         log("Native engines: shizuposed=" + shizuposedLoaded
             + " amiru=" + amiruLoaded);
-    }
-
-    // ═════════════════════════════════════════════════════════════════
-    // IXposedHookCmdInit
-    // ═════════════════════════════════════════════════════════════════
-
-    private static void dispatchCmdInit(String[] argv, String pkg) {
-        List<ModuleInfo> modules;
-        try {
-            modules = loadApplicableModules(pkg);
-        } catch (Throwable t) {
-            log("dispatchCmdInit: loadApplicableModules failed: " + t.getMessage());
-            return;
-        }
-
-        if (modules.isEmpty()) {
-            log("dispatchCmdInit: no applicable modules");
-            return;
-        }
-
-        ClassLoader frameworkLoader = XposedHook.class.getClassLoader();
-        if (argv == null) argv = new String[0];
-        String cmdline = TextUtils.join(" ", argv);
-
-        int fired = 0;
-        for (ModuleInfo m : modules) {
-            try {
-                Class<?> entryClass;
-                if (m.cachedDexPath != null
-                        && new File(m.cachedDexPath).exists()) {
-                    String optDir = BASE_DIR + "/dexopt/" + m.packageName;
-                    new File(optDir).mkdirs();
-                    DexClassLoader loader = new DexClassLoader(
-                        m.cachedDexPath, optDir, null, frameworkLoader);
-                    String entryName = m.xposedInit;
-                    if (entryName == null || entryName.isEmpty()) {
-                        entryName = readXposedInitFromZip(m.cachedDexPath);
-                    }
-                    if (entryName == null || entryName.isEmpty()) continue;
-                    entryClass = loader.loadClass(entryName);
-                } else {
-                    if (m.xposedInit == null || m.xposedInit.isEmpty()) continue;
-                    entryClass = Class.forName(m.xposedInit, true, frameworkLoader);
-                }
-
-                if (!IXposedHookCmdInit.class.isAssignableFrom(entryClass)) {
-                    continue;
-                }
-
-                Constructor<?> ctor = entryClass.getDeclaredConstructor();
-                HiddenApiBypass.forceAccessible(ctor);
-                Object instance = ctor.newInstance();
-                IXposedHookCmdInit hook = (IXposedHookCmdInit) instance;
-
-                IXposedHookCmdInit.InitCmdProcessParam param =
-                    new IXposedHookCmdInit.InitCmdProcessParam();
-                param.processName = pkg;
-                param.cmdline     = cmdline;
-                param.argv        = argv;
-                param.classLoader = frameworkLoader;
-
-                hook.initCmdProcess(param);
-                fired++;
-                log("dispatchCmdInit: fired on " + m.packageName
-                    + " (entry=" + entryClass.getName() + ")");
-
-            } catch (ClassNotFoundException e) {
-                // Module entry point doesn't implement it. Normal.
-            } catch (Throwable t) {
-                log("dispatchCmdInit: " + m.packageName + " threw: " + t);
-            }
-        }
-
-        log("dispatchCmdInit: " + fired + " module(s) fired (of "
-            + modules.size() + " applicable)");
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -387,6 +346,16 @@ public class XposedHook {
             int hooksFrom = installModuleHooks(pkg, appLoader, appInfo);
 
             try {
+                ClassLoadingBridge.install(appLoader);
+                int preloaded = ClassLoadingBridge.preloadComponentClasses(
+                    pkg, appInfo, appLoader);
+                log("ClassLoadingBridge installed (preloaded "
+                    + preloaded + " component class(es))");
+            } catch (Throwable t) {
+                log("ClassLoadingBridge setup failed: " + t.getMessage());
+            }
+
+            try {
                 Resources targetResources = resolveTargetResources(activityThread, appInfo);
                 if (targetResources != null) {
                     callInitPackageResources(pkg, targetResources);
@@ -401,6 +370,19 @@ public class XposedHook {
                 com.shizuposed.manager.core.backends.InstrumentationBackend.install(pkg);
             } catch (Throwable t) {
                 log("Instrumentation install failed: " + t.getMessage());
+            }
+
+            try {
+                boolean atInstalled =
+                    com.shizuposed.manager.core.backends.ApplicationThreadBackend
+                        .install(activityThread);
+                if (atInstalled) {
+                    log("ApplicationThreadBackend installed");
+                } else {
+                    log("ApplicationThreadBackend installed no hooks");
+                }
+            } catch (Throwable t) {
+                log("ApplicationThreadBackend failed: " + t.getMessage());
             }
 
             tryInstallContentProviders(activityThread, appInfo, appLoader);
@@ -625,12 +607,56 @@ public class XposedHook {
             } else {
                 bindApplication.invoke(activityThread, data);
             }
+
+            // ── Verify the bind actually took ────────────────────
+            //
+            // handleBindApplication returning without throwing is
+            // not proof that the Application exists. Check.
+            boolean bound = verifyApplicationBound(activityThread);
+            if (!bound) {
+                log("handleBindApplication returned but no Application "
+                    + "was created — bind did not take effect");
+                return false;
+            }
+            log("Verified: Application bound successfully");
             return true;
+
         } catch (Throwable t) {
             log("bindApplication failed: " + t);
             t.printStackTrace();
             return false;
         }
+    }
+
+    private static boolean verifyApplicationBound(Object activityThread) {
+        // Path 1: read mInitialApplication directly.
+        try {
+            Class<?> c = activityThread.getClass();
+            while (c != null) {
+                try {
+                    Field f = c.getDeclaredField("mInitialApplication");
+                    HiddenApiBypass.forceAccessible(f);
+                    Object app = f.get(activityThread);
+                    if (app instanceof Application) return true;
+                    break;
+                } catch (NoSuchFieldException e) {
+                    c = c.getSuperclass();
+                }
+            }
+        } catch (Throwable t) {
+            log("verifyApplicationBound: field read failed: " + t.getMessage());
+        }
+
+        // Path 2: currentApplication() accessor.
+        try {
+            Application app = currentApplication();
+            if (app != null) return true;
+        } catch (Throwable t) {
+            log("verifyApplicationBound: currentApplication failed: "
+                + t.getMessage());
+        }
+
+        return false;
     }
 
     private static Object buildAppBindData(Class<?> dataClass,
@@ -802,11 +828,18 @@ public class XposedHook {
                 return 0;
             }
 
-            XC_LoadPackage.LoadPackageParam param =
-                buildLoadPackageParam(pkg, appLoader, appInfo);
-
             int loaded = 0;
             for (ModuleInfo m : modules) {
+                // Each module gets its OWN LoadPackageParam whose
+                // classLoader is the module's own DexClassLoader.
+                // That is the loader the module was compiled against,
+                // and the one its own classes (MainActivity, etc.)
+                // are visible through. Handing it the target's
+                // appLoader instead would make findAndHookMethod on
+                // the module's own classes fail with
+                // ClassNotFoundError, which is the self-hook bug.
+                XC_LoadPackage.LoadPackageParam param =
+                    buildLoadPackageParam(pkg, appLoader, appInfo);
                 if (loadModule(m, null, appLoader, param)) loaded++;
             }
 
@@ -917,12 +950,21 @@ public class XposedHook {
                 appInfo = app.getApplicationInfo();
             } catch (Throwable ignored) {}
 
-            XC_LoadPackage.LoadPackageParam param =
-                buildLoadPackageParam(pkg, appLoader, appInfo);
-
             int loaded = 0;
             for (ModuleInfo m : modules) {
+                XC_LoadPackage.LoadPackageParam param =
+                    buildLoadPackageParam(pkg, appLoader, appInfo);
                 if (loadModule(m, app, appLoader, param)) loaded++;
+            }
+
+            try {
+                ClassLoadingBridge.install(appLoader);
+                if (appInfo != null) {
+                    ClassLoadingBridge.preloadComponentClasses(
+                        pkg, appInfo, appLoader);
+                }
+            } catch (Throwable t) {
+                log("ClassLoadingBridge setup failed: " + t.getMessage());
             }
 
             try {
@@ -1098,6 +1140,18 @@ public class XposedHook {
     // MODULE LOADING
     // ═════════════════════════════════════════════════════════════════
 
+    /**
+     * Load a module's dex and invoke its entry point.
+     *
+     * IMPORTANT: the module's LoadPackageParam.classLoader is
+     * rewritten to the module's own DexClassLoader before
+     * handleLoadPackage is called. That is what lets a module's own
+     * classes (MainActivity, its hook classes, etc.) resolve
+     * through lpparam.classLoader, which is how LSPosed modules are
+     * written. Without this rewrite, the self-hook pattern — a
+     * module hooking one of its own methods to detect activation —
+     * fails with ClassNotFoundError.
+     */
     private static boolean loadModule(ModuleInfo info,
                                       Application app,
                                       ClassLoader appLoader,
@@ -1107,6 +1161,7 @@ public class XposedHook {
 
             Class<?> moduleClass;
             String entry = info.xposedInit;
+            ClassLoader moduleLoader = appLoader;
 
             if (info.cachedDexPath == null) {
                 if (entry == null || entry.isEmpty()) {
@@ -1116,6 +1171,7 @@ public class XposedHook {
                 }
                 moduleClass = Class.forName(entry, true,
                     XposedHook.class.getClassLoader());
+                moduleLoader = XposedHook.class.getClassLoader();
             } else {
                 String optDir;
                 if (app != null && app.getCacheDir() != null) {
@@ -1143,6 +1199,29 @@ public class XposedHook {
                 }
 
                 moduleClass = loader.loadClass(entry);
+                moduleLoader = loader;
+            }
+
+            // ── Give the module its own classloader ────────────
+            //
+            // The module was compiled against its own classes. Its
+            // handleLoadPackage will look up its own classes
+            // through lpparam.classLoader (e.g.
+            // MainActivity.class.getName() + lpparam.classLoader).
+            // For that to resolve, classLoader must be the loader
+            // that actually contains the module's classes.
+            if (param != null && moduleLoader != null) {
+                ClassLoader prev = param.classLoader;
+                param.classLoader = moduleLoader;
+                if (prev != moduleLoader) {
+                    log("Using module classloader for "
+                        + info.packageName + ": "
+                        + moduleLoader.getClass().getSimpleName()
+                        + " (was: "
+                        + (prev != null
+                            ? prev.getClass().getSimpleName() : "null")
+                        + ")");
+                }
             }
 
             Constructor<?> ctor = moduleClass.getDeclaredConstructor();

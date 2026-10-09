@@ -2,7 +2,6 @@ package com.shizuposed.manager;
 
 import android.content.Context;
 import android.content.pm.PackageManager;
-import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
@@ -26,30 +25,28 @@ import rikka.sui.Sui;
 /**
  * Single source of truth for Shizuku / Shevery / Sui state.
  *
- * APP_PROCESS RESOLUTION (R-6.5+)
- * --------------------------------
+ * APP_PROCESS RESOLUTION
+ * ----------------------
  * app_process64 / app_process have fixed filesystem paths on every
- * Android device. The previous implementation used `command -v`,
- * which relies on $PATH — and $PATH on Android's mksh does not
- * reliably contain /system/bin, and app_process invoked bare with
- * no class argument exits with a usage error that the old probe
- * misread as "not found."
+ * Android device. Probing them with `command -v` is unreliable:
+ * $PATH on Android's mksh does not always contain /system/bin, and
+ * app_process invoked bare (no class argument) exits with a usage
+ * error that a naive probe misreads as "not found."
  *
- * The corrected probe checks the filesystem directly, in this
- * order:
+ * So the probe checks the filesystem directly, in this order:
  *
- *   1. Shell `test -x /system/bin/app_process64` — preferred,
- *      works on Android 10+ where the 64-bit binary is authoritative.
- *   2. Shell `test -x /system/bin/app_process` — older devices,
- *      and some 32-bit-only ROMs.
- *   3. Direct java.io.File.canExecute() on the same paths — used
- *      only if shell probing fails. The app process cannot execute
- *      /system/bin binaries itself, but canRead() is enough to
- *      confirm the path exists. Shizuku's shell still runs it.
+ *   1. Shell `test -x /system/bin/app_process64` — preferred on
+ *      Android 10+, where the 64-bit binary is authoritative.
+ *   2. Shell `test -x /system/bin/app_process` — older devices and
+ *      some 32-bit-only ROMs.
+ *   3. Direct java.io.File.canRead() on the same paths — used only
+ *      if shell probing fails. The app cannot execute /system/bin
+ *      binaries itself, but canRead() confirms the path exists,
+ *      and Shizuku's shell will still run it on the launch.
  *
- * This always resolves on real Android devices and removes any
- * dependency on how a particular Shizuku fork implements its
- * provider-side binary lookup.
+ * This resolves on real Android devices and removes any dependency
+ * on how a particular Shizuku fork implements provider-side binary
+ * lookup.
  */
 public class ShizukuHelper {
     private static final String TAG = "ShizukuHelper";
@@ -464,18 +461,6 @@ public class ShizukuHelper {
 
     public boolean isSheveryInstalledPublic() { return sheveryInstalled; }
 
-    public boolean refreshSheveryPresence() {
-        sheveryInstalled = isPackageInstalled(SHEVERY_PACKAGE);
-        realShizukuInstalled = !sheveryInstalled
-                            && isPackageInstalled(SHIZUKU_MANAGER_PACKAGE)
-                            && isPackageInstalled(SHIZUKU_API_PACKAGE);
-        return sheveryInstalled;
-    }
-
-    public boolean isSheveryOnly() {
-        return sheveryInstalled && !isSui;
-    }
-
     public ShizukuStatus checkShizukuActive() {
         if (isSui) return ShizukuStatus.ACTIVE;
         boolean apiInstalled = isPackageInstalled(SHIZUKU_API_PACKAGE);
@@ -492,6 +477,10 @@ public class ShizukuHelper {
             }
         } catch (Throwable ignored) {}
         return ShizukuStatus.NOT_ACTIVE;
+    }
+
+    public boolean isSheveryOnly() {
+        return sheveryInstalled && !isSui;
     }
 
     public String getStatusString() {
@@ -512,34 +501,6 @@ public class ShizukuHelper {
         return "🔑 Privileged (" + provider + " v" + shizukuVersion + ")";
     }
 
-    // ═════════════════════════════════════════════════════════════
-    // COMMAND EXECUTION
-    // ═════════════════════════════════════════════════════════════
-
-    /**
-     * Resolve the app_process binary path.
-     *
-     * Uses fixed absolute paths — NOT $PATH lookups — because:
-     *
-     *   • app_process64 / app_process always live at
-     *     /system/bin on every Android device.
-     *   • `command -v` depends on $PATH, and Android's mksh does
-     *     not reliably include /system/bin.
-     *   • Running app_process bare (no class argument) exits with
-     *     a usage error, which the old probe misread as "not found."
-     *
-     * Resolution order:
-     *   1. Cache.
-     *   2. Shell `test -x /system/bin/app_process64`.
-     *   3. Shell `test -x /system/bin/app_process`.
-     *   4. Local java.io.File fallback — the manager app can't
-     *      execute /system/bin binaries, but canRead() is enough
-     *      to know the path exists. Shizuku's shell will still
-     *      execute it on the actual launch.
-     *
-     * The result is cached. invalidateAppProcessCache() clears it
-     * (called on binder death).
-     */
     public String getAppProcessBinary() {
         String cached = cachedAppProcessBinary;
         if (cached != null) return cached;
@@ -557,7 +518,7 @@ public class ShizukuHelper {
             }
         }
 
-        // Last resort: filesystem check. The manager can't exec
+        // Last resort: filesystem check. The manager cannot exec
         // /system/bin, but canRead() confirms the file exists.
         // Shizuku's shell exec on this path will succeed.
         for (String absPath : APP_PROCESS_ABS_PATHS) {
@@ -573,10 +534,6 @@ public class ShizukuHelper {
         logger.e("No usable app_process binary on this ROM "
             + "(checked " + java.util.Arrays.toString(APP_PROCESS_ABS_PATHS) + ")");
         return null;
-    }
-
-    public void invalidateAppProcessCache() {
-        cachedAppProcessBinary = null;
     }
 
     /**
@@ -686,40 +643,6 @@ public class ShizukuHelper {
         @Override public void destroy() {
             try { remote.destroy(); } catch (android.os.RemoteException ignored) {}
         }
-    }
-
-    public boolean launchXposedHook(String packageName, int pid, int uid, String dexPath) {
-        if (!isAuthorized()) {
-            logger.w("Cannot launch: Shizuku not authorized");
-            return false;
-        }
-        String binary = getAppProcessBinary();
-        if (binary == null) {
-            logger.e("Cannot launch: no usable app_process binary");
-            return false;
-        }
-        try {
-            String cmd = String.format(
-                "%s -Xverify:none -Xallowinmemorycompilation " +
-                "-Xcompiler-option --target-api=%d " +
-                "-cp %s /system/bin XposedHook %s %d %d &",
-                binary, Build.VERSION.SDK_INT, dexPath, packageName, pid, uid);
-            return executeCommand(cmd).isSuccess();
-        } catch (Exception e) {
-            logger.e("launchXposedHook error: " + e.getMessage());
-            return false;
-        }
-    }
-
-    public void cleanup() {
-        try {
-            Shizuku.removeBinderReceivedListener(binderListener);
-            Shizuku.removeBinderDeadListener(binderDeadListener);
-            Shizuku.removeRequestPermissionResultListener(permissionResultListener);
-        } catch (Exception ignored) {}
-        listenersRegistered.set(false);
-        permissionListeners.clear();
-        cachedAppProcessBinary = null;
     }
 
     public enum ShizukuStatus { ACTIVE, NOT_ACTIVE, NOT_INSTALLED }

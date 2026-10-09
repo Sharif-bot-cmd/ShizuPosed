@@ -132,6 +132,91 @@
             android:text="Hide /proc entries"
             android:layout_marginBottom="4dp" />
 
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/switchHideSystemProperties"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Hide system properties"
+            android:layout_marginBottom="4dp" />
+
+        <com.google.android.material.textview.MaterialTextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Sanitizes reads of ro.debuggable, ro.secure, ro.boot.verifiedbootstate, and similar. Covers the Java-level SystemProperties API."
+            android:textSize="11sp"
+            android:textColor="?attr/colorOnSurfaceVariant"
+            android:paddingStart="4dp"
+            android:paddingEnd="4dp"
+            android:paddingBottom="8dp" />
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/switchHideBuildFields"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Sanitize Build fields"
+            android:layout_marginBottom="4dp" />
+
+        <com.google.android.material.textview.MaterialTextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Sets Build.TAGS to release-keys and Build.TYPE to user. Closes the most common custom-ROM detection vector."
+            android:textSize="11sp"
+            android:textColor="?attr/colorOnSurfaceVariant"
+            android:paddingStart="4dp"
+            android:paddingEnd="4dp"
+            android:paddingBottom="8dp" />
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/switchScrubProperties"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Scrub framework properties"
+            android:layout_marginBottom="4dp" />
+
+        <com.google.android.material.textview.MaterialTextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Removes shizuposed.* entries from System.getProperties() and System.getProperty()."
+            android:textSize="11sp"
+            android:textColor="?attr/colorOnSurfaceVariant"
+            android:paddingStart="4dp"
+            android:paddingEnd="4dp"
+            android:paddingBottom="8dp" />
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/switchScrubThreads"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Rename framework threads"
+            android:layout_marginBottom="4dp" />
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/switchBridge"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Use bridge"
+            android:layout_marginBottom="4dp" />
+
+        <com.google.android.material.textview.MaterialTextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Hides ShizuPosed from native enumeration paths: loaded-library walks, /proc/self/fd and /proc/self/task listing, getenv, and readlink on fd targets. Covers the gap between the Java-level checks and the syscall-level engine. Requires an extra native library."
+            android:textSize="11sp"
+            android:textColor="?attr/colorOnSurfaceVariant"
+            android:paddingStart="4dp"
+            android:paddingEnd="4dp"
+            android:paddingBottom="8dp" />
+
+        <com.google.android.material.textview.MaterialTextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Renames ShizuPosed's own threads to innocuous JVM-style names. Cheap win against thread enumeration."
+            android:textSize="11sp"
+            android:textColor="?attr/colorOnSurfaceVariant"
+            android:paddingStart="4dp"
+            android:paddingEnd="4dp"
+            android:paddingBottom="8dp" />
+
         <com.google.android.material.textview.MaterialTextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

@@ -1,10 +1,13 @@
 package com.shizuposed.manager.ui;
 
+import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -16,6 +19,7 @@ import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.appcompat.app.AlertDialog;
 import androidx.fragment.app.Fragment;
 
 import com.google.android.material.materialswitch.MaterialSwitch;
@@ -39,7 +43,7 @@ import java.util.concurrent.Executors;
  *   • Runtime toggles (auto-start, debug, log-to-file)
  *   • Scan interval slider (ProcessMonitor refresh rate)
  *   • Hook delay slider (framework-to-bootstrap pause)
- *   • Cache management
+ *   • Maintenance actions (clear logs, clean all caches)
  *   • Config export
  *
  * The XStealth master toggle lives in the XStealth detail sheet,
@@ -55,13 +59,31 @@ import java.util.concurrent.Executors;
  * read when the scheduler is created). The hook delay takes effect
  * on the next app launch, because it's passed as a -D property to
  * app_process.
+ *
+ * MAINTENANCE ACTIONS
+ * -------------------
+ * Two actions are dispatched to ShizuPosedService via startForegroundService:
+ *
+ *   • ACTION_CLEAR_LOGS — removes launch.log and other shell-side
+ *     logs. Manager's own log is cleared separately from the Logs
+ *     tab.
+ *
+ *   • ACTION_CLEAN_ALL — removes the deployed dex, native libs,
+ *     module files, markers, and logs. Resets the service's deploy
+ *     flags, so the next routed launch redeploys everything from
+ *     scratch. This is the "nuclear option" for stale caches.
+ *
+ * Both actions report their outcome via ACTION_LAUNCH_RESULT with
+ * the sentinel package name MAINTENANCE_RESULT_PKG ("__logs__").
+ * The receiver in this fragment filters on that sentinel so
+ * maintenance results don't collide with launch results.
  */
 public class SettingsFragment extends Fragment {
 
     private MaterialSwitch swAutoStart, swDebugMode, swLogToFile;
     private Slider sliderScanInterval, sliderHookDelay;
     private TextView tvScanIntervalValue, tvHookDelayValue;
-    private Button btnClearCache, btnExportConfig;
+    private Button btnClearLogs, btnCleanAll, btnExportConfig;
     private TextView tvVersion, tvShizukuStatus, tvServiceStatus;
 
     private Logger logger;
@@ -70,6 +92,10 @@ public class SettingsFragment extends Fragment {
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
     private volatile boolean viewReady = false;
+
+    // ─── Maintenance result receiver ─────────────────────────────
+    private BroadcastReceiver maintenanceReceiver;
+    private boolean maintenanceReceiverRegistered = false;
 
     private final CompoundButton.OnCheckedChangeListener autoStartListener =
         (buttonView, isChecked) -> {
@@ -132,6 +158,7 @@ public class SettingsFragment extends Fragment {
         setupListeners();
         loadSettings();
         updateRealStatus();
+        registerMaintenanceReceiver();
     }
 
     @Override
@@ -146,6 +173,7 @@ public class SettingsFragment extends Fragment {
     public void onDestroyView() {
         super.onDestroyView();
         viewReady = false;
+        unregisterMaintenanceReceiver();
         swAutoStart = null;
         swDebugMode = null;
         swLogToFile = null;
@@ -153,7 +181,8 @@ public class SettingsFragment extends Fragment {
         sliderHookDelay = null;
         tvScanIntervalValue = null;
         tvHookDelayValue = null;
-        btnClearCache = null;
+        btnClearLogs = null;
+        btnCleanAll = null;
         btnExportConfig = null;
         tvVersion = null;
         tvShizukuStatus = null;
@@ -180,18 +209,22 @@ public class SettingsFragment extends Fragment {
         sliderHookDelay = view.findViewById(R.id.sliderHookDelay);
         tvScanIntervalValue = view.findViewById(R.id.tvScanIntervalValue);
         tvHookDelayValue = view.findViewById(R.id.tvHookDelayValue);
-        btnClearCache = view.findViewById(R.id.btnClearCache);
+        btnClearLogs = view.findViewById(R.id.btnClearLogs);
+        btnCleanAll = view.findViewById(R.id.btnCleanAll);
         btnExportConfig = view.findViewById(R.id.btnExportConfig);
         tvVersion = view.findViewById(R.id.tvVersion);
         tvShizukuStatus = view.findViewById(R.id.tvShizukuStatus);
         tvServiceStatus = view.findViewById(R.id.tvServiceStatus);
 
-        if (tvVersion != null) tvVersion.setText("7.0");
+        if (tvVersion != null) tvVersion.setText("1.0.3");
     }
 
     private void setupListeners() {
-        if (btnClearCache != null) {
-            btnClearCache.setOnClickListener(v -> clearCacheSafe());
+        if (btnClearLogs != null) {
+            btnClearLogs.setOnClickListener(v -> confirmClearLogs());
+        }
+        if (btnCleanAll != null) {
+            btnCleanAll.setOnClickListener(v -> confirmCleanAll());
         }
         if (btnExportConfig != null) {
             btnExportConfig.setOnClickListener(v -> exportConfig());
@@ -294,6 +327,138 @@ public class SettingsFragment extends Fragment {
     private void saveSetting(String key, boolean value) {
         if (prefs == null) return;
         prefs.edit().putBoolean(key, value).apply();
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // MAINTENANCE ACTIONS
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Register a receiver for maintenance action results. The
+     * service broadcasts on ACTION_LAUNCH_RESULT with the sentinel
+     * package name MAINTENANCE_RESULT_PKG; anything else is a
+     * launch result and is ignored here.
+     */
+    private void registerMaintenanceReceiver() {
+        if (maintenanceReceiverRegistered) return;
+        if (!isAdded() || getContext() == null) return;
+
+        try {
+            maintenanceReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    if (intent == null) return;
+                    if (!ShizuPosedService.ACTION_LAUNCH_RESULT
+                            .equals(intent.getAction())) return;
+
+                    String pkg = intent.getStringExtra(
+                        ShizuPosedService.EXTRA_LAUNCH_PKG);
+                    if (!ShizuPosedService.MAINTENANCE_RESULT_PKG
+                            .equals(pkg)) return;
+
+                    String msg = intent.getStringExtra(
+                        ShizuPosedService.EXTRA_LAUNCH_MSG);
+                    boolean ok = intent.getBooleanExtra(
+                        ShizuPosedService.EXTRA_LAUNCH_OK, false);
+
+                    if (!isAdded()) return;
+                    Toast.makeText(requireContext(),
+                        msg != null ? msg : (ok ? "Done" : "Failed"),
+                        Toast.LENGTH_LONG).show();
+
+                    if (logger != null) {
+                        logger.i("Maintenance result: ok=" + ok
+                            + (msg != null ? " msg=" + msg : ""));
+                    }
+                }
+            };
+
+            IntentFilter filter = new IntentFilter(
+                ShizuPosedService.ACTION_LAUNCH_RESULT);
+            Context ctx = requireContext().getApplicationContext();
+            if (Build.VERSION.SDK_INT >= 33) {
+                ctx.registerReceiver(maintenanceReceiver, filter,
+                    Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                ctx.registerReceiver(maintenanceReceiver, filter);
+            }
+            maintenanceReceiverRegistered = true;
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.w("registerMaintenanceReceiver failed: "
+                    + t.getMessage());
+            }
+            maintenanceReceiver = null;
+            maintenanceReceiverRegistered = false;
+        }
+    }
+
+    private void unregisterMaintenanceReceiver() {
+        if (!maintenanceReceiverRegistered) return;
+        if (maintenanceReceiver == null) return;
+        try {
+            requireContext().getApplicationContext()
+                .unregisterReceiver(maintenanceReceiver);
+        } catch (Throwable ignored) {}
+        maintenanceReceiver = null;
+        maintenanceReceiverRegistered = false;
+    }
+
+    private void confirmClearLogs() {
+        if (!isAdded()) return;
+        new AlertDialog.Builder(requireContext())
+            .setTitle("Clear logs?")
+            .setMessage("Removes launch.log and other shell-side log files. "
+                + "The manager's own log is cleared separately from the Logs tab.")
+            .setPositiveButton("Clear", (d, w) ->
+                dispatchMaintenance(ShizuPosedService.ACTION_CLEAR_LOGS))
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    private void confirmCleanAll() {
+        if (!isAdded()) return;
+        new AlertDialog.Builder(requireContext())
+            .setTitle("Clean all caches?")
+            .setMessage("Removes the deployed dex, native libs, module files, "
+                + "markers, and logs. The next routed launch will redeploy "
+                + "everything from scratch and be slower.")
+            .setPositiveButton("Clean", (d, w) ->
+                dispatchMaintenance(ShizuPosedService.ACTION_CLEAN_ALL))
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    /**
+     * Dispatch a maintenance action to the service. The service
+     * must be running — the actions are handled in onStartCommand,
+     * which requires the service to be alive.
+     */
+    private void dispatchMaintenance(String action) {
+        if (!isAdded()) return;
+        if (!ShizuPosedService.isServiceRunning()) {
+            Toast.makeText(requireContext(),
+                "Service is not running. Start it first.",
+                Toast.LENGTH_LONG).show();
+            return;
+        }
+        try {
+            Intent i = new Intent(requireContext(), ShizuPosedService.class);
+            i.setAction(action);
+            requireContext().startForegroundService(i);
+            Toast.makeText(requireContext(),
+                "Working…", Toast.LENGTH_SHORT).show();
+            if (logger != null) {
+                logger.i("Dispatched maintenance action: " + action);
+            }
+        } catch (Throwable t) {
+            Toast.makeText(requireContext(),
+                "Dispatch failed: " + t.getMessage(),
+                Toast.LENGTH_LONG).show();
+            if (logger != null) {
+                logger.e("dispatchMaintenance failed: " + t.getMessage());
+            }
+        }
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -417,88 +582,6 @@ public class SettingsFragment extends Fragment {
                 }
             }
         });
-    }
-
-    // ═════════════════════════════════════════════════════════════
-    // CACHE
-    // ═════════════════════════════════════════════════════════════
-
-    private void clearCacheSafe() {
-        if (!isAdded()) return;
-        new android.app.AlertDialog.Builder(requireContext())
-            .setTitle("Clear Cache")
-            .setMessage("This will remove all cached DEX files and "
-                + "temporary data. Continue?")
-            .setPositiveButton("Clear", (dialog, which) -> {
-                if (!isAdded()) return;
-                Toast.makeText(requireContext(), "Clearing cache…",
-                    Toast.LENGTH_SHORT).show();
-
-                final Context appCtx = requireContext().getApplicationContext();
-                executor.execute(() -> {
-                    int deletedCount = 0;
-                    try {
-                        File internalCache = appCtx.getCacheDir();
-                        File externalCache = appCtx.getExternalCacheDir();
-                        File syscallCache = new File(
-                            appCtx.getFilesDir(), ".syscall_cache");
-
-                        if (internalCache != null && internalCache.exists()) {
-                            deletedCount += deleteDirectorySafe(internalCache);
-                        }
-                        if (externalCache != null && externalCache.exists()) {
-                            deletedCount += deleteDirectorySafe(externalCache);
-                        }
-                        if (syscallCache.exists()) {
-                            deletedCount += deleteDirectorySafe(syscallCache);
-                            syscallCache.mkdirs();
-                            new File(syscallCache, "modules").mkdirs();
-                            new File(syscallCache, "logs").mkdirs();
-                        }
-                    } catch (Exception e) {
-                        if (logger != null) {
-                            logger.e("Clear cache error: " + e.getMessage());
-                        }
-                    }
-
-                    final int finalCount = deletedCount;
-                    if (!isAdded() || getActivity() == null) return;
-                    requireActivity().runOnUiThread(() -> {
-                        if (!isAdded()) return;
-                        Toast.makeText(requireContext(),
-                            "Cache cleared (" + finalCount + " files)",
-                            Toast.LENGTH_LONG).show();
-                        if (logger != null) {
-                            logger.i("Cache cleared, removed "
-                                + finalCount + " files");
-                        }
-                    });
-                });
-            })
-            .setNegativeButton("Cancel", null)
-            .show();
-    }
-
-    private int deleteDirectorySafe(File dir) {
-        int count = 0;
-        try {
-            if (dir == null || !dir.exists()) return 0;
-            if (dir.isDirectory()) {
-                File[] children = dir.listFiles();
-                if (children != null) {
-                    for (File child : children) {
-                        if (child.isDirectory()) {
-                            count += deleteDirectorySafe(child);
-                        }
-                        if (child.exists() && child.delete()) count++;
-                    }
-                }
-            }
-            if (dir.exists() && dir.delete()) count++;
-        } catch (Exception e) {
-            if (logger != null) logger.e("Delete error: " + e.getMessage());
-        }
-        return count;
     }
 
     // ═════════════════════════════════════════════════════════════

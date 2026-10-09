@@ -27,6 +27,10 @@ public final class XStealthNativeNext {
 
     private XStealthNativeNext() {}
 
+    // ═════════════════════════════════════════════════════════════
+    // LOAD / ACTIVATE
+    // ═════════════════════════════════════════════════════════════
+
     public static synchronized boolean load(String libDir) {
         if (sLoaded) return sAvailable;
         sLoaded = true;
@@ -79,8 +83,72 @@ public final class XStealthNativeNext {
         }
     }
 
+    public static String getStrategy() {
+        if (!sAvailable) return "none";
+        try { return nativeGetStrategy(); }
+        catch (Throwable t) { return "none"; }
+    }
+
+    public static int getPatchCount() {
+        if (!sAvailable) return 0;
+        try { return nativeGetPatchCount(); }
+        catch (Throwable t) { return 0; }
+    }
+
+    public static boolean isEffectivelyActive() {
+        if (!sAvailable) return false;
+        try { return nativeIsEffectivelyActive(); }
+        catch (Throwable t) { return false; }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // MMAP GUARD / PREAD64
+    // ═════════════════════════════════════════════════════════════
+
+    public static boolean isMmapGuardActive() {
+        if (!sAvailable) return false;
+        try { return nativeIsMmapGuardActive(); }
+        catch (Throwable t) { return false; }
+    }
+
+    public static int getMmapInterceptedCount() {
+        if (!sAvailable) return 0;
+        try { return nativeGetMmapInterceptedCount(); }
+        catch (Throwable t) { return 0; }
+    }
+
+    public static String getMmapGuardInfo() {
+        if (!sAvailable) return "unavailable";
+        try { return nativeGetMmapGuardInfo(); }
+        catch (Throwable t) { return "unavailable"; }
+    }
+
+    public static int getPread64InterceptedCount() {
+        if (!sAvailable) return 0;
+        try { return nativeGetPread64InterceptedCount(); }
+        catch (Throwable t) { return 0; }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // JNI — single declaration block
+    // ═════════════════════════════════════════════════════════════
+
     private static native boolean nativeInit();
     private static native boolean nativeSetActive(boolean active);
     private static native boolean nativeIsActive();
     private static native String  nativeDescribe();
+
+    private static native boolean nativeIsEffectivelyActive();
+    private static native int     nativeGetPatchCount();
+    private static native String  nativeGetStrategy();
+
+    private static native boolean nativeIsMmapGuardActive();
+    private static native int     nativeGetMmapInterceptedCount();
+    private static native String  nativeGetMmapGuardInfo();
+    private static native int     nativeGetPread64InterceptedCount();
+    public static native int nativeGetOpenat2InterceptedCount();
+    public static native int nativeGetIoctlInterceptedCount();
+    public static native int nativeGetStatxInterceptedCount();
+    public static native int nativeGetFaccessat2InterceptedCount();
+    public static native int nativeGetFchmodat2InterceptedCount();
 }
