@@ -52,6 +52,13 @@ import java.util.Set;
  * programmatic setChecked(...) call, and reattached afterwards. This
  * prevents a recycled ViewHolder from firing its stale callback against
  * the wrong package name.
+ *
+ * PROTECTED-UID FILTERING (1.0.1)
+ * -------------------------------
+ * setApps() filters out packages the framework cannot actually
+ * reach: any package whose uid is below 10000 (SYSTEM_UID = 1000
+ * and the reserved system UID pool 1001-1999), and the manager's
+ * own package. See isSelectable().
  */
 public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapter.AppViewHolder> {
 
@@ -84,16 +91,75 @@ public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapte
     /**
      * Replace the displayed list. Does NOT touch the selection.
      * Recommended apps are sorted to the top.
+     *
+     * Packages the framework cannot reach (protected UIDs, the
+     * manager itself) are filtered out before the list is stored.
      */
     public void setApps(List<ApplicationInfo> apps) {
-        List<ApplicationInfo> copy = (apps != null)
-            ? new ArrayList<>(apps)
-            : new ArrayList<>();
+        List<ApplicationInfo> copy = new ArrayList<>();
+        if (apps != null) {
+            for (ApplicationInfo app : apps) {
+                if (app == null) continue;
+                if (!isSelectable(app)) continue;
+                copy.add(app);
+            }
+        }
         try {
             copy.sort(recommendedFirst());
         } catch (Throwable ignored) {}
         this.apps = copy;
         notifyDataSetChanged();
+    }
+
+    /**
+     * True if this app can be offered as a hook target.
+     *
+     * The scope editor is a list of apps a module may be applied
+     * to. Not every installed package belongs there:
+     *
+     *   • Protected UIDs. ShizuPosed's only injection primitive is
+     *     app_process as the target UID. The shell UID (2000) can
+     *     setuid to ordinary app UIDs (>= 10000), but cannot setuid
+     *     to SYSTEM_UID (1000) or the reserved system UID pool
+     *     (1001-1999) — those are protected. System UI, Settings,
+     *     Phone, Bluetooth, NFC, Shell, and system_server all live
+     *     there. Offering them would produce a row that can be
+     *     scoped but can never actually be hooked.
+     *
+     *   • The manager's own package. Scoping ShizuPosed itself is
+     *     meaningless — it is the framework, not a target.
+     *
+     * The UID test is authoritative. The flag test is a fallback
+     * for the rare case where ApplicationInfo.uid is reported as 0
+     * (some ROMs during package scanning) — in that case we fall
+     * back to the FLAG_SYSTEM bit, but only to EXCLUDE packages
+     * whose name also looks framework-owned, so a preinstalled
+     * app with a real uid >= 10000 is not wrongly hidden.
+     */
+    private boolean isSelectable(ApplicationInfo app) {
+        if (app == null || app.packageName == null) return false;
+
+        // Never offer the manager itself.
+        if (app.packageName.equals(context.getPackageName())) return false;
+
+        int uid = app.uid;
+
+        // Authoritative: the shell can only assume app UIDs.
+        if (uid > 0) {
+            return uid >= 10000;
+        }
+
+        // Fallback when uid is not reported. Only exclude obvious
+        // framework packages; keep preinstalled apps whose uid the
+        // scanner did not populate.
+        boolean system = (app.flags & (ApplicationInfo.FLAG_SYSTEM
+                | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) != 0;
+        if (!system) return true;
+
+        String pkg = app.packageName;
+        return !(pkg.startsWith("android.")
+                || pkg.startsWith("com.android.")
+                || pkg.startsWith("com.google.android."));
     }
 
     /** Seed the selection. Copies the incoming set. */

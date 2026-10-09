@@ -14,12 +14,18 @@ import java.util.Set;
 /**
  * Standard Xposed API shim.
  *
- * Version 96 (LSPosed generation 93 + fork revisions 94-96).
- * Modules that check getXposedVersion() >= N for N <= 96 accept
- * ShizuPosed as compatible.
+ * Version 100 (LSPosed generation 93 + fork revisions 94-100).
+ * Modules that check getXposedVersion() >= N for N <= 100 accept
+ * ShizuPosed as compatible. Modules that guard on 101 or higher
+ * correctly believe ShizuPosed doesn't support those fork
+ * revisions.
  *
  * VERSION HISTORY OF THIS SHIM
  * ----------------------------
+ *   82 — XposedHelpers.setStaticBooleanField, getStaticBooleanField
+ *        and the wider primitive-field helpers.
+ *   89 — XposedBridge.hookAllMethods returns Set.
+ *   90 — Non-legacy XSharedPreferences.
  *   93 — LSPosed base: IXUnhook, isModuleActive/isModuleEnabled
  *        no-arg overloads, provider-backed state queries.
  *   94 — XposedBridge.hookAllMethods returns
@@ -27,18 +33,33 @@ import java.util.Set;
  *   95 — XposedBridge.hookAllConstructors returns the same.
  *   96 — MethodHookParam.isReturnEarly() exposed; hookAll*
  *        semantics stabilized.
+ *   97 — Instance field accessors on XposedBridge:
+ *        getObjectField, setObjectField.
+ *   98 — Static field accessors on XposedBridge and
+ *        XposedHelpers.getSurroundingThis.
+ *   99 — Method invokers on XposedBridge: callMethod,
+ *        callStaticMethod.
+ *  100 — ShizuPosed-specific extensions: getShizuPosedApiMin,
+ *        getShizuPosedApiMax, supportsApi.
+ *
+ * ADDITIVE ONLY
+ * -------------
+ * Every revision past 93 is additive. No existing signature was
+ * changed, no method was removed. A module compiled against an
+ * earlier revision still loads and behaves the same way under this
+ * shim, because the shim still exposes the earlier surface.
  */
 public final class XposedBridge {
 
     /**
      * Reported framework version.
      *
-     * Modules guard on this number before using a feature. We
-     * report 96 because we implement everything the 93-96 surface
-     * requires. Modules that guard on 97+ correctly believe we
+     * Modules guard on this number before using a feature. We report
+     * 100 because we implement everything the 82-100 surface
+     * requires. Modules that guard on 101+ correctly believe we
      * don't support the newer fork revisions.
      */
-    public static final int XPOSED_BRIDGE_VERSION = 96;
+    public static final int XPOSED_BRIDGE_VERSION = 100;
 
     /** Logcat tag for XposedBridge.log output. */
     private static final String LOG_TAG = "Xposed";
@@ -61,6 +82,30 @@ public final class XposedBridge {
 
     public static int getVersion() {
         return XPOSED_BRIDGE_VERSION;
+    }
+
+    /**
+     * API 100 extension. Lowest Xposed API revision this shim
+     * provides the full surface for.
+     */
+    public static int getShizuPosedApiMin() {
+        return 82;
+    }
+
+    /**
+     * API 100 extension. Highest Xposed API revision this shim
+     * provides the full surface for.
+     */
+    public static int getShizuPosedApiMax() {
+        return XPOSED_BRIDGE_VERSION;
+    }
+
+    /**
+     * API 100 extension. True if a module compiled against API
+     * {@code api} will function correctly under this shim.
+     */
+    public static boolean supportsApi(int api) {
+        return api >= 82 && api <= XPOSED_BRIDGE_VERSION;
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -128,14 +173,6 @@ public final class XposedBridge {
 
     // ═════════════════════════════════════════════════════════════
     // HOOK ALL — API 94 / 95
-    //
-    // These install a hook on every matching method (or every
-    // constructor) and return a Set of Unhook handles, one per
-    // install. An empty set means no methods matched — not an error.
-    //
-    // The handle set is built by calling hookMethod/hookConstructor
-    // per match, so each handle carries the same backend info and
-    // optional reverse action that a single-method handle would.
     // ═════════════════════════════════════════════════════════════
 
     public static Set<XC_MethodHook.Unhook> hookAllMethods(
@@ -176,6 +213,45 @@ public final class XposedBridge {
             Log.e(FRAMEWORK_TAG, "hookAllConstructors failed", t);
         }
         return out;
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // API 97-100 — ADDITIVE FIELD / METHOD ACCESSORS
+    // ═════════════════════════════════════════════════════════════
+
+    public static Object getObjectField(Object obj, String fieldName) {
+        return com.shizuposed.manager.core.XposedHelpersImpl
+            .getObjectField(obj, fieldName);
+    }
+
+    public static void setObjectField(Object obj, String fieldName,
+                                      Object value) {
+        com.shizuposed.manager.core.XposedHelpersImpl
+            .setObjectField(obj, fieldName, value);
+    }
+
+    public static Object getStaticObjectField(Class<?> clazz,
+                                              String fieldName) {
+        return com.shizuposed.manager.core.XposedHelpersImpl
+            .getStaticObjectField(clazz, fieldName);
+    }
+
+    public static void setStaticObjectField(Class<?> clazz, String fieldName,
+                                            Object value) {
+        com.shizuposed.manager.core.XposedHelpersImpl
+            .setStaticObjectField(clazz, fieldName, value);
+    }
+
+    public static Object callMethod(Object obj, String methodName,
+                                    Object... args) {
+        return com.shizuposed.manager.core.XposedHelpersImpl
+            .callMethod(obj, methodName, args);
+    }
+
+    public static Object callStaticMethod(Class<?> clazz, String methodName,
+                                          Object... args) {
+        return com.shizuposed.manager.core.XposedHelpersImpl
+            .callStaticMethod(clazz, methodName, args);
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -314,6 +390,35 @@ public final class XposedBridge {
         return LSPosedManager.isModuleActive(context, modulePackage);
     }
 
+    /**
+     * Has this module been loaded into ANY process ShizuPosed has
+     * bootstrapped? This is the LSPosed-style "am I active
+     * anywhere" question.
+     *
+     * Distinct from isModuleActive(pkg), which asks whether the
+     * module is loaded into a specific target's process. Under
+     * LSPosed, the two questions have the same answer, because
+     * LSPosed injects into every process. Under ShizuPosed they
+     * differ, so this method exists to answer the broader question
+     * without changing what isModuleActive(pkg) means.
+     *
+     * See LSPosedManager.isModuleActiveAnywhere for details.
+     */
+    public static boolean isModuleActiveAnywhere(String modulePackage) {
+        Context ctx = currentApplication();
+        if (ctx == null) {
+            Log.w(FRAMEWORK_TAG, "isModuleActiveAnywhere(" + modulePackage
+                + "): no Context available (off-main-thread?)");
+            return false;
+        }
+        return LSPosedManager.isModuleActiveAnywhere(ctx, modulePackage);
+    }
+
+    public static boolean isModuleActiveAnywhere(Context context,
+                                                 String modulePackage) {
+        return LSPosedManager.isModuleActiveAnywhere(context, modulePackage);
+    }
+
     public static String[] getModuleScope(String modulePackage) {
         Context ctx = currentApplication();
         if (ctx == null) return new String[0];
@@ -330,11 +435,19 @@ public final class XposedBridge {
 
     private static void logVisibilityHint(String call, String packageName) {
         if (android.os.Build.VERSION.SDK_INT < 30) return;
-        Log.w(FRAMEWORK_TAG, call + "(" + packageName + "): empty result. "
-            + "If this is Android 11+, the module's AndroidManifest.xml "
-            + "must declare: <queries><provider android:authorities=\""
-            + PROVIDER_AUTHORITY + "\" /></queries>. "
-            + "Without it, the provider is invisible to this app.");
+
+        Log.w(FRAMEWORK_TAG,
+            "⚠️ " + call + "(" + packageName + "): empty result on "
+            + "Android " + android.os.Build.VERSION.SDK_INT + ". "
+            + "This is almost always a package-visibility issue, not a "
+            + "missing marker. The module's own AndroidManifest.xml must "
+            + "declare:\n"
+            + "    <queries>\n"
+            + "        <provider android:authorities=\""
+            + PROVIDER_AUTHORITY + "\" />\n"
+            + "    </queries>\n"
+            + "Without it, the provider is invisible to this app and every "
+            + "activation query returns false, regardless of marker state.");
     }
 
     // ═════════════════════════════════════════════════════════════

@@ -5,12 +5,7 @@
     <!-- Permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <!--
-        FGS type changed from dataSync to specialUse.
-        Android 15 forbids dataSync FGS from BOOT_COMPLETED. specialUse is
-        the correct type for a privileged hooking/service-manager that does
-        not fit one of the narrow categories (dataSync, mediaPlayback, etc.).
-    -->
+
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
@@ -40,24 +35,6 @@
         </intent>
     </queries>
 
-    <!--
-        NOTE ON ModuleStatusProvider ACCESS
-
-        The provider is intentionally world-readable. It exposes only:
-          • whether a module is enabled (user preference)
-          • whether a module has loaded into at least one target process
-          • which target packages a module has loaded into
-          • framework name / version / enabled-module count
-
-        None of that is sensitive, and modules that display "Activated"
-        in their own UI must be able to query it from their own process
-        under their own signing key. A signature-level permission on the
-        provider blocks exactly that use case, because modules are never
-        signed with ShizuPosed's key.
-
-        LSPosed takes the same approach for its activation-query path.
-    -->
-
     <application
         android:name=".ShizuPosedManagerApp"
         android:allowBackup="true"
@@ -70,6 +47,7 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.ShizuPosedManager"
         android:resizeableActivity="true"
+        android:enableOnBackInvokedCallback="true"
         tools:targetApi="37">
 
         <!-- Shizuku Provider -->
@@ -99,6 +77,35 @@
             android:multiprocess="false"
             android:grantUriPermissions="true" />
 
+        <!--
+            ShizukuBinderWatcher
+
+            A no-op ContentProvider whose only purpose is to give the
+            app a component Android creates eagerly and keeps alive for
+            the process lifetime. Inside its onCreate() it registers
+            Shizuku.addBinderReceivedListenerSticky and
+            addBinderDeadListener, so the app is notified whenever
+            Shizuku's server comes up or goes down — regardless of the
+            reason. When the binder is received, it starts
+            ShizuPosedService.
+
+            The case this exists for: Shizuku-Next's "ADB without
+            Developer options" switch takes Shizuku's server down while
+            a target app is in the foreground and brings it back when
+            the app exits. Without the watcher, nothing tells ShizuPosed
+            that the server has returned, and the service stays stopped
+            until the user opens the app.
+
+            The provider is not exported and has no public URI surface.
+            Android only needs it to exist so it will be instantiated.
+            No <intent-filter> and no <meta-data> are needed.
+        -->
+        <provider
+            android:name=".watcher.ShizukuBinderWatcher"
+            android:authorities="${applicationId}.shizuku-watcher"
+            android:enabled="true"
+            android:exported="false" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -115,14 +122,10 @@
         <!--
             ShizuPosedService
 
-            foregroundServiceType changed:
-              dataSync  →  specialUse
-
-            Android 15 forbids starting a dataSync FGS from BOOT_COMPLETED
-            (this was the crash: "FGS type dataSync not allowed to start
-            from BOOT_COMPLETED"). specialUse is permitted at boot subject
-            to the general background-start rules, and it is the correct
-            semantic type for this service.
+            foregroundServiceType is specialUse. Android 15 forbids
+            starting a dataSync FGS from BOOT_COMPLETED; specialUse is
+            permitted at boot subject to the general background-start
+            rules, and it is the correct semantic type for this service.
 
             The <property> tag is REQUIRED for specialUse on Android 14+.
         -->

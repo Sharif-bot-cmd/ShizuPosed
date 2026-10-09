@@ -53,13 +53,16 @@ import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.stealth.XStealthModule;
 import com.shizuposed.manager.stealth.XStealthPrefs;
 import com.shizuposed.manager.utils.Logger;
+import com.shizuposed.manager.utils.ModuleActivityResolver;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -77,21 +80,29 @@ import java.util.concurrent.Executors;
  *   • Tapping the switch     → toggles the module.
  *   • Tapping the icon       → opens the detail sheet.
  *
- * Opening a module's own UI (with the self-hook activation
- * installed) is done from the detail sheet's "Open module app"
- * button. Uninstall is no longer exposed in the UI.
- *
- * LAUNCH RESULT BROADCAST (R-6.5+)
- * ---------------------------------
+ * LAUNCH RESULT BROADCAST
+ * -----------------------
  * launchUnderShizuPosed() registers a receiver for
- * ShizuPosedService.ACTION_LAUNCH_RESULT. The service broadcasts
- * after the app_process spawn succeeds or fails, so the UI can
- * report the real outcome instead of an optimistic "Launching…"
- * toast.
+ * ACTION_LAUNCH_RESULT. The service broadcasts after the
+ * app_process spawn succeeds or fails, so the UI can report the
+ * real outcome instead of an optimistic "Launching…" toast.
  *
  * An in-flight guard prevents double-taps from spawning two
- * app_process instances, and an 8-second timeout clears the guard
- * if the service never responds.
+ * app_process instances.
+ *
+ * TIMEOUT HANDLING (7.2 fix)
+ * --------------------------
+ * A timeout callback is scheduled alongside the launch. It is
+ * cancelled when the result broadcast arrives. If the broadcast
+ * never arrives within LAUNCH_TIMEOUT_MS, the timeout logs the
+ * event and shows an informational toast — it does NOT re-launch
+ * the app, because the previous behaviour (calling
+ * fallbackToDirectLaunch from the timeout) caused the module to
+ * re-open on exit: the timeout fired after the launch had already
+ * succeeded, and the fallback spawned a second activity start.
+ *
+ * The timeout map tracks one Runnable per package so a late
+ * broadcast can cancel the pending timeout cleanly.
  */
 public class ModulesFragment extends Fragment {
     private RecyclerView moduleRecyclerView;
@@ -133,15 +144,37 @@ public class ModulesFragment extends Fragment {
 
     private SharedPreferences.OnSharedPreferenceChangeListener xStealthPrefsListener;
 
+    // ─── Load coalescing ──────────────────────────────────────────
+    private volatile boolean loadPending = false;
+    private static final long FRAGMENT_LOAD_DEBOUNCE_MS = 100L;
+
     // ─── Launch result tracking ───────────────────────────────────
     private BroadcastReceiver launchResultReceiver;
+    private boolean launchReceiverRegistered = false;
     private static final String ACTION_LAUNCH_RESULT =
         "com.shizuposed.manager.action.LAUNCH_RESULT";
     private static final String EXTRA_LAUNCH_OK  = "ok";
     private static final String EXTRA_LAUNCH_MSG = "message";
     private static final String EXTRA_LAUNCH_PKG = "package";
     private final Set<String> launchesInFlight = new HashSet<>();
-    private static final long LAUNCH_TIMEOUT_MS = 8_000L;
+
+    /**
+     * Per-package timeout Runnable. When the result broadcast
+     * arrives, we cancel the corresponding Runnable so the timeout
+     * never fires after a successful launch. Without this, the
+     * timeout fired at 20s and (previously) re-launched the app.
+     */
+    private final Map<String, Runnable> launchTimeouts = new HashMap<>();
+
+    /**
+     * Timeout for the routed launch. The service-side fixes
+     * (dedicated launch executor + no module push on launch) make
+     * this generous rather than tight — a healthy launch completes
+     * in under a second. The 20s ceiling is the point at which the
+     * UI gives up waiting for the broadcast and shows an
+     * informational toast. It does NOT re-launch the app.
+     */
+    private static final long LAUNCH_TIMEOUT_MS = 20_000L;
 
     // ═════════════════════════════════════════════════════════════
     // APP LIST CACHE
@@ -152,6 +185,7 @@ public class ModulesFragment extends Fragment {
 
     private static final long APP_CACHE_TTL_MS = 60_000L;
     private static volatile boolean sAppRefreshInFlight = false;
+    private static volatile boolean sFirstScanDone = false;
 
     private BroadcastReceiver packageChangeReceiver;
 
@@ -208,7 +242,7 @@ public class ModulesFragment extends Fragment {
         registerPackageChangeReceiver();
         registerLaunchResultReceiver();
         warmAppListCache();
-        loadModules();
+        requestLoadModules();
         startBackgroundScan();
     }
 
@@ -219,6 +253,7 @@ public class ModulesFragment extends Fragment {
         unregisterXStealthPrefsListener();
         unregisterPackageChangeReceiver();
         unregisterLaunchResultReceiver();
+        cancelAllLaunchTimeouts();
         dismissAllDialogs();
         addModuleDialog = null;
         selectAppsDialog = null;
@@ -249,7 +284,7 @@ public class ModulesFragment extends Fragment {
     public void onResume() {
         super.onResume();
         if (!viewReady) return;
-        loadModules();
+        requestLoadModules();
         startBackgroundScan();
     }
 
@@ -258,7 +293,34 @@ public class ModulesFragment extends Fragment {
             if (logger != null) logger.d("refresh() skipped: view not ready");
             return;
         }
-        loadModules();
+        requestLoadModules();
+    }
+
+    /**
+     * Coalesce loadModules() calls that arrive in the same frame.
+     * The fragment triggers loadModules() from onViewCreated,
+     * onResume, background scan completion, and the XStealth prefs
+     * listener. Without this, all four can land within ~50ms and
+     * each one churns the adapter.
+     */
+    private void requestLoadModules() {
+        if (!viewReady) return;
+        if (loadPending) return;
+        loadPending = true;
+        mainHandler.postDelayed(() -> {
+            loadPending = false;
+            if (viewReady) loadModules();
+        }, FRAGMENT_LOAD_DEBOUNCE_MS);
+    }
+
+    /**
+     * Force a load right now, bypassing the coalesce. Used when the
+     * user just did something that needs an immediate refresh (add
+     * module).
+     */
+    private void requestLoadModulesNow() {
+        loadPending = false;
+        if (viewReady) loadModules();
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -353,8 +415,13 @@ public class ModulesFragment extends Fragment {
     // ═════════════════════════════════════════════════════════════
     // LAUNCH RESULT RECEIVER
     // ═════════════════════════════════════════════════════════════
-
     private void registerLaunchResultReceiver() {
+        if (launchReceiverRegistered) {
+            if (logger != null) {
+                logger.d("Launch result receiver already registered — skipping");
+            }
+            return;
+        }
         if (!isAdded() || getContext() == null) return;
         try {
             launchResultReceiver = new BroadcastReceiver() {
@@ -364,6 +431,19 @@ public class ModulesFragment extends Fragment {
                     if (!ACTION_LAUNCH_RESULT.equals(intent.getAction())) return;
 
                     String pkg = intent.getStringExtra(EXTRA_LAUNCH_PKG);
+
+                    // Maintenance results (clear logs, clean caches)
+                    // are broadcast on the same channel with the
+                    // sentinel package name. Skip them here — the
+                    // Settings tab's own receiver handles those.
+                    if (ShizuPosedService.MAINTENANCE_RESULT_PKG.equals(pkg)) {
+                        if (logger != null) {
+                            logger.d("Launch receiver: skipping maintenance "
+                                + "result broadcast (pkg=" + pkg + ")");
+                        }
+                        return;
+                    }
+
                     boolean ok = intent.getBooleanExtra(EXTRA_LAUNCH_OK, false);
                     String msg = intent.getStringExtra(EXTRA_LAUNCH_MSG);
 
@@ -371,6 +451,7 @@ public class ModulesFragment extends Fragment {
                         synchronized (launchesInFlight) {
                             launchesInFlight.remove(pkg);
                         }
+                        cancelLaunchTimeout(pkg);
                     }
 
                     if (!isAdded()) return;
@@ -404,21 +485,56 @@ public class ModulesFragment extends Fragment {
             } else {
                 ctx.registerReceiver(launchResultReceiver, filter);
             }
+            launchReceiverRegistered = true;
         } catch (Throwable t) {
             if (logger != null) {
                 logger.w("registerLaunchResultReceiver failed: " + t.getMessage());
             }
             launchResultReceiver = null;
+            launchReceiverRegistered = false;
         }
     }
 
     private void unregisterLaunchResultReceiver() {
+        if (!launchReceiverRegistered) return;
         if (launchResultReceiver == null) return;
         try {
             requireContext().getApplicationContext()
                 .unregisterReceiver(launchResultReceiver);
         } catch (Throwable ignored) {}
         launchResultReceiver = null;
+        launchReceiverRegistered = false;
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // LAUNCH TIMEOUT TRACKING
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Cancel the pending timeout Runnable for a package. Called
+     * from the result receiver and from onDestroyView. Safe to
+     * call if no timeout is registered.
+     */
+    private void cancelLaunchTimeout(String packageName) {
+        if (packageName == null) return;
+        Runnable pending;
+        synchronized (launchTimeouts) {
+            pending = launchTimeouts.remove(packageName);
+        }
+        if (pending != null) {
+            mainHandler.removeCallbacks(pending);
+        }
+    }
+
+    private void cancelAllLaunchTimeouts() {
+        Map<String, Runnable> snapshot;
+        synchronized (launchTimeouts) {
+            snapshot = new HashMap<>(launchTimeouts);
+            launchTimeouts.clear();
+        }
+        for (Runnable r : snapshot.values()) {
+            if (r != null) mainHandler.removeCallbacks(r);
+        }
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -433,7 +549,7 @@ public class ModulesFragment extends Fragment {
                 if (!"enabled".equals(key)) return;
                 if (!viewReady) return;
                 if (logger != null) logger.d("XStealth prefs changed, reloading rows");
-                loadModules();
+                requestLoadModules();
             };
             requireContext()
                 .getSharedPreferences("xstealth", Context.MODE_PRIVATE)
@@ -539,13 +655,16 @@ public class ModulesFragment extends Fragment {
                 mainHandler.post(() -> {
                     scanInProgress = false;
                     if (!viewReady) return;
-                    loadModules();
+                    requestLoadModules();
 
                     View v = getView();
                     if (v == null) return;
 
                     int newCount = result.newlyRegistered;
                     int purged = result.purgedCount;
+
+                    boolean wasFirstScan = !sFirstScanDone;
+                    sFirstScanDone = true;
 
                     if (purged > 0 && newCount > 0) {
                         Snackbar.make(v,
@@ -556,9 +675,17 @@ public class ModulesFragment extends Fragment {
                             purged + " module" + (purged != 1 ? "s" : "") + " removed",
                             Snackbar.LENGTH_LONG).show();
                     } else if (newCount > 0) {
-                        Snackbar.make(v,
-                            newCount + " new module" + (newCount != 1 ? "s" : "") + " detected",
-                            Snackbar.LENGTH_LONG).show();
+                        if (wasFirstScan) {
+                            if (logger != null) {
+                                logger.d("Suppressing first-scan '"
+                                    + newCount + " new modules detected' toast");
+                            }
+                        } else {
+                            Snackbar.make(v,
+                                newCount + " new module"
+                                    + (newCount != 1 ? "s" : "") + " detected",
+                                Snackbar.LENGTH_LONG).show();
+                        }
                     }
                 });
             } catch (Throwable t) {
@@ -663,7 +790,7 @@ public class ModulesFragment extends Fragment {
                 return;
             }
         }
-        loadModules();
+        requestLoadModules();
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -834,12 +961,13 @@ public class ModulesFragment extends Fragment {
                 || !shizukuHelper.isAvailable()
                 || !shizukuHelper.isAuthorized()) {
             Toast.makeText(requireContext(),
-                "Shizuku not available or not authorized",
+                "Shizuku not available or not authorized — opening directly",
                 Toast.LENGTH_LONG).show();
             if (logger != null) {
                 logger.w("launchUnderShizuPosed: Shizuku unavailable for "
-                    + packageName);
+                    + packageName + " — falling back to direct launch");
             }
+            fallbackToDirectLaunch(packageName);
             return;
         }
 
@@ -862,34 +990,123 @@ public class ModulesFragment extends Fragment {
 
             if (logger != null) {
                 logger.i("Dispatched launch for " + packageName
-                    + " — awaiting result broadcast");
+                    + " — awaiting result broadcast (timeout="
+                    + LAUNCH_TIMEOUT_MS + "ms)");
             }
 
-            mainHandler.postDelayed(() -> {
+            // Schedule the timeout Runnable and store it so the
+            // receiver can cancel it when the broadcast arrives.
+            // The Runnable is removed from the map either by the
+            // receiver (cancelLaunchTimeout) or by itself when it
+            // fires.
+            final Runnable timeoutRunnable = () -> {
                 boolean stillPending;
                 synchronized (launchesInFlight) {
                     stillPending = launchesInFlight.remove(packageName);
                 }
-                if (stillPending && isAdded()) {
-                    Toast.makeText(requireContext(),
-                        "Launch timed out. Check the Logs tab for details.",
-                        Toast.LENGTH_LONG).show();
-                    if (logger != null) {
-                        logger.w("Launch timed out for " + packageName);
-                    }
+                synchronized (launchTimeouts) {
+                    launchTimeouts.remove(packageName);
                 }
-            }, LAUNCH_TIMEOUT_MS);
+                if (stillPending && isAdded()) {
+                    // Informational only. The previous behaviour
+                    // called fallbackToDirectLaunch here, which
+                    // re-opened the module on exit because the
+                    // timeout fired after the launch had already
+                    // succeeded. That re-launch path is removed.
+                    if (logger != null) {
+                        logger.w("Routed launch timed out for " + packageName
+                            + " — no result broadcast received within "
+                            + LAUNCH_TIMEOUT_MS + "ms");
+                    }
+                    Toast.makeText(requireContext(),
+                        "Launch is taking longer than expected. "
+                        + "Check the Logs tab if it doesn't appear.",
+                        Toast.LENGTH_LONG).show();
+                }
+            };
+
+            synchronized (launchTimeouts) {
+                launchTimeouts.put(packageName, timeoutRunnable);
+            }
+            mainHandler.postDelayed(timeoutRunnable, LAUNCH_TIMEOUT_MS);
 
         } catch (Throwable t) {
             synchronized (launchesInFlight) {
                 launchesInFlight.remove(packageName);
             }
+            cancelLaunchTimeout(packageName);
             Toast.makeText(requireContext(),
                 "Failed to dispatch launch: " + t.getMessage(),
                 Toast.LENGTH_LONG).show();
             if (logger != null) {
                 logger.e("launchUnderShizuPosed dispatch failed: " + t.getMessage());
             }
+            fallbackToDirectLaunch(packageName);
+        }
+    }
+
+    /**
+     * Direct-launch fallback when the routed path fails or times out.
+     *
+     * Uses ModuleActivityResolver first, which handles modules whose
+     * launchable UI isn't tagged with android.intent.category.LAUNCHER.
+     * getLaunchIntentForPackage alone returns null for those modules,
+     * which is what produced the "no launcher activity" failure.
+     *
+     * The toast tells the user that self-hook activation won't fire
+     * in this mode, so a "Disabled" reading in the module UI isn't
+     * surprising.
+     */
+    private void fallbackToDirectLaunch(String packageName) {
+        if (!isAdded() || getContext() == null) return;
+        try {
+            ModuleActivityResolver.Result resolved =
+                ModuleActivityResolver.resolve(requireContext(), packageName);
+
+            Intent launch = null;
+            String source = "unknown";
+
+            if (resolved != null && resolved.component != null) {
+                launch = new Intent(Intent.ACTION_MAIN);
+                launch.setComponent(resolved.component);
+                source = "resolver:" + resolved.reason;
+            } else {
+                launch = requireContext().getPackageManager()
+                    .getLaunchIntentForPackage(packageName);
+                source = "getLaunchIntentForPackage";
+            }
+
+            if (launch == null) {
+                if (logger != null) {
+                    logger.w("fallbackToDirectLaunch: no activity found for "
+                        + packageName + " (tried resolver and "
+                        + "getLaunchIntentForPackage)");
+                }
+                Toast.makeText(requireContext(),
+                    "Could not open module app — no launchable activity",
+                    Toast.LENGTH_LONG).show();
+                return;
+            }
+
+            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            requireContext().startActivity(launch);
+
+            Toast.makeText(requireContext(),
+                "Opened directly. Self-hook activation won't fire, "
+                + "so the module UI may show \"Disabled.\"",
+                Toast.LENGTH_LONG).show();
+
+            if (logger != null) {
+                logger.i("fallbackToDirectLaunch: opened " + packageName
+                    + " via " + source);
+            }
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.w("fallbackToDirectLaunch failed: " + t.getMessage());
+            }
+            Toast.makeText(requireContext(),
+                "Could not open module app: " + t.getMessage(),
+                Toast.LENGTH_LONG).show();
         }
     }
 
@@ -1364,10 +1581,8 @@ public class ModulesFragment extends Fragment {
 
         try {
             moduleLoader.installModule(module);
-            loadModules();
+            requestLoadModulesNow();
 
-            // Only delete the cache copy if installModule() did NOT
-            // rewrite apkPath to point somewhere durable.
             String resolved = module.apkPath;
             if (resolved != null
                     && resolved.startsWith(

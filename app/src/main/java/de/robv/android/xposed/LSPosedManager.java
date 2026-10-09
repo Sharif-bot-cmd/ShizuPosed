@@ -22,11 +22,30 @@ import android.util.Log;
  *   • isModuleActive(pkg)  — has the module actually loaded into at
  *                            least one target process at least once?
  *
- * Hide My Applist and similar modules use isModuleActive to decide
- * whether to display "Activated" in their own UI. That state is
- * derived from the shell-side hooked markers written by XposedHook,
- * not from the manager's module list, so it reflects what the
- * framework has actually done.
+ * SEMANTICS UNDER LSPosed vs ShizuPosed
+ * -------------------------------------
+ * Under LSPosed, isModuleActive(pkg) often functions as "am I
+ * loaded anywhere" because LSPosed injects into every process — the
+ * module's own UI included. Modules that scope themselves to a
+ * target app and then call isModuleActive(getPackageName()) see
+ * true as soon as the framework has loaded them into any process.
+ *
+ * ShizuPosed's coverage is narrower. Only processes that ShizuPosed
+ * bootstrapped have hooks, so the honest answer to "am I loaded
+ * into target T" is false until the user has launched T under
+ * ShizuPosed. That's correct for the question being asked, but it
+ * breaks the LSPosed idiom.
+ *
+ * To bridge that gap without changing what isModuleActive(pkg)
+ * means, ShizuPosed provides isModuleActiveAnywhere(pkg). That
+ * answers the LSPosed-style question directly: true if the module
+ * is listed in any marker, regardless of which target the marker
+ * belongs to.
+ *
+ * A module UI that wants to show "Activated" under both frameworks
+ * can check its own hook first (the pure self-hook pattern), then
+ * fall back to isModuleActive(getPackageName()), then
+ * isModuleActiveAnywhere(getPackageName()).
  *
  * NO-ARG OVERLOADS
  * ----------------
@@ -56,10 +75,10 @@ import android.util.Log;
 public final class LSPosedManager {
 
     /** Framework name reported to modules. */
-    public static final String FRAMEWORK_NAME = "7.0";
+    public static final String FRAMEWORK_NAME = "1.0.4";
 
     /** Reported API version. Matches XposedBridge.XPOSED_BRIDGE_VERSION. */
-    public static final int API_VERSION = 96;
+    public static final int API_VERSION = 100;
 
     /** Authority of ShizuPosed's ModuleStatusProvider. */
     private static final String PROVIDER_AUTHORITY = "com.shizuposed.manager.status";
@@ -93,9 +112,6 @@ public final class LSPosedManager {
      * XposedBridge uses this as the last step in its own context
      * resolution, so both shims agree on which Context is in play
      * when ActivityThread lookups fail.
-     *
-     * @return the registered fallback Context, or null if none has
-     *         been set yet.
      */
     public static Context getFallbackContext() {
         return sFallbackContext;
@@ -126,7 +142,7 @@ public final class LSPosedManager {
     }
 
     public static String getVersionName() {
-        return "(1213)";
+        return "(3810)";
     }
 
     public static String getManagerPackageName() {
@@ -189,8 +205,6 @@ public final class LSPosedManager {
                 int idx = c.getColumnIndex("package");
                 if (idx == -1) return new String[0];
 
-                // Two passes: first count non-null rows, then fill.
-                // Avoids inserting nulls into the returned array.
                 int count = 0;
                 c.moveToPosition(-1);
                 while (c.moveToNext()) {
@@ -217,8 +231,6 @@ public final class LSPosedManager {
 
     /**
      * No-arg form. Derives the calling package from the stack.
-     * LSPosed declares this form. Module UIs that call it fail to
-     * link without it.
      */
     public static boolean isModuleActive() {
         String pkg = getCallingPackage();
@@ -231,11 +243,11 @@ public final class LSPosedManager {
     }
 
     /**
-     * Has the module loaded into at least one target process?
+     * Has this module loaded into a process for the given package?
      *
      * Reads the shell-side hooked markers via
-     * content://.../active/<pkg>. Returns false if no marker lists
-     * this module's package name.
+     * content://.../active/<pkg>. Returns true if any marker for
+     * <pkg> lists this module's package in its moduleList.
      */
     public static boolean isModuleActive(String modulePackage) {
         Context ctx = currentApplication();
@@ -264,6 +276,63 @@ public final class LSPosedManager {
             }
         } catch (Throwable t) {
             Log.e(LOG_TAG, "isModuleActive(" + modulePackage + ") failed", t);
+        }
+        return false;
+    }
+
+    /**
+     * Has this module been loaded into ANY process ShizuPosed has
+     * bootstrapped?
+     *
+     * This is the LSPosed-style "am I active anywhere" question.
+     * Under LSPosed, isModuleActive(getPackageName()) effectively
+     * answers this, because LSPosed injects into every process
+     * including the module's own UI. Under ShizuPosed the coverage
+     * is narrower, so a module that has only been loaded into its
+     * own UI would see false from the target-specific query.
+     *
+     * This method answers the "anywhere" question directly: true if
+     * any marker exists whose moduleList contains this module's
+     * package, regardless of which target the marker belongs to.
+     *
+     * Module UIs written for LSPosed that want to keep working
+     * under both frameworks should check, in this order:
+     *   1. Is my own hook installed in this process? (self-hook)
+     *   2. isModuleActive(getPackageName())
+     *   3. isModuleActiveAnywhere(getPackageName())
+     *
+     * The third check is ShizuPosed-specific. Modules that want to
+     * stay LSPosed-clean can skip it and rely on (1) instead.
+     */
+    public static boolean isModuleActiveAnywhere(String modulePackage) {
+        Context ctx = currentApplication();
+        if (ctx == null) {
+            Log.w(LOG_TAG, "isModuleActiveAnywhere(" + modulePackage
+                + "): no Context available (off-main-thread?)");
+            return false;
+        }
+        return isModuleActiveAnywhere(ctx, modulePackage);
+    }
+
+    public static boolean isModuleActiveAnywhere(Context context,
+                                                  String modulePackage) {
+        if (context == null || modulePackage == null) return false;
+        try {
+            ContentResolver cr = context.getContentResolver();
+            Uri uri = Uri.parse("content://" + PROVIDER_AUTHORITY
+                + "/any-active/" + modulePackage);
+            try (Cursor c = cr.query(uri, null, null, null, null)) {
+                if (c != null && c.moveToFirst()) {
+                    int idx = c.getColumnIndex("active");
+                    if (idx != -1) return c.getInt(idx) == 1;
+                    int vIdx = c.getColumnIndex("value");
+                    if (vIdx != -1) return "1".equals(c.getString(vIdx));
+                }
+                logVisibilityHint("isModuleActiveAnywhere", modulePackage);
+            }
+        } catch (Throwable t) {
+            Log.e(LOG_TAG, "isModuleActiveAnywhere(" + modulePackage
+                + ") failed", t);
         }
         return false;
     }
@@ -314,21 +383,25 @@ public final class LSPosedManager {
 
     private static void logVisibilityHint(String call, String packageName) {
         if (android.os.Build.VERSION.SDK_INT < 30) return;
-        Log.w(LOG_TAG, call + "(" + packageName + "): empty result. "
-            + "If this is Android 11+, the module's AndroidManifest.xml "
-            + "must declare: <queries><provider android:authorities=\""
-            + PROVIDER_AUTHORITY + "\" /></queries>. "
-            + "Without it, the provider is invisible to this app.");
+
+        Log.w(LOG_TAG,
+            "⚠️ " + call + "(" + packageName + "): empty result on "
+            + "Android " + android.os.Build.VERSION.SDK_INT + ". "
+            + "This is almost always a package-visibility issue, not a "
+            + "missing marker. The module's own AndroidManifest.xml must "
+            + "declare:\n"
+            + "    <queries>\n"
+            + "        <provider android:authorities=\""
+            + PROVIDER_AUTHORITY + "\" />\n"
+            + "    </queries>\n"
+            + "Without it, the provider is invisible to this app and every "
+            + "activation query returns false, regardless of marker state.");
     }
 
     // ═════════════════════════════════════════════════════════════
     // CALLING PACKAGE RESOLUTION
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Walk the stack to find the first caller outside the framework,
-     * then derive its package name. Used by the no-arg overloads.
-     */
     private static String getCallingPackage() {
         try {
             for (StackTraceElement e : Thread.currentThread().getStackTrace()) {
@@ -366,14 +439,6 @@ public final class LSPosedManager {
     // CONTEXT RESOLUTION
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Resolve a Context, working off the main thread.
-     *
-     * Order:
-     *   1. ActivityThread.currentApplication()
-     *   2. ActivityThread.currentActivityThread().getSystemContext()
-     *   3. sFallbackContext
-     */
     private static Context currentApplication() {
         Context fb = sFallbackContext;
 
