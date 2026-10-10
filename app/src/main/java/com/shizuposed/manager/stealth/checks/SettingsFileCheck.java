@@ -327,14 +327,6 @@ public final class SettingsFileCheck {
     // ProcessBuilder HOOKS
     // ═════════════════════════════════════════════════════════════════
 
-    /**
-     * ProcessBuilder.start() reads the command list from the
-     * builder's internal `command` field. Hook start() and check
-     * that field.
-     *
-     * Some callers subclass ProcessBuilder, but the field is on
-     * the base class, so reflection through the hierarchy finds it.
-     */
     private static void hookProcessBuilder(XC_LoadPackage.LoadPackageParam lpparam) {
         try {
             XposedHelpers.findAndHookMethod(
@@ -480,33 +472,34 @@ public final class SettingsFileCheck {
         return scrubFor(String.join(" ", command));
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // ShadowProcess — a Process that never spawned
-    // ═════════════════════════════════════════════════════════════════
-
     /**
-     * Minimal Process implementation serving scrubbed stdout.
+     * Hardened Process implementation serving scrubbed stdout.
      *
-     * The subprocess never exists. exitValue() returns 0 so callers
-     * that check for a successful exit see success. waitFor()
-     * returns immediately. destroy() is a no-op.
+     * Differences from the previous version:
      *
-     * stderr is empty. Some apps check stderr for error messages
-     * to decide whether the command succeeded; empty stderr plus
-     * exit code 0 looks like a clean run.
+     *   • exitValue() throws IllegalThreadStateException before
+     *     waitFor() completes, matching the real Process contract
+     *     on Android. Callers that check exitValue() as a
+     *     completion signal see the same behavior they would with
+     *     a real subprocess.
      *
-     * getInputStream() returns a ByteArrayInputStream over the
-     * scrubbed XML — but note that Process.getInputStream()
-     * conventionally returns the subprocess's STDOUT. We're
-     * faithfully reproducing that contract.
+     *   • isAlive() returns true until waitFor() or destroy() is
+     *     called. Real subprocesses stay "alive" until they exit.
      *
-     * getErrorStream() returns an empty stream.
-     * getOutputStream() returns a sink (nobody reads it).
+     *   • Streams are single-use. Reading the input stream twice
+     *     returns an empty stream the second time, matching the
+     *     behavior of a real pipe.
+     *
+     *   • destroy() marks the process as destroyed but doesn't
+     *     throw. Subsequent waitFor() returns 0 (a destroyed
+     *     process exits "cleanly" from the caller's perspective).
      */
     private static final class ShadowProcess extends Process {
 
         private final byte[] stdoutBytes;
-        private boolean destroyed = false;
+        private volatile boolean destroyed = false;
+        private volatile boolean waited = false;
+        private volatile boolean inputConsumed = false;
 
         ShadowProcess(String stdout) {
             this.stdoutBytes = (stdout != null)
@@ -516,8 +509,6 @@ public final class SettingsFileCheck {
 
         @Override
         public OutputStream getOutputStream() {
-            // Nobody reads what the app writes to a read-only
-            // command's stdin. Sink it.
             return new OutputStream() {
                 @Override public void write(int b) {}
                 @Override public void write(byte[] b) {}
@@ -527,6 +518,10 @@ public final class SettingsFileCheck {
 
         @Override
         public InputStream getInputStream() {
+            if (inputConsumed) {
+                return new ByteArrayInputStream(new byte[0]);
+            }
+            inputConsumed = true;
             return new ByteArrayInputStream(stdoutBytes);
         }
 
@@ -536,12 +531,19 @@ public final class SettingsFileCheck {
         }
 
         @Override
-        public int waitFor() {
+        public synchronized int waitFor() {
+            waited = true;
             return 0;
         }
 
         @Override
-        public int exitValue() {
+        public synchronized int exitValue() {
+            if (!waited && !destroyed) {
+                // Match the real Process contract: exitValue() is
+                // only valid after the process has terminated.
+                throw new IllegalThreadStateException(
+                    "process has not exited yet");
+            }
             return 0;
         }
 
@@ -552,7 +554,7 @@ public final class SettingsFileCheck {
 
         @Override
         public boolean isAlive() {
-            return false;
+            return !waited && !destroyed;
         }
     }
 

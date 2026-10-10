@@ -79,6 +79,10 @@ public class ModuleStatusProvider extends ContentProvider {
         return Uri.parse("content://" + AUTHORITY + "/scope/" + modulePackage);
     }
 
+    public static Uri anyActiveUri(String modulePackage) {
+        return Uri.parse("content://" + AUTHORITY + "/any-active/" + modulePackage);
+    }
+
     private Logger logger;
 
     // ── In-memory cache of the parsed mirror ────────────────────
@@ -150,6 +154,10 @@ public class ModuleStatusProvider extends ContentProvider {
         }
         if (segments.length >= 2 && "info".equals(segments[1])) {
             return queryInfo();
+        }
+
+        if (segments.length >= 3 && "any-active".equals(segments[1])) {
+            return queryModuleAnyActive(segments[2]);
         }
 
         Log.w(TAG, "query: unknown path " + path);
@@ -228,6 +236,30 @@ public class ModuleStatusProvider extends ContentProvider {
             }
         } catch (Throwable t) {
             Log.e(TAG, "queryModuleActive(" + modulePkg + ") failed", t);
+        }
+
+        MatrixCursor c = new MatrixCursor(
+            new String[]{"package", "active", "value"});
+        c.addRow(new Object[]{
+            modulePkg,
+            active ? 1 : 0,
+            active ? "1" : "0"
+        });
+        return c;
+    }
+
+    private Cursor queryModuleAnyActive(String modulePkg) {
+        boolean active = false;
+        try {
+            Map<String, String> markers = getMarkers();
+            for (Map.Entry<String, String> e : markers.entrySet()) {
+                if (markerContainsModule(e.getValue(), modulePkg)) {
+                    active = true;
+                    break;
+                }
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "queryModuleAnyActive(" + modulePkg + ") failed", t);
         }
 
         MatrixCursor c = new MatrixCursor(
@@ -371,6 +403,15 @@ public class ModuleStatusProvider extends ContentProvider {
                     }
                     c.close();
                     b.putStringArrayList("scope", pkgs);
+                }
+            } else if ("any-active".equals(path) && arg != null) {
+                Cursor c = queryModuleAnyActive(arg);
+                if (c != null && c.moveToFirst()) {
+                    int idx = c.getColumnIndex("active");
+                    b.putBoolean("active", idx != -1 && c.getInt(idx) == 1);
+                    b.putString("value",
+                        idx != -1 && c.getInt(idx) == 1 ? "1" : "0");
+                    c.close();
                 }
             } else if ("info".equals(path)) {
                 b.putString("framework", "ShizuPosed");

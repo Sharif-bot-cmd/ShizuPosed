@@ -1,4 +1,14 @@
-// build.gradle
+// build.gradle (project-level)
+//
+// Toolchain:
+//   Gradle  9.8.0
+//   JDK     25
+//   AGP     9.4.1
+//
+// The JDK 25 toolchain means source/target compatibility is 25.
+// AGP 9.4.0 is the first AGP that officially supports JDK 25 as
+// the running JVM, so that pairing is required.
+
 buildscript {
     repositories {
         google()
@@ -7,20 +17,29 @@ buildscript {
         maven { url 'https://maven.rikka.dev/releases' }
     }
     dependencies {
-        // Android Gradle Plugin 9.4.0 is compatible with JDK 21
-        classpath 'com.android.tools.build:gradle:9.4.0'
+        // Android Gradle Plugin 9.4.1 — minimum AGP for Gradle 9.8
+        // and JDK 25. Older AGP versions reject JDK 25 at startup.
+        classpath 'com.android.tools.build:gradle:9.4.1'
     }
 }
 
-// Set Java version for all subprojects
+// Set Java version for all subprojects.
+//
+// Using JavaVersion.VERSION_25 pins both source and target to 25,
+// which matches the JDK 25 toolchain. If a subproject needs a
+// different level (e.g., a library that must run on older
+// Android), override it in that subproject's build.gradle.
 subprojects {
-    tasks.withType(JavaCompile) {
-        sourceCompatibility = JavaVersion.VERSION_21
-        targetCompatibility = JavaVersion.VERSION_21
+    tasks.withType(JavaCompile).configureEach {
+        sourceCompatibility = JavaVersion.VERSION_25
+        targetCompatibility = JavaVersion.VERSION_25
         options.compilerArgs << '-Xlint:unchecked' << '-Xlint:deprecation'
+        options.encoding = 'UTF-8'
     }
 }
 
-task clean(type: Delete) {
-    delete rootProject.buildDir
+// Clean task. rootProject.buildDir is deprecated in Gradle 9.x —
+// use layout.buildDirectory instead.
+tasks.register('clean', Delete) {
+    delete rootProject.layout.buildDirectory
 }

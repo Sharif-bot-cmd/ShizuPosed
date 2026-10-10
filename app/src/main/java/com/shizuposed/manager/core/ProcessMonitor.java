@@ -28,29 +28,33 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * ProcessMonitor
  *
- * Keeps a live map of running app processes. Reads /proc directly when
- * possible; falls back to reading through Shizuku (shell uid) when the
- * direct read is blocked by SELinux.
+ * Keeps a live map of running app processes. Reads /proc directly
+ * when possible; falls back to reading through Shizuku (shell uid)
+ * when the direct read is blocked by SELinux.
  *
  * MARKER MIRROR
  * -------------
  * Each scan cycle also refreshes MarkerCache, the local mirror of
  * the shell-side hooked markers. ModuleStatusProvider reads from
  * that mirror to answer "is this module active?" without a Shizuku
- * round-trip per query. Refreshing here means the provider's queries
- * stay fast and independent of Shizuku's state at query time.
+ * round-trip per query.
  *
- * SCAN INTERVAL
- * -------------
- * The interval between scan cycles is read from RuntimePrefs at
- * startMonitoring() time. It defaults to 5 seconds and can be tuned
- * from the Settings tab. A change takes effect on the next service
- * start, since the scheduler is created once per startMonitoring()
- * call.
+ * NON-BLOCKING START (7.0)
+ * ------------------------
+ * startMonitoring() schedules its priming work (marker cache
+ * refresh + initial scan) on the scheduler thread and returns
+ * immediately. Previously it ran them inline, which stalled the
+ * caller for 10-20 seconds on devices where the shell-side process
+ * enumeration is slow. That stalled everything queued behind the
+ * caller on the same worker thread — including routed module
+ * launches.
  *
- * The marker mirror refresh runs at the same interval, bounded by
- * MARKER_REFRESH_INTERVAL_MS so a very fast scan interval doesn't
- * hammer the shell.
+ * FAST SHELL SCAN (7.0)
+ * ---------------------
+ * The fallback shell scan used to loop over /proc/[0-9]* and run
+ * grep/awk/tr per process. On a device with 300+ processes that's
+ * 15-20 seconds of shell work. It now uses a single `ps -A -o
+ * PID,UID,ARGS` call, which is ~1 second.
  */
 public class ProcessMonitor {
     private static ProcessMonitor instance;
@@ -71,11 +75,7 @@ public class ProcessMonitor {
     private volatile long lastMarkerRefresh = 0L;
 
     /**
-     * Minimum interval between marker mirror refreshes. The provider's
-     * own in-memory TTL is 3 seconds, so a 5-second refresh keeps the
-     * mirror at most one provider-TTL stale. This does NOT follow the
-     * scan interval — the mirror refresh is capped at this rate even
-     * if the scan runs faster.
+     * Minimum interval between marker mirror refreshes.
      */
     private static final long MARKER_REFRESH_INTERVAL_MS = 5000L;
 
@@ -130,38 +130,60 @@ public class ProcessMonitor {
     // LIFECYCLE
     // ═════════════════════════════════════════════════════════════
 
+    /**
+     * Start monitoring. Returns immediately — the priming work
+     * (marker cache refresh + initial scan) runs on the scheduler
+     * thread in the background.
+     *
+     * Previously this method ran the priming inline, which stalled
+     * the caller for 10-20 seconds on devices where the shell-side
+     * process enumeration is slow. That blocked everything queued
+     * behind the caller on the same thread, including routed module
+     * launches.
+     */
     public void startMonitoring() {
         if (!isRunning.compareAndSet(false, true)) {
             logger.d("ProcessMonitor already running");
             return;
         }
 
-        // ── Read the configured scan interval. Defaults to 5 s.
-        //    Bounded by RuntimePrefs to [2 s, 30 s].
         int intervalMs = RuntimePrefs.getScanIntervalMs(context);
-        logger.i("ProcessMonitor started - scan interval " + intervalMs + "ms");
+        logger.i("ProcessMonitor starting - scan interval " + intervalMs + "ms");
 
-        // ── Prime the marker mirror so the first provider query
-        //    after startup finds a populated cache instead of
-        //    paying the cold-start cost on the query thread.
-        try {
-            MarkerCache.refresh(context);
-            lastMarkerRefresh = System.currentTimeMillis();
-        } catch (Throwable t) {
-            logger.w("Initial MarkerCache.refresh failed: " + t.getMessage());
-        }
-
-        scanExistingProcesses();
-
+        // Create the scheduler with a daemon thread so it doesn't
+        // keep the process alive.
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "ProcessMonitor-scan");
             t.setDaemon(true);
             return t;
         });
+
+        // Schedule the priming work in the background. Everything
+        // that used to block startMonitoring() now runs here.
+        scheduler.execute(() -> {
+            try {
+                MarkerCache.refresh(context);
+                lastMarkerRefresh = System.currentTimeMillis();
+            } catch (Throwable t) {
+                logger.w("Initial MarkerCache.refresh failed: " + t.getMessage());
+            }
+            try {
+                long t0 = System.currentTimeMillis();
+                scanExistingProcesses();
+                long dt = System.currentTimeMillis() - t0;
+                logger.i("Initial ProcessMonitor scan took " + dt + "ms");
+            } catch (Throwable t) {
+                logger.w("Initial scanExistingProcesses failed: " + t.getMessage());
+            }
+        });
+
+        // Schedule the recurring scan.
         scanTask = scheduler.scheduleWithFixedDelay(
             this::scanExistingProcesses,
             intervalMs, intervalMs, TimeUnit.MILLISECONDS
         );
+
+        logger.i("ProcessMonitor scheduled - initial scan deferred to background");
     }
 
     public void stopMonitoring() {
@@ -185,19 +207,6 @@ public class ProcessMonitor {
     private void scanExistingProcesses() {
         if (!isRunning.get()) return;
 
-        // ── Refresh the marker mirror once per MARKER_REFRESH_INTERVAL_MS.
-        //    This is decoupled from the scan interval: a fast scan
-        //    interval doesn't hammer the shell with mirror refreshes.
-        try {
-            long now = System.currentTimeMillis();
-            if (now - lastMarkerRefresh >= MARKER_REFRESH_INTERVAL_MS) {
-                lastMarkerRefresh = now;
-                MarkerCache.refresh(context);
-            }
-        } catch (Throwable t) {
-            logger.w("MarkerCache.refresh failed: " + t.getMessage());
-        }
-
         try {
             Map<Integer, ProcInfo> found = scanProcTree();
 
@@ -211,6 +220,16 @@ public class ProcessMonitor {
                 if (pid == android.os.Process.myPid()) continue;
 
                 if (hookedProcesses.containsKey(pid)) continue;
+      
+            try {
+                long now = System.currentTimeMillis();
+                if (now - lastMarkerRefresh >= MARKER_REFRESH_INTERVAL_MS) {
+                    lastMarkerRefresh = now;
+                    MarkerCache.refresh(context);
+                }
+            } catch (Throwable t) {
+                logger.w("MarkerCache.refresh failed: " + t.getMessage());
+            }
 
                 HookedProcess process = new HookedProcess();
                 process.setProcessName(info.packageName);
@@ -240,7 +259,7 @@ public class ProcessMonitor {
                 }
             }
 
-            // ── Marker promotion. Reads the local mirror, no Shizuku.
+            // Marker promotion. Reads the local mirror, no Shizuku.
             promoteFromMirror();
 
             // Prune tracked pids that no longer exist in /proc
@@ -256,17 +275,13 @@ public class ProcessMonitor {
                 }
             }
 
-            logger.i("Scanned " + found.size() + " processes ("
+            logger.d("Scanned " + found.size() + " processes ("
                 + newlyAdded + " new, " + hookedProcesses.size() + " tracked)");
 
         } catch (Exception e) {
             logger.e("Scan error: " + e.getMessage());
         }
     }
-
-    // ═════════════════════════════════════════════════════════════
-    // MARKER PROMOTION FROM LOCAL MIRROR
-    // ═════════════════════════════════════════════════════════════
 
     private void promoteFromMirror() {
         try {
@@ -317,10 +332,6 @@ public class ProcessMonitor {
         }
     }
 
-    /**
-     * Parse an integer value out of a tiny JSON object by key.
-     * Returns -1 if the key isn't found or the value isn't numeric.
-     */
     private int extractInt(String json, String key) {
         if (json == null || key == null) return -1;
         try {
@@ -350,13 +361,22 @@ public class ProcessMonitor {
     }
 
     private Map<Integer, ProcInfo> scanProcTree() {
+        long t0 = System.currentTimeMillis();
         Map<Integer, ProcInfo> direct = scanProcDirect();
-        if (direct.size() >= 10) return direct;
+        long directMs = System.currentTimeMillis() - t0;
 
+        if (direct.size() >= 10) {
+            return direct;
+        }
+
+        long t1 = System.currentTimeMillis();
         Map<Integer, ProcInfo> shell = scanProcViaShell();
+        long shellMs = System.currentTimeMillis() - t1;
+
+        logger.d("scanProcTree: direct=" + direct.size() + " (" + directMs
+            + "ms), shell=" + shell.size() + " (" + shellMs + "ms)");
+
         if (shell.size() > direct.size()) {
-            logger.d("Using shell scan (" + shell.size()
-                + " processes) — direct /proc read yielded " + direct.size());
             return shell;
         }
         return direct;
@@ -401,6 +421,18 @@ public class ProcessMonitor {
         return out;
     }
 
+    /**
+     * Fallback: enumerate processes via a single `ps` invocation
+     * through Shizuku.
+     *
+     * Previously this used a shell loop over /proc/[0-9]* with
+     * per-process grep/awk/tr. On a device with 300+ processes that
+     * took 15-20 seconds. A single `ps -A -o PID,UID,ARGS` is
+     * roughly 1 second.
+     *
+     * Falls back progressively through `ps` output formats, since
+     * column names vary across Android versions and OEM builds.
+     */
     private Map<Integer, ProcInfo> scanProcViaShell() {
         Map<Integer, ProcInfo> out = new HashMap<>();
         try {
@@ -410,19 +442,20 @@ public class ProcessMonitor {
                 return out;
             }
 
+            // Try ARGS first (full command line), then NAME (short
+            // name), then bare ps. Each returns fewer details but
+            // at least gives pid+uid.
             String script =
-                "for d in /proc/[0-9]*; do " +
-                "  pid=${d##*/}; " +
-                "  uid=$(grep '^Uid:' $d/status 2>/dev/null | awk '{print $2}'); " +
-                "  cmd=$(tr '\\0' ' ' < $d/cmdline 2>/dev/null); " +
-                "  if [ -n \"$uid\" ] && [ -n \"$cmd\" ]; then " +
-                "    echo \"$pid|$uid|$cmd\"; " +
-                "  fi; " +
-                "done";
+                "ps -A -o PID,UID,ARGS 2>/dev/null "
+                + "|| ps -A -o PID,UID,NAME 2>/dev/null "
+                + "|| ps -A 2>/dev/null";
 
+            long t0 = System.currentTimeMillis();
             ShellUtils.CommandResult r = sh.executeCommand(script);
+            long dt = System.currentTimeMillis() - t0;
+
             if (!r.isSuccess() || r.stdout == null) {
-                logger.d("Shell scan returned no output");
+                logger.d("Shell scan returned no output (took " + dt + "ms)");
                 shellScanAvailable = Boolean.FALSE;
                 return out;
             }
@@ -434,23 +467,38 @@ public class ProcessMonitor {
                 line = line.trim();
                 if (line.isEmpty()) continue;
 
-                int p1 = line.indexOf('|');
-                if (p1 <= 0) continue;
-                int p2 = line.indexOf('|', p1 + 1);
-                if (p2 <= 0) continue;
+                // Skip headers.
+                if (line.startsWith("PID")) continue;
+                if (line.startsWith("USER")) continue;
+                if (line.startsWith("UID")) continue;
+
+                // Format: PID UID ARGS (whitespace-separated, ARGS
+                // may contain spaces).
+                String[] parts = line.split("\\s+", 3);
+                if (parts.length < 3) continue;
 
                 int pid;
                 int uid;
                 try {
-                    pid = Integer.parseInt(line.substring(0, p1));
-                    uid = Integer.parseInt(line.substring(p1 + 1, p2));
+                    pid = Integer.parseInt(parts[0]);
+                    uid = Integer.parseInt(parts[1]);
                 } catch (NumberFormatException e) {
-                    continue;
+                    // Some ROMs emit non-numeric columns; try to
+                    // parse from the second field if the first
+                    // looks like a username.
+                    try {
+                        uid = Integer.parseInt(parts[1]);
+                        pid = -1;
+                        if (uid < 0) continue;
+                    } catch (NumberFormatException e2) {
+                        continue;
+                    }
+                    if (pid < 0) continue;
                 }
                 if (pid < 100) continue;
                 if (pid == android.os.Process.myPid()) continue;
 
-                String cmdline = line.substring(p2 + 1);
+                String cmdline = parts[2];
                 String pkg = parsePackageName(cmdline);
                 if (pkg == null || pkg.isEmpty()) continue;
 
@@ -459,6 +507,9 @@ public class ProcessMonitor {
                 info.uid = uid;
                 out.put(pid, info);
             }
+
+            logger.d("Shell scan via ps: " + out.size()
+                + " processes parsed (took " + dt + "ms)");
         } catch (Throwable t) {
             logger.d("scanProcViaShell error: " + t.getMessage());
         }
