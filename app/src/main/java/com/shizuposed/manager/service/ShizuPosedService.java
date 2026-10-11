@@ -1185,7 +1185,6 @@ public class ShizuPosedService extends Service {
     // ═════════════════════════════════════════════════════════════
     // DEX DEPLOYMENT
     // ═════════════════════════════════════════════════════════════
-
     private boolean deployDexToShellDir() {
         if (!shizukuHelper.isAuthorized()) {
             logger.w("Cannot deploy dex: Shizuku not authorized");
@@ -1234,10 +1233,11 @@ public class ShizuPosedService extends Service {
             shizukuHelper.executeCommand("mkdir -p " + libsDir);
             shizukuHelper.executeCommand("mkdir -p " + modulesDir);
             shizukuHelper.executeCommand("mkdir -p " + hookedDir);
+
             shizukuHelper.executeCommand("chmod 755 " + base
                 + " " + libsDir
-                + " " + modulesDir
-                + " " + hookedDir);
+                + " " + modulesDir);
+            shizukuHelper.executeCommand("chmod 777 " + hookedDir);
 
             logger.i("XposedHook.dex deployed to: " + dexPath);
             dexDeployed.set(true);
