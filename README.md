@@ -383,25 +383,6 @@ server comes back, and `ShizuBinderWatcher` restarts ShizuPosed's
 service. This is the same trade-off Shizuku-Next's "ADB without
 Developer options" switch makes.
 
-#### What you lose
-
-  * **Apps launched during the window are not hooked.** If the
-    user opens a second scoped app while the first is still in
-    the foreground, the second app is not launched through
-    ShizuPosed, and modules scoped to it do not load.
-  * **The foreground-detection race.** The monitor detects the
-    transition using `UsageStatsManager`, which polls. The poll
-    interval is 500 ms. An app that reads its settings in
-    `Application.attachBaseContext` before the monitor's next
-    poll sees the previous value. XStealth's read interception
-    does not have this race — the hooks install during bootstrap
-    — so the two mechanisms are complementary: read interception
-    covers the early reads, the state change covers the late ones.
-  * **`PACKAGE_USAGE_STATS`.** The monitor uses
-    `UsageStatsManager`, which requires the user to grant the
-    permission through Settings → Special app access → Usage
-    access. Without it, the monitor does not start.
-
 #### When to use it
 
 Enable it when a scoped app is known to read the settings through
@@ -867,7 +848,7 @@ This isn't a ShizuPosed bug. Without root, no framework is going to beat BioCatc
 
 ## License
 
-    Copyright 2024-2026 ShizuPosed Contributors
+    Copyright 2026-2027 ShizuPosed Contributors
 
     Licensed under the Apache License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License.
