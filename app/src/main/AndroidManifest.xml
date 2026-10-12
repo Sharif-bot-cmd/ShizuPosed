@@ -18,6 +18,9 @@
     <!-- Shizuku Permission -->
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
 
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+
     <!--
         QUERY_ALL_PACKAGES
         Required on some OEM ROMs (OPPO, older Xiaomi) that do not honor

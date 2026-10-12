@@ -10,6 +10,7 @@ import android.os.Handler;
 import android.os.Looper;
 
 import com.shizuposed.manager.service.ShizuPosedService;
+import com.shizuposed.manager.updates.UpdateChecker;
 import com.shizuposed.manager.utils.Logger;
 
 import java.io.File;
@@ -122,6 +123,17 @@ public class ShizuPosedManagerApp extends Application {
 
         createDirectories();
         setupNotificationChannel();
+
+        // Check GitHub Releases for a newer version. Runs on a
+        // background thread; throttled to once per 12 hours; fails
+        // silently if offline. Never blocks startup.
+        try {
+            String currentVersion = getPackageManager()
+                .getPackageInfo(getPackageName(), 0).versionName;
+            UpdateChecker.checkAsync(this, currentVersion);
+        } catch (Throwable t) {
+            logger.d("Update check skipped: " + t.getMessage());
+        }
 
         new Handler(Looper.getMainLooper()).post(this::deferredShizukuSetup);
 
