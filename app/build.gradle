@@ -18,8 +18,8 @@ android {
         applicationId "com.shizuposed.manager"
         minSdk 29
         targetSdk 37
-        versionCode 3920
-        versionName "1.0.6"
+        versionCode 4100
+        versionName "1.0.8"
 
         ndk {
             abiFilters 'arm64-v8a'
@@ -64,6 +64,7 @@ android {
     buildFeatures {
         viewBinding true
         dataBinding true
+        buildConfig true
     }
 
     androidResources {

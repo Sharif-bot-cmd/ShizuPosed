@@ -1,7 +1,9 @@
 package com.shizuposed.manager.ui;
 
 import android.content.Context;
+import android.content.Intent;
 import android.os.Bundle;
+import android.provider.Settings;
 import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -14,10 +16,18 @@ import androidx.coordinatorlayout.widget.CoordinatorLayout;
 
 import com.google.android.material.bottomsheet.BottomSheetBehavior;
 import com.google.android.material.bottomsheet.BottomSheetDialogFragment;
+import com.google.android.material.button.MaterialButton;
 import com.google.android.material.materialswitch.MaterialSwitch;
 import com.google.android.material.textview.MaterialTextView;
 import com.shizuposed.manager.R;
+import com.shizuposed.manager.monitor.ForegroundMonitor;
+import com.shizuposed.manager.stealth.SmartForegroundController;
+import com.shizuposed.manager.stealth.XStealthConfig;
 import com.shizuposed.manager.stealth.XStealthPrefs;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 /**
  * XStealthDetailSheet
@@ -46,12 +56,26 @@ import com.shizuposed.manager.stealth.XStealthPrefs;
  * is turned off. Turning the master back on restores them to
  * whatever the user last set.
  *
+ * SMART FOREGROUND (Design B)
+ * ---------------------------
+ * There is no dedicated master toggle for smart foreground
+ * hiding. The two signal toggles — Hide Developer Options and
+ * Hide ADB enabled — gate both the read interception and the
+ * state change. The state change fires only for apps in the
+ * smart-foreground scope, which the user edits through the
+ * "Watch apps for foreground hiding" button that sits under
+ * those two toggles.
+ *
+ * When the scope is non-empty and at least one signal toggle is
+ * on, a warning appears under the scope summary. Adding apps to
+ * the scope is the way the user opts into the state change.
+ *
  * TOGGLE LAYERS
  * -------------
  *   Master          — enabled
  *   Next            — nextEnabled
  *   Bridge          — bridgeEnabled
- *   Settings        — hideDevOptions, hideAdb
+ *   Settings        — hideDevOptions, hideAdb (+ smart-fg scope)
  *   System props    — hideSystemProperties, hideBuildFields
  *   Framework props — scrubShizuPosedProperties, scrubThreadNames
  *   Package/process — hideShizukuPackage, hideShizuPosedPackage,
@@ -97,6 +121,7 @@ public class XStealthDetailSheet extends BottomSheetDialogFragment {
                 XStealthPrefs.setEnabled(ctx, checked);
                 XStealthPushHelper.requestPush(ctx);
                 refresh(view);
+                updateSmartFgUi(view);
                 Toast.makeText(ctx,
                     checked ? "XStealth enabled" : "XStealth disabled",
                     Toast.LENGTH_SHORT).show();
@@ -155,6 +180,8 @@ public class XStealthDetailSheet extends BottomSheetDialogFragment {
                 if (!sheetReady) return;
                 XStealthPrefs.setHideDevOptions(ctx, checked);
                 XStealthPushHelper.requestPush(ctx);
+                updateSmartFgUi(view);
+                SmartForegroundController.getInstance(ctx).restartMonitor();
             });
 
         bindSwitch(view, R.id.switchHideAdb,
@@ -162,7 +189,35 @@ public class XStealthDetailSheet extends BottomSheetDialogFragment {
                 if (!sheetReady) return;
                 XStealthPrefs.setHideAdb(ctx, checked);
                 XStealthPushHelper.requestPush(ctx);
+                updateSmartFgUi(view);
+                SmartForegroundController.getInstance(ctx).restartMonitor();
             });
+
+        // ─── Smart foreground controls (Design B) ─────────────────
+        //
+        // These are not a separate feature section. They modify what
+        // the two signal toggles above do: when a scoped app is in
+        // the foreground, the settings the toggles cover are written
+        // to 0 through Shizuku.
+        //
+        // Button, scope summary, warning, and grant button are all
+        // wired below. The grant button is only visible when the
+        // user hasn't yet granted PACKAGE_USAGE_STATS.
+
+        MaterialButton sfScopeButton = view.findViewById(
+            R.id.buttonSmartForegroundScope);
+        if (sfScopeButton != null) {
+            sfScopeButton.setOnClickListener(v -> {
+                if (!sheetReady) return;
+                openAppPickerForSmartForegroundScope();
+            });
+        }
+
+        MaterialButton sfGrantButton = view.findViewById(
+            R.id.buttonSmartForegroundGrant);
+        if (sfGrantButton != null) {
+            sfGrantButton.setOnClickListener(v -> openUsageAccessSettings());
+        }
 
         // ─── System property / Build sanitization ─────────────────
         bindSwitch(view, R.id.switchHideSystemProperties,
@@ -239,6 +294,7 @@ public class XStealthDetailSheet extends BottomSheetDialogFragment {
             });
 
         refresh(view);
+        updateSmartFgUi(view);
         sheetReady = true;
     }
 
@@ -277,7 +333,13 @@ public class XStealthDetailSheet extends BottomSheetDialogFragment {
     public void onResume() {
         super.onResume();
         View view = getView();
-        if (view != null) refresh(view);
+        if (view != null) {
+            refresh(view);
+            // Reload the smart-fg UI on resume so the grant button
+            // updates after the user returns from the usage-access
+            // settings screen.
+            updateSmartFgUi(view);
+        }
     }
 
     private void refresh(View view) {
@@ -315,6 +377,160 @@ public class XStealthDetailSheet extends BottomSheetDialogFragment {
         }
     }
 
+    /**
+     * Update the smart-foreground controls to match the current
+     * config.
+     *
+     * Design B: the state-change path is active when (a) at least
+     * one of the signal toggles is on, and (b) the scope is
+     * non-empty. The scope button is only meaningful when a signal
+     * toggle is on — if both are off, there's nothing for the
+     * foreground state change to write.
+     *
+     * The warning under the scope summary appears only when the
+     * scope is non-empty and a signal toggle is on. The grant
+     * button is visible only when PACKAGE_USAGE_STATS hasn't been
+     * granted.
+     */
+    private void updateSmartFgUi(View view) {
+        if (!isAdded()) return;
+        Context ctx = requireContext();
+
+        MaterialButton sfScopeButton = view.findViewById(
+            R.id.buttonSmartForegroundScope);
+        MaterialTextView sfScopeText = view.findViewById(
+            R.id.tvSmartForegroundScope);
+        MaterialTextView sfWarning = view.findViewById(
+            R.id.tvSmartForegroundWarning);
+        MaterialButton sfGrantButton = view.findViewById(
+            R.id.buttonSmartForegroundGrant);
+
+        boolean signalOn = XStealthPrefs.isHideDevOptions(ctx)
+                        || XStealthPrefs.isHideAdb(ctx);
+        boolean masterOn = XStealthPrefs.isEnabled(ctx);
+
+        // Scope list comes from the shell-side config. It's not in
+        // XStealthPrefs because it's not a single boolean — the
+        // manager reads it from the same xstealth.json the shell
+        // side reads, via a small loader.
+        List<String> scope = loadSmartForegroundScope(ctx);
+        int n = scope.size();
+
+        if (sfScopeButton != null) {
+            sfScopeButton.setEnabled(masterOn && signalOn);
+            sfScopeButton.setAlpha(masterOn && signalOn ? 1.0f : 0.5f);
+        }
+
+        if (sfScopeText != null) {
+            if (n == 0) {
+                sfScopeText.setText("No apps selected");
+            } else {
+                StringBuilder sb = new StringBuilder();
+                sb.append(n).append(n == 1 ? " app: " : " apps: ");
+                int shown = 0;
+                for (String p : scope) {
+                    if (shown >= 2) {
+                        sb.append(", +").append(n - 2).append(" more");
+                        break;
+                    }
+                    if (shown > 0) sb.append(", ");
+                    sb.append(p);
+                    shown++;
+                }
+                sfScopeText.setText(sb.toString());
+            }
+        }
+
+        if (sfWarning != null) {
+            boolean show = n > 0 && signalOn && masterOn;
+            sfWarning.setVisibility(show ? View.VISIBLE : View.GONE);
+        }
+
+        if (sfGrantButton != null) {
+            boolean hasUsage = hasUsageAccess(ctx);
+            sfGrantButton.setVisibility(
+                hasUsage ? View.GONE : View.VISIBLE);
+            sfGrantButton.setEnabled(masterOn);
+            sfGrantButton.setAlpha(masterOn ? 1.0f : 0.5f);
+        }
+    }
+
+    /**
+     * Read the smart-foreground scope from the shell-side config.
+     *
+     * The scope lives in xstealth.json, which the manager writes
+     * before launching a target. XStealthConfig.load() reads that
+     * file. It's the same loader the shell side uses.
+     *
+     * If the file isn't readable (for example, XStealth has never
+     * been pushed), returns an empty list.
+     */
+    private List<String> loadSmartForegroundScope(Context ctx) {
+        try {
+            XStealthConfig config = XStealthConfig.load();
+            if (config == null) return Collections.emptyList();
+            return new ArrayList<>(config.smartForegroundScope);
+        } catch (Throwable t) {
+            Log.d(TAG, "loadSmartForegroundScope: " + t.getMessage());
+            return Collections.emptyList();
+        }
+    }
+
+    /**
+     * Check whether PACKAGE_USAGE_STATS has been granted.
+     *
+     * Uses a throwaway ForegroundMonitor with an empty scope — the
+     * permission check doesn't need a scope, only the
+     * UsageStatsManager.
+     */
+    private boolean hasUsageAccess(Context ctx) {
+        try {
+            ForegroundMonitor mon = new ForegroundMonitor(
+                ctx, Collections.emptySet(), null);
+            return mon.hasUsageStatsPermission();
+        } catch (Throwable t) {
+            Log.d(TAG, "hasUsageAccess: " + t.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Open the system Usage access screen.
+     *
+     * Most ROMs expose ACTION_USAGE_ACCESS_SETTINGS, which takes
+     * the user straight to the per-app list. A few OEM ROMs omit
+     * it; the fallback is the top-level Settings app.
+     */
+    private void openUsageAccessSettings() {
+        if (!isAdded()) return;
+        try {
+            Intent i = new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS);
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (Throwable t) {
+            try {
+                Intent i = new Intent(Settings.ACTION_SETTINGS);
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(i);
+            } catch (Throwable ignored) {
+                Toast.makeText(requireContext(),
+                    "Could not open Settings",
+                    Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    private void openAppPickerForSmartForegroundScope() {
+        if (!isAdded()) return;
+        try {
+            SmartForegroundScopeSheet sheet =
+                SmartForegroundScopeSheet.newInstance();
+            sheet.show(getParentFragmentManager(), "smart_fg_scope");
+        } catch (Throwable t) {
+            Log.w(TAG, "open picker failed: " + t.getMessage());
+        }
+    }
+
     private void applyEnabledState(View view, boolean masterOn) {
         int[] ids = {
             R.id.switchNext,
@@ -331,6 +547,8 @@ public class XStealthDetailSheet extends BottomSheetDialogFragment {
             R.id.switchHideProcFs,
             R.id.switchApiProtection,
             R.id.switchDexOptimize,
+            R.id.buttonSmartForegroundScope,
+            R.id.buttonSmartForegroundGrant,
         };
         for (int id : ids) {
             View v = view.findViewById(id);

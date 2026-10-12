@@ -66,6 +66,8 @@ public final class XStealthPrefs {
     private static final String KEY_SCOPE_LEGACY      = "scope_legacy";
     private static final String KEY_SCOPE_MIGRATION   = "scope_migrated_5_5";
 
+    private static final String KEY_SMART_FG_SCOPE = "smart_fg_scope";
+
     private XStealthPrefs() {}
 
     private static SharedPreferences prefs(Context c) {
@@ -246,6 +248,15 @@ public final class XStealthPrefs {
             ? new HashSet<>()
             : new HashSet<>(scope);
         prefs(c).edit().putStringSet(KEY_SCOPE, copy).commit();
+    }
+
+    public static Set<String> getSmartForegroundScope(Context c) {
+        return prefs(c).getStringSet(KEY_SMART_FG_SCOPE,
+                                     Collections.emptySet());
+    }
+
+    public static void setSmartForegroundScope(Context c, Set<String> scope) {
+        prefs(c).edit().putStringSet(KEY_SMART_FG_SCOPE, scope).apply();
     }
 
     public static boolean isInScope(Context c, String pkg) {
