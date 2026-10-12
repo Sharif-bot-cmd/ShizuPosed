@@ -102,7 +102,66 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="Hide ADB enabled"
+            android:layout_marginBottom="8dp" />
+
+        <!-- ── Smart foreground controls (Design B) ────────────────
+             These three elements appear only under the two toggles
+             they apply to. They aren't a separate feature section;
+             they extend what "Hide Developer Options" and "Hide ADB
+             enabled" already do. -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/buttonSmartForegroundScope"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Watch apps for foreground hiding"
+            style="@style/Widget.Material3.Button.OutlinedButton"
             android:layout_marginBottom="4dp" />
+
+        <com.google.android.material.textview.MaterialTextView
+            android:id="@+id/tvSmartForegroundScope"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="No apps selected"
+            android:textSize="11sp"
+            android:textColor="?attr/colorOnSurfaceVariant"
+            android:paddingStart="4dp"
+            android:paddingEnd="4dp"
+            android:paddingBottom="4dp" />
+
+        <com.google.android.material.textview.MaterialTextView
+            android:id="@+id/tvSmartForegroundHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Tap the button above to pick apps. Until then, no state change will fire."
+            android:textSize="11sp"
+            android:textColor="?attr/colorOnSurfaceVariant"
+            android:paddingStart="4dp"
+            android:paddingEnd="4dp"
+            android:paddingBottom="4dp"
+            android:visibility="gone" />
+
+        <com.google.android.material.textview.MaterialTextView
+            android:id="@+id/tvSmartForegroundWarning"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Apps in this list trigger a state change while they're in the foreground: Developer Options and ADB are written to 0 through Shizuku. Shizuku and ShizuPosed are down for the duration. Read interception still applies to every app in the module scope, whether or not it's in this list."
+            android:textSize="11sp"
+            android:textColor="?attr/colorError"
+            android:paddingStart="4dp"
+            android:paddingEnd="4dp"
+            android:paddingBottom="8dp"
+            android:visibility="gone" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/buttonSmartForegroundGrant"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Grant usage access"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:visibility="gone"
+            android:layout_marginBottom="8dp" />
+
+        <!-- ── end smart foreground controls ──────────────────────── -->
 
         <com.google.android.material.materialswitch.MaterialSwitch
             android:id="@+id/switchHideShizuku"

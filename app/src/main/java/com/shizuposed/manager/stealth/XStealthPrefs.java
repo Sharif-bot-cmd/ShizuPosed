@@ -29,15 +29,17 @@ import java.util.Set;
  * stored as a Set<String> of package names under key "scope".
  *
  * An EMPTY scope means "apply to every app ShizuPosed launches."
- * This matches XStealth's historical behavior before scope existed,
- * so upgrading users see no change. A user who wants to narrow the
- * hiding to specific apps adds them to the scope; from that point
- * on, only those apps are affected.
  *
- * The effective check is:
- *   • scope.isEmpty()                     → applies everywhere
- *   • scope.contains(targetPackage)       → applies to that target
- *   • otherwise                           → does not apply
+ * SMART FOREGROUND SCOPE
+ * ----------------------
+ * A separate scope for the smart-foreground feature. When this
+ * scope is non-empty and at least one of the signal toggles
+ * (hideDevOptions / hideAdb) is on, the manager watches the
+ * foreground app and writes the relevant settings to 0 while a
+ * scoped package is in front.
+ *
+ * This scope is not the module scope. It lives under its own key
+ * and is written separately to xstealth.json.
  */
 public final class XStealthPrefs {
 
@@ -59,12 +61,14 @@ public final class XStealthPrefs {
     private static final String KEY_SCRUB_PROPERTIES  = "scrubShizuPosedProperties";
     private static final String KEY_SCRUB_THREADS     = "scrubThreadNames";
 
-    private static final String KEY_BRIDGE_ENABLED = "bridge_enabled";
+    private static final String KEY_BRIDGE_ENABLED    = "bridge_enabled";
 
     private static final String KEY_SCOPE             = "scope";
 
     private static final String KEY_SCOPE_LEGACY      = "scope_legacy";
     private static final String KEY_SCOPE_MIGRATION   = "scope_migrated_5_5";
+
+    private static final String KEY_SMART_FG_SCOPE    = "smart_fg_scope";
 
     private XStealthPrefs() {}
 
@@ -217,6 +221,7 @@ public final class XStealthPrefs {
     public static boolean isMethodBaselineEnabled(Context c) {
         return prefs(c).getBoolean("methodBaseline", true);
     }
+
     public static void setMethodBaselineEnabled(Context c, boolean v) {
         prefs(c).edit().putBoolean("methodBaseline", v).commit();
     }
@@ -224,6 +229,7 @@ public final class XStealthPrefs {
     public static boolean isUnsafeGateEnabled(Context c) {
         return prefs(c).getBoolean("unsafeGate", true);
     }
+
     public static void setUnsafeGateEnabled(Context c, boolean v) {
         prefs(c).edit().putBoolean("unsafeGate", v).commit();
     }
@@ -285,5 +291,50 @@ public final class XStealthPrefs {
 
     public static Set<String> getScopeReadonly(Context c) {
         return Collections.unmodifiableSet(getScope(c));
+    }
+
+    // ─── Smart foreground scope ──────────────────────────────────
+    //
+    // The list of packages whose foreground triggers the state
+    // change (Developer Options / ADB written to 0 through
+    // Shizuku). Empty means the state change never runs.
+    //
+    // Reads return a defensive copy: SharedPreferences.getStringSet
+    // returns an internal set that must not be mutated. Callers
+    // expect a set they can freely modify.
+    //
+    // Writes use commit(), matching every other setter in this
+    // class, so the value survives process death on ROMs with
+    // aggressive background killers.
+
+    public static Set<String> getSmartForegroundScope(Context c) {
+        try {
+            Set<String> stored = prefs(c).getStringSet(
+                KEY_SMART_FG_SCOPE, null);
+            if (stored == null) return new HashSet<>();
+            return new HashSet<>(stored);
+        } catch (Throwable t) {
+            return new HashSet<>();
+        }
+    }
+
+    public static void setSmartForegroundScope(Context c, Set<String> scope) {
+        HashSet<String> copy = (scope == null)
+            ? new HashSet<>()
+            : new HashSet<>(scope);
+        prefs(c).edit().putStringSet(KEY_SMART_FG_SCOPE, copy).commit();
+    }
+
+    public static boolean isSmartForegroundScoped(Context c, String pkg) {
+        if (pkg == null) return false;
+        return getSmartForegroundScope(c).contains(pkg);
+    }
+
+    public static int getSmartForegroundScopeCount(Context c) {
+        return getSmartForegroundScope(c).size();
+    }
+
+    public static void clearSmartForegroundScope(Context c) {
+        prefs(c).edit().remove(KEY_SMART_FG_SCOPE).commit();
     }
 }

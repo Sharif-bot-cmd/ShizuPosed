@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:gravity="center_vertical"
+    android:paddingStart="24dp"
+    android:paddingEnd="24dp"
+    android:paddingTop="8dp"
+    android:paddingBottom="8dp"
+    android:background="?attr/selectableItemBackground"
+    android:clickable="true"
+    android:focusable="true">
+
+    <ImageView
+        android:id="@+id/imgAppIcon"
+        android:layout_width="40dp"
+        android:layout_height="40dp"
+        android:layout_marginEnd="12dp"
+        android:contentDescription="@null" />
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <com.google.android.material.textview.MaterialTextView
+                android:id="@+id/tvAppLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="App name"
+                android:textSize="15sp"
+                android:textColor="?attr/colorOnSurface"
+                android:maxLines="1"
+                android:ellipsize="end" />
+
+            <com.google.android.material.textview.MaterialTextView
+                android:id="@+id/tvSystemChip"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="System"
+                android:textSize="10sp"
+                android:textColor="?attr/colorOnSurfaceVariant"
+                android:paddingStart="6dp"
+                android:paddingEnd="6dp"
+                android:paddingTop="1dp"
+                android:paddingBottom="1dp"
+                android:layout_marginStart="8dp"
+                android:background="?attr/colorSurfaceVariant"
+                android:visibility="gone" />
+        </LinearLayout>
+
+        <com.google.android.material.textview.MaterialTextView
+            android:id="@+id/tvAppPackage"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="com.example.app"
+            android:textSize="11sp"
+            android:textColor="?attr/colorOnSurfaceVariant"
+            android:maxLines="1"
+            android:ellipsize="end" />
+    </LinearLayout>
+
+    <CheckBox
+        android:id="@+id/checkApp"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:clickable="false"
+        android:focusable="false" />
+</LinearLayout>
