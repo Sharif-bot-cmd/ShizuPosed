@@ -3,6 +3,8 @@ package com.shizuposed.manager.service;
 import android.app.Notification;
 import android.app.NotificationManager;
 import android.app.Service;
+import android.app.usage.UsageEvents;
+import android.app.usage.UsageStatsManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
@@ -10,7 +12,9 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.Process;
+import android.provider.Settings;
 
 import androidx.core.app.NotificationCompat;
 
@@ -26,15 +30,20 @@ import com.shizuposed.manager.runtime.RuntimePrefs;
 import com.shizuposed.manager.utils.FileUtils;
 import com.shizuposed.manager.utils.Logger;
 import com.shizuposed.manager.utils.ShellUtils;
-import com.shizuposed.manager.stealth.XStealthModule;
+import com.shizuposed.manager.stealth.SmartForegroundController;
+import com.shizuposed.manager.stealth.XStealthPrefs;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.InputStream;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -53,20 +62,19 @@ public class ShizuPosedService extends Service {
         "com.shizuposed.manager.ACTION_LAUNCH_APP";
     public static final String EXTRA_LAUNCH_PACKAGE = "package";
 
-    /**
-     * Fired by ShizukuBinderWatcher (and safe to fire from anywhere
-     * else that detects Shizuku's binder returning) to restart the
-     * service's worker path without user interaction. Idempotent:
-     * if the service is already running and authorized, this is a
-     * no-op.
-     */
     public static final String ACTION_ENSURE_RUNNING =
         "com.shizuposed.manager.action.ENSURE_RUNNING";
 
-    /** Removes shell-side logs (launch.log and variants). */
+    public static final String ACTION_DISABLE_DEV_SETTINGS =
+        "com.shizuposed.manager.action.DISABLE_DEV_SETTINGS";
+
+    public static final String ACTION_RESTORE_DEV_SETTINGS =
+        "com.shizuposed.manager.action.RESTORE_DEV_SETTINGS";
+
+    public static final String EXTRA_SMART_FG_PACKAGE = "smartFgPackage";
+
     public static final String ACTION_CLEAR_LOGS =
         "com.shizuposed.manager.ACTION_CLEAR_LOGS";
-    /** Removes shell-side caches (dex, libs, modules, markers). */
     public static final String ACTION_CLEAN_ALL =
         "com.shizuposed.manager.ACTION_CLEAN_ALL";
 
@@ -76,12 +84,6 @@ public class ShizuPosedService extends Service {
     public static final String EXTRA_LAUNCH_MSG = "message";
     public static final String EXTRA_LAUNCH_PKG = "package";
 
-    /**
-     * Sentinel package name used for maintenance-action results
-     * broadcast on ACTION_LAUNCH_RESULT. The UI's launch-result
-     * receiver checks for this value and treats the result as a
-     * maintenance result rather than a launch result.
-     */
     public static final String MAINTENANCE_RESULT_PKG = "__logs__";
 
     private static final String[] SHELL_BASE_CANDIDATES = {
@@ -104,7 +106,6 @@ public class ShizuPosedService extends Service {
 
     private static final boolean REQUIRE_AUTHORIZATION = true;
 
-    /** Absolute paths for spawn tools. */
     private static final String ABS_SH      = "/system/bin/sh";
     private static final String ABS_SETSID  = "/system/bin/setsid";
     private static final String ABS_NOHUP   = "/system/bin/nohup";
@@ -113,9 +114,16 @@ public class ShizuPosedService extends Service {
     private static final long BOOTSTRAP_MAX_WAIT_MS = 8000L;
     private static final long BOOTSTRAP_POLL_MS = 250L;
 
-    // ═════════════════════════════════════════════════════════════
-    // SPAWN-TOOL PROBE (cached once per process)
-    // ═════════════════════════════════════════════════════════════
+    /**
+     * Window used by isAnyWatchedPackageForeground() when deciding
+     * whether a restore is safe. Must be larger than the
+     * ForegroundMonitor freshness window (1500 ms) so a live app is
+     * always detected, and small enough that a recently-left app
+     * isn't still counted. 5 s is a comfortable margin.
+     */
+    private static final long FOREGROUND_CHECK_WINDOW_MS = 5_000L;
+
+    private static final String SMART_FG_STATE_FILE = "smart_fg_state";
 
     private static volatile boolean sSpawnFormResolved = false;
     private static volatile boolean sSetsidAvailable = false;
@@ -153,14 +161,13 @@ public class ShizuPosedService extends Service {
     private final AtomicBoolean modulesPushed = new AtomicBoolean(false);
     private volatile long modulesPushedAt = 0L;
 
-    /** Set once setupWorkerInfrastructure() has been called at least once. */
     private final AtomicBoolean workerSetupStarted = new AtomicBoolean(false);
 
-    /**
-     * Packages with a monitor-triggered launch currently in flight.
-     * Prevents the scan interval from queuing a second launch for a
-     * package whose first launch hasn't finished yet.
-     */
+    private final AtomicBoolean writeSecureSettingsChecked =
+        new AtomicBoolean(false);
+
+    private static volatile boolean sWriteSecureEffective = false;
+
     private final java.util.Set<String> inFlightLaunches =
         java.util.concurrent.ConcurrentHashMap.newKeySet();
 
@@ -368,24 +375,35 @@ public class ShizuPosedService extends Service {
 
         try {
             startForeground(NOTIFICATION_ID,
-                buildNotification("Service starting"));
+                buildNotification("Service running"));
             foregroundStarted.set(true);
+            logger = Logger.getInstance(this);
+            logger.i("ShizuPosedService foreground promoted");
         } catch (Throwable t) {
+            foregroundStarted.set(false);
             android.util.Log.e("ShizuPosedService",
-                "startForeground failed in onCreate", t);
-            isServiceRunning = false;
-            stopSelf();
-            return;
+                "startForeground failed — continuing as background service", t);
+            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                try {
+                    startForeground(NOTIFICATION_ID,
+                        buildNotification("Service running"));
+                    foregroundStarted.set(true);
+                    if (logger != null) {
+                        logger.i("ShizuPosedService foreground promoted "
+                            + "on retry");
+                    }
+                } catch (Throwable t2) {
+                    android.util.Log.e("ShizuPosedService",
+                        "startForeground retry failed — staying background", t2);
+                }
+            }, 2000L);
         }
 
-        logger = Logger.getInstance(this);
+        if (logger == null) {
+            logger = Logger.getInstance(this);
+        }
         logger.i("ShizuPosedService creating...");
 
-        // Set up the worker infrastructure regardless of auth
-        // state. If Shizuku isn't responding yet, the worker sits
-        // idle and waits for ACTION_SHIZUKU_AUTHORIZED to trigger
-        // the deploy. The service never self-stops on a transient
-        // auth failure.
         if (REQUIRE_AUTHORIZATION && !isAuthorizedNow()) {
             logger.w("onCreate: Shizuku not currently responsive — "
                 + "deferring deploy; will resume on authorization");
@@ -394,10 +412,6 @@ public class ShizuPosedService extends Service {
         setupWorkerInfrastructure();
     }
 
-    /**
-     * Set up the worker thread, launch executor, and component
-     * references. Idempotent: safe to call multiple times.
-     */
     private synchronized void setupWorkerInfrastructure() {
         if (!workerSetupStarted.compareAndSet(false, true)) {
             return;
@@ -443,6 +457,10 @@ public class ShizuPosedService extends Service {
                 String shellBase = resolveShellBaseDir();
                 logger.i("Shell base:         " + shellBase);
 
+                reconcilePendingSmartFgState();
+
+                ensureWriteSecureSettingsGranted();
+
                 if (shizukuHelper.isAuthorized()) {
                     probeSpawnTools();
                     startServiceInternal();
@@ -486,13 +504,13 @@ public class ShizuPosedService extends Service {
                         + "worker ready — will dispatch after setup");
                 }
             }
-            return START_STICKY;
+            return START_NOT_STICKY;
         }
 
         if (intent != null) {
             String action = intent.getAction();
             if (action == null) {
-                return START_STICKY;
+                return START_NOT_STICKY;
             }
 
             switch (action) {
@@ -506,6 +524,38 @@ public class ShizuPosedService extends Service {
                     onEnsureRunning();
                     break;
 
+                case ACTION_DISABLE_DEV_SETTINGS: {
+                    final String pkg = intent.getStringExtra(
+                        EXTRA_SMART_FG_PACKAGE);
+                    logger.i("ACTION_DISABLE_DEV_SETTINGS for " + pkg);
+                    workerHandler.post(() -> {
+                        try {
+                            String result = disableDevSettings(pkg);
+                            logger.i("smart-fg disable result: " + result);
+                        } catch (Throwable t) {
+                            logger.w("smart-fg disable threw: "
+                                + t.getMessage());
+                        }
+                    });
+                    break;
+                }
+
+                case ACTION_RESTORE_DEV_SETTINGS: {
+                    final String pkg = intent.getStringExtra(
+                        EXTRA_SMART_FG_PACKAGE);
+                    logger.i("ACTION_RESTORE_DEV_SETTINGS for " + pkg);
+                    workerHandler.post(() -> {
+                        try {
+                            String result = restoreDevSettings(pkg);
+                            logger.i("smart-fg restore result: " + result);
+                        } catch (Throwable t) {
+                            logger.w("smart-fg restore threw: "
+                                + t.getMessage());
+                        }
+                    });
+                    break;
+                }
+
                 case ACTION_LAUNCH_APP: {
                     final String target =
                         intent.getStringExtra(EXTRA_LAUNCH_PACKAGE);
@@ -516,8 +566,6 @@ public class ShizuPosedService extends Service {
                             String failReason = null;
                             boolean ok = false;
                             try {
-                                // The button path opens the UI. This
-                                // is what a self-hooking module needs.
                                 ok = launchAppUnderShizuPosed(target, sent);
                             } catch (Throwable t) {
                                 failReason = t.getMessage();
@@ -568,7 +616,7 @@ public class ShizuPosedService extends Service {
             }
         }
 
-        return START_STICKY;
+        return START_NOT_STICKY;
     }
 
     @Override
@@ -606,23 +654,9 @@ public class ShizuPosedService extends Service {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // ENSURE RUNNING (fired by ShizukuBinderWatcher)
+    // ENSURE RUNNING
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Idempotent entry point for "make sure the service's worker
-     * path is running with a live Shizuku connection."
-     *
-     * Called from onStartCommand when ACTION_ENSURE_RUNNING
-     * arrives. Three cases:
-     *
-     *   1. Worker ready and Shizuku authorized → re-run the
-     *      payload readiness and startup sequence.
-     *   2. Worker ready but Shizuku not authorized → do nothing;
-     *      ACTION_SHIZUKU_AUTHORIZED handles it.
-     *   3. Worker not yet set up → setupWorkerInfrastructure()
-     *      will set it up.
-     */
     private void onEnsureRunning() {
         if (logger != null) {
             logger.i("onEnsureRunning: isRunning=" + isRunning.get()
@@ -662,6 +696,353 @@ public class ShizuPosedService extends Service {
                 }
             }
         });
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // SMART FOREGROUND
+    // ═════════════════════════════════════════════════════════════
+
+    private void reconcilePendingSmartFgState() {
+        File stateFile = new File(getFilesDir(), SMART_FG_STATE_FILE);
+        if (!stateFile.exists()) return;
+
+        if (!shizukuHelper.isAuthorized()) {
+            logger.w("startup: pending smart-fg state found but "
+                + "Shizuku not authorized — restore deferred");
+            SmartForegroundController.markPendingRestore(this);
+            return;
+        }
+
+        // Do not restore if a watched app is currently in the
+        // foreground. The state file means "a disable is in effect";
+        // if the app that triggered it is still open, the disable is
+        // still correct and must be left alone.
+        if (isAnyWatchedPackageForeground()) {
+            logger.i("startup: pending smart-fg state found, but a "
+                + "watched app is still foreground — keeping disable, "
+                + "restore deferred");
+            return;
+        }
+
+        logger.w("startup: pending smart-fg state found and no watched "
+            + "app is foreground — restoring prior values");
+        try {
+            String result = restoreDevSettings("(startup-reconcile)");
+            logger.i("startup: reconcile result: " + result);
+        } catch (Throwable t) {
+            logger.w("startup: reconcile threw: " + t.getMessage());
+        }
+    }
+
+    /**
+     * True if any package in the smart-foreground scope is currently
+     * the top resumed activity. Uses the same freshness logic as
+     * ForegroundMonitor — a package is foreground if its most recent
+     * event in the window was ACTIVITY_RESUMED and that resume is
+     * recent.
+     *
+     * Called from the worker thread during service setup and from
+     * restoreDevSettings, so it must be cheap. queryEvents on a
+     * 5-second window is a few ms.
+     */
+    private boolean isAnyWatchedPackageForeground() {
+        try {
+            UsageStatsManager usm = (UsageStatsManager)
+                getSystemService(Context.USAGE_STATS_SERVICE);
+            if (usm == null) return false;
+
+            Set<String> scope =
+                XStealthPrefs.getSmartForegroundScope(this);
+            if (scope == null || scope.isEmpty()) return false;
+
+            long now = System.currentTimeMillis();
+            long windowStart = now - FOREGROUND_CHECK_WINDOW_MS;
+            UsageEvents events = usm.queryEvents(windowStart, now);
+            if (events == null) return false;
+
+            Map<String, Integer> lastEvent = new HashMap<>();
+            UsageEvents.Event e = new UsageEvents.Event();
+            while (events.hasNextEvent()) {
+                events.getNextEvent(e);
+                String pkg = e.getPackageName();
+                if (pkg == null) continue;
+                int type = e.getEventType();
+                if (type == UsageEvents.Event.ACTIVITY_RESUMED
+                        || type == UsageEvents.Event.ACTIVITY_PAUSED
+                        || type == UsageEvents.Event.ACTIVITY_STOPPED) {
+                    lastEvent.put(pkg, type);
+                }
+            }
+
+            for (String pkg : scope) {
+                Integer t = lastEvent.get(pkg);
+                if (t != null && t == UsageEvents.Event.ACTIVITY_RESUMED) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Throwable t) {
+            logger.w("isAnyWatchedPackageForeground failed: "
+                + t.getMessage());
+            return false;
+        }
+    }
+
+    private String disableDevSettings(String pkg) {
+        boolean wantAdb = XStealthPrefs.isHideAdb(this)
+            && sWriteSecureEffective;
+
+        if (!wantAdb) {
+            return "adb_enabled not enabled in prefs (or gated)";
+        }
+
+        File stateFile = new File(getFilesDir(), SMART_FG_STATE_FILE);
+        if (stateFile.exists()) {
+            return "already disabled (saved state present)";
+        }
+
+        try {
+            String currentAdb = readGlobalSetting("adb_enabled");
+            if (currentAdb == null) currentAdb = "1";
+            String currentAdbWifi = readGlobalSetting("adb_wifi_enabled");
+            boolean hasAdbWifi = currentAdbWifi != null;
+
+            boolean okAdb = writeGlobalSetting("adb_enabled", "0");
+            boolean okAdbWifi = !hasAdbWifi
+                || writeGlobalSetting("adb_wifi_enabled", "0");
+
+            if (!okAdb || !okAdbWifi) {
+                if (stateFile.exists()) stateFile.delete();
+                logger.w("smart-fg: disable failed for " + pkg
+                    + " (adb=" + okAdb + " adbWifi=" + okAdbWifi
+                    + ") — no state written");
+                return "write failed (adb=" + okAdb
+                    + " adbWifi=" + okAdbWifi + ")";
+            }
+
+            try (FileWriter w = new FileWriter(stateFile, false)) {
+                w.write("-");                           // line 1: dev, unused
+                w.write("\n");
+                w.write(currentAdb);                    // line 2: adb
+                w.write("\n");
+                w.write(hasAdbWifi ? currentAdbWifi : "-"); // line 3: adb_wifi
+                w.write("\n");
+            }
+            stateFile.setReadable(true, false);
+            SmartForegroundController.markPendingRestore(this);
+
+            logger.i("smart-fg: disabled for " + pkg
+                     + " (adb=" + currentAdb
+                     + " adbWifi=" + (hasAdbWifi ? currentAdbWifi : "n/a")
+                     + ")");
+            return "disabled";
+        } catch (Throwable t) {
+            if (stateFile.exists()) stateFile.delete();
+            logger.w("smart-fg: disable failed: " + t.getMessage());
+            return "error: " + t.getMessage();
+        }
+    }
+
+    /**
+     * Restore the values captured in disableDevSettings.
+     *
+     * Never restores while a watched app is still foreground. A
+     * restore triggered by service restart, monitor restart, or
+     * recoverIfNeeded would otherwise undo the disable while the
+     * user is still inside the app that the disable exists for —
+     * which looked like "Dev Options and ADB turned back on
+     * without my consent". In that case, the restore is deferred
+     * (pending flag re-armed) and a later call runs it once the
+     * watched app has actually left.
+     */
+    private String restoreDevSettings(String pkg) {
+        File stateFile = new File(getFilesDir(), SMART_FG_STATE_FILE);
+        if (!stateFile.exists()) {
+            return "nothing to restore";
+        }
+
+        if (isAnyWatchedPackageForeground()) {
+            logger.i("smart-fg: restore for " + pkg
+                + " skipped — a watched app is still foreground");
+            SmartForegroundController.markPendingRestore(this);
+            return "deferred (watched app still foreground)";
+        }
+
+        try {
+            String dev = "-";
+            String adb = "-";
+            String adbWifi = "-";
+            try (BufferedReader r = new BufferedReader(
+                    new FileReader(stateFile))) {
+                String l1 = r.readLine();
+                String l2 = r.readLine();
+                String l3 = r.readLine();
+                if (l1 != null && !l1.isEmpty()) dev = l1.trim();
+                if (l2 != null && !l2.isEmpty()) adb = l2.trim();
+                if (l3 != null && !l3.isEmpty()) adbWifi = l3.trim();
+            }
+
+            boolean wantDev = !"-".equals(dev);
+            boolean wantAdb = !"-".equals(adb);
+            boolean wantAdbWifi = !"-".equals(adbWifi);
+
+            boolean okDev = !wantDev
+                || writeGlobalSetting("development_settings_enabled", dev);
+            boolean okAdb = !wantAdb
+                || writeGlobalSetting("adb_enabled", adb);
+            boolean okAdbWifi = !wantAdbWifi
+                || writeGlobalSetting("adb_wifi_enabled", adbWifi);
+
+            if (okDev && okAdb && okAdbWifi) {
+                stateFile.delete();
+                SmartForegroundController.clearPendingRestore(this);
+                logger.i("smart-fg: restored for " + pkg
+                         + " (dev=" + dev
+                         + " adb=" + adb
+                         + " adbWifi=" + adbWifi + ")");
+                return "restored";
+            } else {
+                SmartForegroundController.markPendingRestore(this);
+                logger.w("smart-fg: restore partial (dev=" + okDev
+                         + " adb=" + okAdb
+                         + " adbWifi=" + okAdbWifi
+                         + ") — state kept for retry");
+                return "partial: dev=" + okDev
+                    + " adb=" + okAdb
+                    + " adbWifi=" + okAdbWifi;
+            }
+        } catch (Throwable t) {
+            SmartForegroundController.markPendingRestore(this);
+            logger.w("smart-fg: restore failed: " + t.getMessage());
+            return "error: " + t.getMessage();
+        }
+    }
+
+    private String readGlobalSetting(String key) {
+        try {
+            String direct = Settings.Global.getString(
+                getContentResolver(), key);
+            if (direct != null) return direct;
+        } catch (Throwable t) {
+            logger.d("readGlobalSetting direct failed for " + key
+                + ": " + t.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Write a Settings.Global value through the manager's own
+     * ContentResolver, then read it back to confirm the write
+     * actually took.
+     *
+     * The read-back is important because some ROMs (and some
+     * banking apps in their own anti-tamper logic) will revert
+     * development_settings_enabled / adb_enabled shortly after the
+     * write. When that happens, putInt returns true, but a read a
+     * few ms later returns the old value. Logging the mismatch
+     * makes it visible instead of silently letting the disable
+     * evaporate.
+     *
+     * Direct-only. No shell fallback, ever — writing adb_enabled
+     * over Shizuku tears down the ADB transport and kills
+     * Shizuku's binder, which is what the banking app was
+     * detecting.
+     */
+    private boolean writeGlobalSetting(String key, String value) {
+        try {
+            int intValue = -1;
+            boolean isInt = true;
+            try {
+                intValue = Integer.parseInt(value);
+            } catch (NumberFormatException nfe) {
+                isInt = false;
+            }
+
+            boolean ok;
+            if (isInt) {
+                ok = Settings.Global.putInt(
+                    getContentResolver(), key, intValue);
+            } else {
+                ok = Settings.Global.putString(
+                    getContentResolver(), key, value);
+            }
+
+            if (!ok) {
+                logger.w("writeGlobalSetting direct returned false for "
+                    + key + " = " + value
+                    + " — setting left unchanged");
+                return false;
+            }
+
+            if (!sWriteSecureEffective) {
+                sWriteSecureEffective = true;
+                logger.i("writeGlobalSetting: direct path effective "
+                    + "— direct writes enabled for the rest of this "
+                    + "process");
+            }
+
+            // Read back to confirm the value stuck. A ROM or
+            // another process may have reverted it.
+            String after = readGlobalSetting(key);
+            if (after != null && !after.equals(value)) {
+                logger.w("writeGlobalSetting: " + key + " write to "
+                    + value + " did not stick — read back = " + after
+                    + ". Something is reverting the setting.");
+            } else {
+                logger.d("writeGlobalSetting direct: " + key
+                    + " = " + value
+                    + (after != null ? " (verified)" : ""));
+            }
+            return true;
+
+        } catch (SecurityException se) {
+            sWriteSecureEffective = false;
+            logger.w("writeGlobalSetting direct denied for " + key
+                + " = " + value + ": " + se.getMessage()
+                + " — setting left unchanged. WRITE_SECURE_SETTINGS "
+                + "will be effective after the next service restart.");
+            return false;
+        } catch (Throwable t) {
+            sWriteSecureEffective = false;
+            logger.w("writeGlobalSetting direct threw for " + key
+                + " = " + value + ": " + t.getMessage()
+                + " — setting left unchanged");
+            return false;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // WRITE_SECURE_SETTINGS BOOTSTRAP
+    // ═════════════════════════════════════════════════════════════
+
+    private void ensureWriteSecureSettingsGranted() {
+        if (!writeSecureSettingsChecked.compareAndSet(false, true)) {
+            return;
+        }
+        if (!shizukuHelper.isAuthorized()) {
+            writeSecureSettingsChecked.set(false);
+            return;
+        }
+
+        String pkg = getPackageName();
+        try {
+            ShellUtils.CommandResult r = shizukuHelper.executeCommand(
+                "pm grant " + pkg
+                + " android.permission.WRITE_SECURE_SETTINGS");
+            if (r != null && r.isSuccess()) {
+                logger.i("bootstrap: pm grant WRITE_SECURE_SETTINGS "
+                    + "succeeded for " + pkg);
+            } else {
+                logger.w("bootstrap: pm grant WRITE_SECURE_SETTINGS "
+                    + "returned non-zero: stdout=["
+                    + (r != null ? r.getStdoutString() : "null")
+                    + "] stderr=["
+                    + (r != null ? r.getStderrString() : "null") + "]");
+            }
+        } catch (Throwable t) {
+            logger.w("bootstrap: pm grant WRITE_SECURE_SETTINGS "
+                + "failed: " + t.getMessage());
+        }
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -757,25 +1138,11 @@ public class ShizuPosedService extends Service {
         }
     }
 
-    /**
-     * Diagnostic for "module shows not activated." Called from the
-     * Logs tab. Checks, for a given module package:
-     *
-     *   1. Is the module in the manager's module list?
-     *   2. Does the module's cached dex exist?
-     *   3. Is the module scoped to any app?
-     *   4. Have any markers been written that list this module?
-     *   5. Does the module's manifest need a <queries> declaration
-     *      for the status provider (Android 11+)?
-     *
-     * Returns a human-readable report. Nothing here changes state.
-     */
     public String diagnoseModuleActivation(String modulePackage) {
         StringBuilder sb = new StringBuilder();
         sb.append("Diagnostic for ").append(modulePackage).append("\n");
 
         try {
-            // 1. In module list?
             List<ModuleInfo> all = moduleLoader.loadModules();
             ModuleInfo mi = null;
             for (ModuleInfo m : all) {
@@ -794,7 +1161,6 @@ public class ShizuPosedService extends Service {
             sb.append("  Enabled: ")
               .append(mi.enabled ? "yes" : "NO").append("\n");
 
-            // 2. Dex present?
             boolean dexOk = mi.cachedDexPath != null
                 && new File(mi.cachedDexPath).exists();
             sb.append("  Cached dex: ")
@@ -804,13 +1170,11 @@ public class ShizuPosedService extends Service {
                     + "Try Settings → Maintenance → Repush modules.\n");
             }
 
-            // 3. Scope?
             int scoped = mi.hookedApps != null ? mi.hookedApps.size() : 0;
             sb.append("  Scoped to ").append(scoped).append(" app(s)");
             if (mi.hookAllApps) sb.append(" (all apps)");
             sb.append("\n");
 
-            // 4. Marker listing the module?
             boolean anyMarker = false;
             int markerCount = 0;
             try {
@@ -837,7 +1201,6 @@ public class ShizuPosedService extends Service {
                     + "re-run this diagnostic.\n");
             }
 
-            // 5. Manifest <queries> note.
             sb.append("  Manifest <queries> check: not queryable from here.\n");
             sb.append("  → On Android 11+, the module must declare:\n");
             sb.append("      <queries>\n");
@@ -969,44 +1332,12 @@ public class ShizuPosedService extends Service {
     // LOCAL STAGING
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Stage XposedHook.dex from the APK's assets to the local
-     * staging path.
-     *
-     * WHY THIS VERIFIES INSTEAD OF TRUSTING A NON-EMPTY FILE
-     * -----------------------------------------------------
-     * The previous version returned early if the staged file
-     * existed and had non-zero length. That was wrong for updates:
-     * the staging path lives on the app's external files dir
-     * (/storage/emulated/0/Android/data/<pkg>/files), which the OS
-     * preserves across installs. So after an update, the staged
-     * copy was still the previous APK's dex, and it got deployed to
-     * the shell side unchanged — the shell-side XposedHook.dex
-     * stayed at the old version indefinitely.
-     *
-     * This version reads the APK's asset every time and compares
-     * it, by size and content hash, against the staged copy. If
-     * they match, the staged copy is reused (no rewrite). If they
-     * differ, the staged copy is rewritten from the asset.
-     *
-     * Size alone isn't enough: the previous dex and the new dex
-     * can have the same length by coincidence, and the shell-side
-     * file would then never refresh. So both size and SHA-256 of
-     * the content are compared.
-     *
-     * Returns true on success, false if the asset can't be read or
-     * the file can't be written. Failure is non-destructive: the
-     * previous staged copy is left in place if the new write
-     * fails, so a transient I/O error doesn't wipe the payload.
-     */
     private boolean stageDexLocally() {
         try {
             File staged = new File(localStagingDexPath);
             File parent = staged.getParentFile();
             if (parent != null && !parent.exists()) parent.mkdirs();
 
-            // Read the current asset into memory. XposedHook.dex is
-            // a few hundred KB, small enough that this is cheap.
             byte[] assetBytes;
             try (InputStream is = getAssets().open("XposedHook.dex")) {
                 assetBytes = readAllBytes(is);
@@ -1020,7 +1351,6 @@ public class ShizuPosedService extends Service {
                 return false;
             }
 
-            // Compare against what's already staged.
             if (staged.exists() && staged.isFile()
                     && staged.length() == assetBytes.length) {
                 byte[] stagedBytes;
@@ -1052,10 +1382,6 @@ public class ShizuPosedService extends Service {
                     + assetBytes.length + " bytes");
             }
 
-            // Write to a temp file in the same directory, then
-            // rename. This guarantees the staged path either holds
-            // the complete new content or the previous content —
-            // never a half-written file.
             File tmp = new File(staged.getAbsolutePath() + ".tmp");
             try (FileOutputStream fos = new FileOutputStream(tmp)) {
                 fos.write(assetBytes);
@@ -1106,11 +1432,6 @@ public class ShizuPosedService extends Service {
 
             File dst = new File(localStagingLibDir, libName);
 
-            // Read both files and compare their SHA-256. The
-            // libraries are small (tens of KB each) so this is
-            // cheap. Reading into memory also avoids a partial-write
-            // race that comparing sizes over two separate stat calls
-            // would have.
             byte[] srcBytes = readFileBytes(src);
             if (srcBytes == null || srcBytes.length == 0) {
                 logger.e("stageNativeLib: could not read source: "
@@ -1138,8 +1459,6 @@ public class ShizuPosedService extends Service {
                     + " — staging " + srcBytes.length + " bytes");
             }
 
-            // Write to a temp file then rename, so a partial write
-            // can't leave a corrupt library in place.
             File tmp = new File(dst.getAbsolutePath() + ".tmp");
             try (FileOutputStream out = new FileOutputStream(tmp)) {
                 out.write(srcBytes);
@@ -1234,10 +1553,11 @@ public class ShizuPosedService extends Service {
             shizukuHelper.executeCommand("mkdir -p " + libsDir);
             shizukuHelper.executeCommand("mkdir -p " + modulesDir);
             shizukuHelper.executeCommand("mkdir -p " + hookedDir);
+
             shizukuHelper.executeCommand("chmod 755 " + base
                 + " " + libsDir
-                + " " + modulesDir
-                + " " + hookedDir);
+                + " " + modulesDir);
+            shizukuHelper.executeCommand("chmod 777 " + hookedDir);
 
             logger.i("XposedHook.dex deployed to: " + dexPath);
             dexDeployed.set(true);
@@ -1444,10 +1764,6 @@ public class ShizuPosedService extends Service {
                 File apkCopy = new File(
                     getApplicationInfo().nativeLibraryDir, lib);
                 if (!apkCopy.exists()) {
-                    // The APK doesn't ship this lib. Skip it — some
-                    // builds omit optional libraries (e.g. libcallsite
-                    // when CallSite isn't built), and a missing
-                    // optional library isn't a reason to redeploy.
                     logger.d("nativeLibsPresentOnShell: " + lib
                         + " not in APK — skipping");
                     continue;
@@ -1738,6 +2054,9 @@ public class ShizuPosedService extends Service {
         }
         workerHandler.post(() -> {
             try {
+                writeSecureSettingsChecked.set(false);
+                ensureWriteSecureSettingsGranted();
+
                 if (ensurePayloadReady()) {
                     prepareXposedHook();
                 }
@@ -1780,44 +2099,12 @@ public class ShizuPosedService extends Service {
         }
     }
 
-    /**
-     * Fast presence check for the specific process app_process
-     * spawned for this package.
-     *
-     * Three tiers, tried in order:
-     *
-     *   1. pgrep -f — fastest and most precise. Searches the full
-     *      /proc/<pid>/cmdline. Present on every Android 10+ device
-     *      via toybox, but a small number of custom ROMs ship a
-     *      busybox or a minimal toybox that lacks it.
-     *
-     *   2. ps + /proc read — portable fallback. Lists processes
-     *      with `ps -A -o PID,NAME`, filters to app_process-like
-     *      names (this is the truncated column, but NAME is short
-     *      and never truncated), then reads /proc/<pid>/cmdline
-     *      for each candidate. The full cmdline is read from the
-     *      kernel, not from ps, so truncation doesn't matter.
-     *
-     *   3. /proc scan — last resort if ps is also missing. Walks
-     *      /proc/[0-9]* and reads cmdline for each. Slower, but
-     *      only runs if the first two fail.
-     *
-     * Every tier looks for `XposedHook <pkg>`, which is unique to
-     * the bootstrapped process. The pattern is not just the package
-     * name, because the target app's own process also contains that
-     * — and we specifically want the app_process one.
-     */
     private boolean isTargetProcessPresent(String packageName) {
         if (packageName == null || packageName.isEmpty()) return false;
 
-        // The exact substring the spawned process's cmdline contains.
-        // app_process is invoked as:
-        //   /system/bin/app_process64 ... com.shizuposed.manager.core.XposedHook <pkg> 0 <uid>
-        // so the combination `XposedHook <pkg>` is unique to it.
         final String needle =
             "com.shizuposed.manager.core.XposedHook " + packageName;
 
-        // ── Tier 1: pgrep -f ─────────────────────────────────
         try {
             String script =
                 "command -v pgrep >/dev/null 2>&1 "
@@ -1846,7 +2133,7 @@ public class ShizuPosedService extends Service {
                 +     "| awk '{print $1}'); do "
                 + "  [ -r \"/proc/$p/cmdline\" ] || continue; "
                 + "  if tr '\\0' ' ' < \"/proc/$p/cmdline\" 2>/dev/null "
-                + "     | grep -qF -- '" + needle + "'; then "
+                +     "| grep -qF -- '" + needle + "'; then "
                 + "    echo FOUND; exit 0; "
                 + "  fi; "
                 + "done; "
@@ -1986,20 +2273,11 @@ public class ShizuPosedService extends Service {
         return null;
     }
 
-    /**
-     * Routed launch. The one-argument form opens the UI and
-     * broadcasts a result — this is the button path.
-     */
     public boolean launchAppUnderShizuPosed(String packageName,
                                              AtomicBoolean sent) {
         return launchAppUnderShizuPosed(packageName, sent, true, true);
     }
 
-    /**
-     * Routed launch with an explicit openUi flag, defaulting to
-     * broadcasting a result. Kept so any existing caller that only
-     * cares about the UI step keeps working.
-     */
     public boolean launchAppUnderShizuPosed(String packageName,
                                              AtomicBoolean sent,
                                              boolean openUi) {
@@ -2083,7 +2361,7 @@ public class ShizuPosedService extends Service {
             }
 
             int beforeCount = countTargetProcesses(packageName);
-           
+
             String spawnPrefix = buildSpawnPrefix();
 
             String inner =
@@ -2144,7 +2422,6 @@ public class ShizuPosedService extends Service {
             long firstMarkerAt = 0L;
 
             try {
-                // Always wait the floor before the first poll.
                 Thread.sleep(BOOTSTRAP_MIN_WAIT_MS);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
@@ -2192,11 +2469,6 @@ public class ShizuPosedService extends Service {
                     + "bootstrap output.");
             }
 
-            // ── Step 2: open the UI ─────────────────────────────
-            //
-            // Skipped entirely when openUi=false. In that mode the
-            // process is left running with hooks live, and the user
-            // opens the app themselves.
             if (!openUi) {
                 logger.i("Spawn-only launch for " + packageName
                     + " — hooks installed, UI not opened"
@@ -2290,52 +2562,10 @@ public class ShizuPosedService extends Service {
         }
     }
 
-    /**
-     * Monitor-triggered injection into a detected app process.
-     *
-     * Called by ProcessMonitor for every newly-seen app process
-     * that has at least one enabled module. The (packageName, pid,
-     * uid) tuple describes a process the user launched normally,
-     * NOT one ShizuPosed started.
-     *
-     * WHAT THIS DOES
-     * --------------
-     * Without root there is no way to attach a JVM to a process
-     * that is already running. app_process starts a NEW process;
-     * it does not inject into the pid passed here. So this method
-     * performs the only non-root injection the framework actually
-     * supports: a spawn-only routed launch (openUi=false) of the
-     * package. The bootstrapped process comes up with hooks
-     * installed, and the user's own tap opens the UI into it.
-     *
-     * The pid argument is used for logging and for dedup only. It
-     * is not the process hooks land in.
-     *
-     * GUARDS
-     * ------
-     *   1. Prerequisites. Shizuku authorized + service running +
-     *      payload deployed. If any is false, skip silently — the
-     *      monitor will call again next cycle.
-     *
-     *   2. UID. The shell UID (2000) can setuid to ordinary app
-     *      UIDs (>= 10000) — the normal app_process target range,
-     *      which includes system apps that the OEM assigned a
-     *      dedicated uid. It cannot setuid to SYSTEM_UID (1000) or
-     *      the reserved system UID pool (1001-1999). So: refuse
-     *      uid < 10000. This is a uid check, not a name check.
-     *
-     *   3. Scope. Only packages that at least one enabled module
-     *      actually scopes are launched.
-     *
-     *   4. Dedup. A package that already has a shell-side hooked
-     *      marker, or that is already being launched by this
-     *      service, is skipped.
-     */
     public boolean injectProcess(String packageName, int pid, int uid,
                                  List<ModuleInfo> modules) {
         if (packageName == null || packageName.isEmpty()) return false;
 
-        // Guard 1: prerequisites.
         if (!isRunning.get() || shizukuHelper == null
                 || !shizukuHelper.isAuthorized()) {
             if (logger != null) {
@@ -2352,8 +2582,6 @@ public class ShizuPosedService extends Service {
             return false;
         }
 
-        // Guard 2: uid. Only ordinary app UIDs (>= 10000) are
-        // assumable by the shell.
         if (uid < 10000) {
             if (logger != null) {
                 logger.d("injectProcess: " + packageName
@@ -2363,7 +2591,6 @@ public class ShizuPosedService extends Service {
             return false;
         }
 
-        // Guard 3: scope.
         if (!isPackageScoped(packageName)) {
             if (logger != null) {
                 logger.v("injectProcess: " + packageName
@@ -2372,7 +2599,6 @@ public class ShizuPosedService extends Service {
             return false;
         }
 
-        // Guard 4: in-flight dedup.
         if (!inFlightLaunches.add(packageName)) {
             if (logger != null) {
                 logger.d("injectProcess: " + packageName
@@ -2382,7 +2608,6 @@ public class ShizuPosedService extends Service {
         }
 
         try {
-            // Guard 5: already hooked.
             if (isPackageAlreadyHooked(packageName)) {
                 if (logger != null) {
                     logger.d("injectProcess: " + packageName
@@ -2396,9 +2621,6 @@ public class ShizuPosedService extends Service {
                     + packageName + " (detected pid=" + pid
                     + ", uid=" + uid + ")");
             }
-
-            // openUi=false — the monitor must not open the app.
-            // The user opens it; hooks are already live by then.
 
             AtomicBoolean sent = new AtomicBoolean(false);
             boolean ok = launchAppUnderShizuPosed(
@@ -2420,11 +2642,6 @@ public class ShizuPosedService extends Service {
         }
     }
 
-    /**
-     * True if any enabled module's scope contains this package.
-     * Mirrors XposedHook.shouldHookApp() and ModuleInfo.isAppHooked()
-     * so the service and the in-process injector agree on scope.
-     */
     private boolean isPackageScoped(String packageName) {
         if (packageName == null) return false;
         try {
@@ -2444,16 +2661,9 @@ public class ShizuPosedService extends Service {
         return false;
     }
 
-    /**
-     * True if a hooked marker exists for this package. Reads the
-     * local mirror first (no IPC); falls back to a single shell
-     * `test -s` on miss. Used to avoid relaunching an app whose
-     * hooks are already live.
-     */
     private boolean isPackageAlreadyHooked(String packageName) {
         if (packageName == null) return false;
 
-        // Local mirror first.
         try {
             Map<String, String> mirror = MarkerCache.read(this);
             if (mirror != null && mirror.containsKey(packageName)) {
@@ -2466,7 +2676,6 @@ public class ShizuPosedService extends Service {
             }
         }
 
-        // Fall back to a single shell check.
         try {
             String base = resolveShellBaseDir();
             String marker = shellPath(base, SUB_DIR_HOOKED)
