@@ -18,6 +18,38 @@
     <!-- Shizuku Permission -->
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
 
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+
+    <!--
+        WRITE_SECURE_SETTINGS
+
+        Signature|privileged permission. Not grantable at runtime
+        through the normal runtime-permission dialog. Must be declared
+        in the manifest so the app can *request* it, and granted
+        through one of:
+
+          • pm grant (works when shell has GRANT_RUNTIME_PERMISSIONS
+            or the equivalent capability — not guaranteed on ColorOS)
+          • being installed as a priv-app under /system/priv-app/ with
+            an allowlist entry in privapp-permissions-*.xml
+          • adb install-time grant on some ROMs
+
+        Declaring it here is a prerequisite for pm grant to work. Without
+        the declaration, pm grant fails with "not requested by package"
+        and the grant is never recorded — which is what was happening
+        before. With the declaration, pm grant in ShizuPosedService can
+        actually take effect, and the direct ContentResolver write path
+        in writeGlobalSetting() becomes usable.
+
+        tools:ignore="ProtectedPermissions" is required because
+        WRITE_SECURE_SETTINGS is in the protected-permissions list and
+        the Android Gradle Plugin would otherwise warn/fail the build.
+    -->
+    <uses-permission
+        android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
+
     <!--
         QUERY_ALL_PACKAGES
         Required on some OEM ROMs (OPPO, older Xiaomi) that do not honor

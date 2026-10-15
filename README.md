@@ -347,6 +347,73 @@ Three classes install it: `PackageCheck` covers `IPackageManager`, `AdbCheck` an
 
 **Thread name scrubbing.** `ThreadNameScrub` renames ShizuPosed's own threads to innocuous patterns.
 
+### Smart foreground hiding (opt-in)
+
+XStealth's Java and native checks intercept reads of Developer
+Options and ADB state. They cover every read path the target app
+takes through libc, through the settings API, and through the
+content resolver.
+
+They do not cover two paths: a Binder call directly to
+`ISettingsProvider` (which bypasses the Java API and the content
+resolver), and a native read of the settings database's backing
+store (which bypasses the file interposers by using SQLite
+directly).
+
+Smart foreground hiding closes those paths by changing the
+*underlying state* rather than intercepting the read. When a
+scoped app comes to the foreground, the manager writes
+`adb_wifi_enabled` and `adb_enabled` to 0 through
+Shizuku. When the app leaves, the manager restores the prior
+values.
+
+Because the settings are genuinely off during that window, every
+reader sees 0 — including the paths XStealth's read interception
+doesn't cover.
+
+#### The cost
+
+Shizuku requires Developer Options to be enabled. When the
+settings are off, Shizuku's server stops. ShizuPosed's service
+loses its binder and shuts down. The framework is idle for the
+duration of the window.
+
+When the scoped app exits, the settings are restored, Shizuku's
+server comes back, and `ShizuBinderWatcher` restarts ShizuPosed's
+service. This is the same trade-off Shizuku-Next's "ADB without
+Developer options" switch makes.
+
+#### What you lose
+
+  * **Apps launched during the window are not hooked.** If the
+    user opens a second scoped app while the first is still in
+    the foreground, the second app is not launched through
+    ShizuPosed, and modules scoped to it do not load.
+  * **The foreground-detection race.** The monitor detects the
+    transition using `UsageStatsManager`, which polls. The poll
+    interval is 500 ms. An app that reads its settings in
+    `Application.attachBaseContext` before the monitor's next
+    poll sees the previous value. XStealth's read interception
+    does not have this race — the hooks install during bootstrap
+    — so the two mechanisms are complementary: read interception
+    covers the early reads, the state change covers the late ones.
+  * **`PACKAGE_USAGE_STATS`.** The monitor uses
+    `UsageStatsManager`, which requires the user to grant the
+    permission through Settings → Special app access → Usage
+    access. Without it, the monitor does not start.
+
+#### When to use it
+
+Enable it when a scoped app is known to read the settings through
+a path XStealth does not intercept. The usual tell: XStealth is on,
+the app's scope is set, but the app still reports Developer
+Options as enabled.
+
+Do not enable it by default. XStealth's read interception covers
+the common cases, and the state change's cost — Shizuku and the
+service going down for the duration — is not worth paying unless
+it's necessary.
+
 ### What each layer covers
 
 | Detection path | Java | Binder | Native | Bridge |

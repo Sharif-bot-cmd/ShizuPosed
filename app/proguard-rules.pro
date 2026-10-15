@@ -51,7 +51,6 @@
 -keep class com.shizuposed.manager.core.MarkerCache { *; }
 -keep class com.shizuposed.manager.core.DexLoadingBridge { *; }
 -keep class com.shizuposed.manager.core.DexLoadingBridge$* { *; }
-
 -keep class com.shizuposed.manager.core.NativeBridge { *; }
 
 -keep class com.shizuposed.manager.core.NativeDispatcher { *; }
@@ -60,6 +59,9 @@
                                 de.robv.android.xposed.XC_MethodHook,
                                 long[]);
 }
+
+-keep class com.shizuposed.manager.updates.UpdateChecker { *; }
+-keep class com.shizuposed.manager.monitor.ForegroundMonitor { *; }
 
 # ── Runtime timing preferences ──────────────────────────────
 #

@@ -22,6 +22,17 @@ import android.content.SharedPreferences;
  *     start and driving the target's Application bootstrap. A
  *     small delay helps on ROMs where the framework races the
  *     app's own initialization. Applies on the next app launch.
+ *
+ * WHY apply() AND NOT commit()
+ * ----------------------------
+ * Writes go through apply(), not commit(). commit() writes the
+ * preferences file synchronously on the calling thread, which on
+ * the Settings UI thread means a disk write during a slider drag —
+ * a visible frame hitch on slow devices. apply() writes on a
+ * background thread and returns immediately. Nothing in the
+ * framework reads these preferences back within the same
+ * millisecond as writing them, so the "write may not have landed
+ * yet" window is harmless.
  */
 public final class RuntimePrefs {
 
@@ -59,7 +70,7 @@ public final class RuntimePrefs {
     public static void setScanIntervalMs(Context c, int v) {
         if (v < MIN_SCAN_INTERVAL_MS) v = MIN_SCAN_INTERVAL_MS;
         if (v > MAX_SCAN_INTERVAL_MS) v = MAX_SCAN_INTERVAL_MS;
-        prefs(c).edit().putInt(KEY_SCAN_INTERVAL_MS, v).commit();
+        prefs(c).edit().putInt(KEY_SCAN_INTERVAL_MS, v).apply();
     }
 
     public static int getHookDelayMs(Context c) {
@@ -72,6 +83,6 @@ public final class RuntimePrefs {
     public static void setHookDelayMs(Context c, int v) {
         if (v < MIN_HOOK_DELAY_MS) v = MIN_HOOK_DELAY_MS;
         if (v > MAX_HOOK_DELAY_MS) v = MAX_HOOK_DELAY_MS;
-        prefs(c).edit().putInt(KEY_HOOK_DELAY_MS, v).commit();
+        prefs(c).edit().putInt(KEY_HOOK_DELAY_MS, v).apply();
     }
 }
