@@ -22,6 +22,14 @@ import java.util.Set;
  *
  * Called by ShizuPosedService on every module repush so the shell
  * side is never out of date.
+ *
+ * SMART FOREGROUND
+ * ----------------
+ * The manager's smart-foreground scope is a Set<String> in
+ * XStealthPrefs. It serializes to the "smartForegroundScope" JSON
+ * array. The shell-side config reads it from there. If the
+ * preference is empty, the array is empty; a missing array on the
+ * shell side is treated the same as an empty one.
  */
 public final class XStealthStatusWriter {
 
@@ -62,6 +70,19 @@ public final class XStealthStatusWriter {
             }
         }
         o.put("scope", scopeArr);
+
+        // Smart foreground scope. Design B: the signal toggles
+        // (hideDevOptions / hideAdb above) decide *whether* the
+        // state change runs; this list decides *for which apps*.
+        // An empty array means the state change never runs.
+        JSONArray sfScopeArr = new JSONArray();
+        Set<String> sfScope = XStealthPrefs.getSmartForegroundScope(c);
+        if (sfScope != null) {
+            for (String p : sfScope) {
+                if (p != null && !p.isEmpty()) sfScopeArr.put(p);
+            }
+        }
+        o.put("smartForegroundScope", sfScopeArr);
 
         return o;
     }

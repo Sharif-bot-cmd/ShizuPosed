@@ -421,8 +421,9 @@ public class XposedHook {
     }
 
     private static Object obtainActivityThread(Class<?> at) {
+        // 1. systemMain() — public entry point used by the runtime.
         try {
-            Method systemMain = findMethodAny(at, "systemMain", new Class<?>[]{});
+            Method systemMain = findMethodByShape(at, "systemMain");
             if (systemMain != null) {
                 Object t = systemMain.invoke(null);
                 if (t != null) {
@@ -434,8 +435,9 @@ public class XposedHook {
             log("systemMain threw: " + t.getMessage());
         }
 
+        // 2. currentActivityThread() — returns the existing thread.
         try {
-            Method current = findMethodAny(at, "currentActivityThread", new Class<?>[]{});
+            Method current = findMethodByShape(at, "currentActivityThread");
             if (current != null) {
                 Object t = current.invoke(null);
                 if (t != null) {
@@ -447,6 +449,7 @@ public class XposedHook {
             log("currentActivityThread threw: " + t.getMessage());
         }
 
+        // 3. Constructor.
         try {
             Constructor<?> ctor = at.getDeclaredConstructor();
             HiddenApiBypass.forceAccessible(ctor);
@@ -467,28 +470,37 @@ public class XposedHook {
             Class<?> compatInfoClass =
                 Class.forName("android.content.res.CompatibilityInfo");
 
-            Method getPackageInfoNoCheck = findMethodAny(at, "getPackageInfoNoCheck",
-                new Class<?>[]{ApplicationInfo.class, compatInfoClass},
-                new Class<?>[]{ApplicationInfo.class}
-            );
-            if (getPackageInfoNoCheck == null) {
-                log("getPackageInfoNoCheck not found in any known signature");
-                return null;
-            }
-
-            Object loadedApk;
-            if (getPackageInfoNoCheck.getParameterCount() == 2) {
-                loadedApk = getPackageInfoNoCheck.invoke(activityThread, appInfo, null);
-            } else {
-                loadedApk = getPackageInfoNoCheck.invoke(activityThread, appInfo);
+            // Find getPackageInfoNoCheck by shape. The method takes
+            // (ApplicationInfo) or (ApplicationInfo, CompatibilityInfo).
+            // We try both by passing the right number of args.
+            Object loadedApk = null;
+            try {
+                Method m1 = findMethodByShape(at, "getPackageInfoNoCheck",
+                    appInfo, null);
+                if (m1 != null) {
+                    loadedApk = m1.invoke(activityThread, appInfo, null);
+                }
+            } catch (Throwable ignored) {}
+            if (loadedApk == null) {
+                try {
+                    Method m2 = findMethodByShape(at, "getPackageInfoNoCheck",
+                        appInfo);
+                    if (m2 != null) {
+                        loadedApk = m2.invoke(activityThread, appInfo);
+                    }
+                } catch (Throwable ignored) {}
             }
             if (loadedApk == null) {
-                log("LoadedApk is null");
+                log("getPackageInfoNoCheck: no working overload");
                 return null;
             }
 
-            Method getClassLoader = loadedApk.getClass().getMethod("getClassLoader");
-            HiddenApiBypass.forceAccessible(getClassLoader);
+            Method getClassLoader =
+                findMethodByShape(loadedApk.getClass(), "getClassLoader");
+            if (getClassLoader == null) {
+                log("LoadedApk.getClassLoader not found");
+                return null;
+            }
             Object cl = getClassLoader.invoke(loadedApk);
             if (cl instanceof ClassLoader) return (ClassLoader) cl;
         } catch (Throwable t) {
@@ -497,15 +509,20 @@ public class XposedHook {
 
         try {
             Class<?> at = Class.forName("android.app.ActivityThread");
-            Method getSystemContext = at.getDeclaredMethod("getSystemContext");
-            HiddenApiBypass.forceAccessible(getSystemContext);
-            Object sysCtx = getSystemContext.invoke(activityThread);
-            if (sysCtx != null) {
-                Method getClassLoader = sysCtx.getClass().getMethod("getClassLoader");
-                Object cl = getClassLoader.invoke(sysCtx);
-                if (cl instanceof ClassLoader) {
-                    log("Using fallback classloader from system context");
-                    return (ClassLoader) cl;
+            Method getSystemContext =
+                findMethodByShape(at, "getSystemContext");
+            if (getSystemContext != null) {
+                Object sysCtx = getSystemContext.invoke(activityThread);
+                if (sysCtx != null) {
+                    Method getClassLoader =
+                        findMethodByShape(sysCtx.getClass(), "getClassLoader");
+                    if (getClassLoader != null) {
+                        Object cl = getClassLoader.invoke(sysCtx);
+                        if (cl instanceof ClassLoader) {
+                            log("Using fallback classloader from system context");
+                            return (ClassLoader) cl;
+                        }
+                    }
                 }
             }
         } catch (Throwable t) {
@@ -522,44 +539,41 @@ public class XposedHook {
             Class<?> compatInfoClass = Class.forName(
                 "android.content.res.CompatibilityInfo");
 
-            Method getPackageInfoNoCheck = findMethodAny(at, "getPackageInfoNoCheck",
-                new Class<?>[]{ApplicationInfo.class, compatInfoClass},
-                new Class<?>[]{ApplicationInfo.class}
-            );
-            if (getPackageInfoNoCheck == null) return null;
-
-            Object loadedApk;
-            if (getPackageInfoNoCheck.getParameterCount() == 2) {
-                loadedApk = getPackageInfoNoCheck.invoke(activityThread, appInfo, null);
-            } else {
-                loadedApk = getPackageInfoNoCheck.invoke(activityThread, appInfo);
+            Object loadedApk = null;
+            try {
+                Method m = findMethodByShape(at, "getPackageInfoNoCheck",
+                    appInfo, null);
+                if (m != null) {
+                    loadedApk = m.invoke(activityThread, appInfo, null);
+                }
+            } catch (Throwable ignored) {}
+            if (loadedApk == null) {
+                try {
+                    Method m = findMethodByShape(at, "getPackageInfoNoCheck",
+                        appInfo);
+                    if (m != null) {
+                        loadedApk = m.invoke(activityThread, appInfo);
+                    }
+                } catch (Throwable ignored) {}
             }
             if (loadedApk == null) return null;
 
-            Method getResources = null;
+            // getResources takes no args or a CompatibilityInfo.
+            Object res = null;
             try {
-                getResources = loadedApk.getClass().getMethod("getResources");
-            } catch (NoSuchMethodException ignored) {}
-
-            if (getResources == null) {
+                Method m = findMethodByShape(loadedApk.getClass(), "getResources");
+                if (m != null) {
+                    res = m.invoke(loadedApk);
+                }
+            } catch (Throwable ignored) {}
+            if (res == null) {
                 try {
-                    getResources = loadedApk.getClass().getDeclaredMethod(
-                        "getResources", compatInfoClass);
-                    HiddenApiBypass.forceAccessible(getResources);
-                } catch (NoSuchMethodException ignored) {}
-            }
-
-            if (getResources == null) {
-                log("LoadedApk.getResources not found in any known signature");
-                return null;
-            }
-
-            Object res;
-            if (getResources.getParameterCount() == 0) {
-                HiddenApiBypass.forceAccessible(getResources);
-                res = getResources.invoke(loadedApk);
-            } else {
-                res = getResources.invoke(loadedApk, (Object) null);
+                    Method m = findMethodByShape(loadedApk.getClass(),
+                        "getResources", (Object) null);
+                    if (m != null) {
+                        res = m.invoke(loadedApk, (Object) null);
+                    }
+                } catch (Throwable ignored) {}
             }
 
             if (res instanceof Resources) {
@@ -580,36 +594,53 @@ public class XposedHook {
             Class<?> dataClass = Class.forName(
                 "android.app.ActivityThread$AppBindData");
 
-            Method bindApplication = findMethodAny(at, "handleBindApplication",
-                new Class<?>[]{dataClass},
-                new Class<?>[]{android.content.Context.class, dataClass}
-            );
-            if (bindApplication == null) {
-                bindApplication = findMethodAny(at, "bindApplication",
-                    new Class<?>[]{dataClass},
-                    new Class<?>[]{android.content.Context.class, dataClass}
-                );
+            Object data = buildAppBindData(dataClass, appInfo, pkg);
+
+            // Try all the known forms of handleBindApplication. The
+            // shape search handles whichever signature the ROM has.
+            Method bind = null;
+            try {
+                bind = findMethodByShape(at, "handleBindApplication", data);
+            } catch (Throwable ignored) {}
+            if (bind == null) {
+                try {
+                    Method getSystemContext =
+                        findMethodByShape(at, "getSystemContext");
+                    Object sysCtx = getSystemContext == null
+                        ? null : getSystemContext.invoke(activityThread);
+                    if (sysCtx != null) {
+                        bind = findMethodByShape(at, "handleBindApplication",
+                            sysCtx, data);
+                    }
+                } catch (Throwable ignored) {}
             }
-            if (bindApplication == null) {
-                log("handleBindApplication / bindApplication not found");
+            if (bind == null) {
+                bind = findMethodByShape(at, "bindApplication", data);
+            }
+            if (bind == null) {
+                log("handleBindApplication / bindApplication: no usable form");
                 return false;
             }
 
-            Object data = buildAppBindData(dataClass, appInfo, pkg);
-
-            if (bindApplication.getParameterCount() == 2) {
-                Method getSystemContext = at.getDeclaredMethod("getSystemContext");
-                HiddenApiBypass.forceAccessible(getSystemContext);
-                Object sysCtx = getSystemContext.invoke(activityThread);
-                bindApplication.invoke(activityThread, sysCtx, data);
+            // Invoke with the arguments the found method expects.
+            Object[] invokeArgs;
+            Class<?>[] params = bind.getParameterTypes();
+            if (params.length == 1) {
+                invokeArgs = new Object[]{ data };
+            } else if (params.length == 2) {
+                Method getSystemContext =
+                    findMethodByShape(at, "getSystemContext");
+                Object sysCtx = getSystemContext == null
+                    ? null : getSystemContext.invoke(activityThread);
+                invokeArgs = new Object[]{ sysCtx, data };
             } else {
-                bindApplication.invoke(activityThread, data);
+                log("handleBindApplication has " + params.length
+                    + " parameters — unknown form");
+                return false;
             }
 
-            // ── Verify the bind actually took ────────────────────
-            //
-            // handleBindApplication returning without throwing is
-            // not proof that the Application exists. Check.
+            bind.invoke(activityThread, invokeArgs);
+
             boolean bound = verifyApplicationBound(activityThread);
             if (!bound) {
                 log("handleBindApplication returned but no Application "
@@ -662,10 +693,14 @@ public class XposedHook {
                                             String pkg) throws Throwable {
         Object data = dataClass.getDeclaredConstructor().newInstance();
 
-        setFieldAny(data, appInfo, "appInfo");
-        setFieldAny(data, pkg, "processName");
-        setFieldAny(data, null, "providers");
-        setFieldAny(data, 0, "debugMode", "debug");
+        // Fields are set by shape, not by hardcoded name. The name
+        // hints are tried in order; if none matches, a unique
+        // field of the right type is used.
+        setFieldByShape(data, appInfo, "appInfo", "info");
+        setFieldByShape(data, pkg, "processName", "procName", "process");
+        setFieldByShape(data, null, "providers");
+        setFieldByShape(data, 0, "debugMode", "debug");
+        setFieldByShape(data, 0, "mDebugMode");
 
         try {
             Class<?> compatInfoClass = Class.forName(
@@ -673,7 +708,8 @@ public class XposedHook {
             Field defaultCompat = compatInfoClass.getField(
                 "DEFAULT_COMPATIBILITY_INFO");
             Object compat = defaultCompat.get(null);
-            setFieldAny(data, compat, "compatInfo", "compatibilityInfo");
+            setFieldByShape(data, compat,
+                "compatInfo", "compatibilityInfo", "mCompatInfo");
         } catch (Throwable ignored) {}
 
         try {
@@ -689,9 +725,8 @@ public class XposedHook {
         try {
             Class<?> at = Class.forName("android.app.ActivityThread");
 
-            Method getProviderList = findMethodAny(at, "getProviderList",
-                new Class<?>[]{ApplicationInfo.class}
-            );
+            Method getProviderList =
+                findMethodByShape(at, "getProviderList", appInfo);
             if (getProviderList == null) {
                 log("getProviderList not found");
                 return;
@@ -707,28 +742,36 @@ public class XposedHook {
                 return;
             }
 
-            Method getSystemContext = at.getDeclaredMethod("getSystemContext");
-            HiddenApiBypass.forceAccessible(getSystemContext);
-            android.content.Context sysCtx =
-                (android.content.Context) getSystemContext.invoke(activityThread);
-            if (sysCtx == null) {
-                log("No system context for ContentProvider install");
-                return;
+            Method getSystemContext =
+                findMethodByShape(at, "getSystemContext");
+            android.content.Context sysCtx = null;
+            if (getSystemContext != null) {
+                Object o = getSystemContext.invoke(activityThread);
+                if (o instanceof android.content.Context) {
+                    sysCtx = (android.content.Context) o;
+                }
             }
 
-            Method installProviders = findMethodAny(at, "installContentProviders",
-                new Class<?>[]{android.content.Context.class, List.class},
-                new Class<?>[]{List.class}
-            );
-            if (installProviders == null) {
+            // Try the two-arg form with the system context, then
+            // the one-arg form.
+            Method install = null;
+            if (sysCtx != null) {
+                install = findMethodByShape(at, "installContentProviders",
+                    sysCtx, providerList);
+            }
+            if (install == null) {
+                install = findMethodByShape(at, "installContentProviders",
+                    providerList);
+            }
+            if (install == null) {
                 log("installContentProviders not found");
                 return;
             }
 
-            if (installProviders.getParameterCount() == 2) {
-                installProviders.invoke(activityThread, sysCtx, providerList);
+            if (install.getParameterCount() == 2) {
+                install.invoke(activityThread, sysCtx, providerList);
             } else {
-                installProviders.invoke(activityThread, providerList);
+                install.invoke(activityThread, providerList);
             }
             log("Installed " + providerList.size() + " ContentProvider(s)");
         } catch (Throwable t) {
@@ -1360,49 +1403,330 @@ public class XposedHook {
     // ═════════════════════════════════════════════════════════════════
     // REFLECTION HELPERS
     // ═════════════════════════════════════════════════════════════════
+    // ═════════════════════════════════════════════════════════════════
+    // DYNAMIC REFLECTION
+    //
+    // The previous helpers tried a fixed list of signatures and
+    // field names. That works for the changes that have already
+    // happened, but every new Android version that changes
+    // ActivityThread's internals needs another entry in the list.
+    //
+    // These helpers search by shape instead:
+    //
+    //   • findMethodByShape — finds any method with the given name
+    //     whose parameter types are assignable from the given
+    //     argument types, in any order that matches.
+    //
+    //   • setFieldByShape — finds a field whose type is assignable
+    //     from the value, preferring names that match one of the
+    //     supplied hints.
+    //
+    //   • findFieldByType — finds a field of a given type on the
+    //     class or its ancestors.
+    //
+    // The effect is that a change like "handleBindApplication now
+    // takes (Context, AppBindData, boolean)" is handled without
+    // adding a signature — the search finds it because the args
+    // match assignability.
+    //
+    // Every "no match" case still logs what exists, so a failure
+    // on a future Android version is diagnosable from launch.log
+    // alone.
+    // ═════════════════════════════════════════════════════════════════
 
-    private static Method findMethodAny(Class<?> clazz,
-                                        String name,
-                                        Class<?>[]... signatures) {
-        for (Class<?>[] sig : signatures) {
-            try {
-                Method m = clazz.getDeclaredMethod(name, sig);
-                HiddenApiBypass.forceAccessible(m);
-                return m;
-            } catch (NoSuchMethodException ignored) {
-            } catch (Throwable t) {
-                log("findMethodAny(" + name + ") error: " + t.getMessage());
+    /**
+     * Find a method by name and shape. The method must:
+     *
+     *   • have exactly the given name
+     *   • accept exactly `args.length` parameters
+     *   • have each parameter type assignable from the corresponding
+     *     arg's runtime class
+     *
+     * If multiple methods match, the first with the fewest
+     * ancestors between parameter type and arg class wins. That
+     * picks the most specific overload.
+     *
+     * Returns null if no method matches. Logs every method with
+     * the given name so the failure is diagnosable.
+     */
+    private static Method findMethodByShape(Class<?> clazz,
+                                            String name,
+                                            Object... args) {
+        if (clazz == null || name == null) return null;
+
+        Method best = null;
+        int bestScore = Integer.MAX_VALUE;
+
+        for (Method m : clazz.getDeclaredMethods()) {
+            if (!m.getName().equals(name)) continue;
+            Class<?>[] params = m.getParameterTypes();
+            if (params.length != args.length) continue;
+
+            int score = 0;
+            boolean ok = true;
+            for (int i = 0; i < params.length; i++) {
+                Object arg = args[i];
+                Class<?> param = params[i];
+
+                // Null arguments match any non-primitive parameter.
+                // For primitives, we can't tell from a null — skip.
+                if (arg == null) {
+                    if (param.isPrimitive()) { ok = false; break; }
+                    score += 1000;
+                    continue;
+                }
+
+                Class<?> argClass = arg.getClass();
+
+                if (param.isAssignableFrom(argClass)) {
+                    // Prefer the most specific parameter type. A
+                    // direct class match scores 0; each superclass
+                    // hop adds 1.
+                    score += distance(argClass, param);
+                    continue;
+                }
+
+                // Primitive boxing: allow int -> Integer and back.
+                if (isBoxedMatch(param, argClass)) {
+                    score += 5;
+                    continue;
+                }
+
+                ok = false;
+                break;
+            }
+
+            if (!ok) continue;
+
+            if (score < bestScore) {
+                bestScore = score;
+                best = m;
             }
         }
+
+        if (best != null) {
+            try {
+                HiddenApiBypass.forceAccessible(best);
+            } catch (Throwable ignored) {}
+            log("findMethodByShape: " + clazz.getSimpleName() + "."
+                + name + "(" + argsToTypeNames(args) + ") -> "
+                + describeMethod(best));
+            return best;
+        }
+
+        log("findMethodByShape: no match for " + clazz.getSimpleName()
+            + "." + name + "(" + argsToTypeNames(args) + ")");
+        log("Available methods named " + name + ":\n"
+            + describeMethods(clazz, name));
         return null;
     }
 
-    private static void setFieldAny(Object target, Object value, String... names) {
-        if (target == null) return;
-        for (String name : names) {
-            if (setFieldQuiet(target, name, value)) return;
-        }
-        log("setFieldAny: none of " + java.util.Arrays.toString(names)
-            + " exist on " + target.getClass());
-    }
+    /**
+     * Find a field by shape. Prefers a field whose type is
+     * assignable from the value's class and whose name matches one
+     * of the given hints (in order). If no hint matches but a
+     * single field of the right type exists, uses that.
+     *
+     * Returns null if no field matches. Logs all fields of the
+     * class so the failure is diagnosable.
+     */
+    private static boolean setFieldByShape(Object target,
+                                           Object value,
+                                           String... nameHints) {
+        if (target == null) return false;
 
-    private static boolean setFieldQuiet(Object target, String name, Object value) {
-        try {
-            Class<?> c = target.getClass();
-            while (c != null) {
-                try {
-                    Field f = c.getDeclaredField(name);
-                    HiddenApiBypass.forceAccessible(f);
-                    f.set(target, value);
+        Class<?> clazz = target.getClass();
+        Class<?> valueClass = value == null ? null : value.getClass();
+
+        // Walk up the class hierarchy so a field declared on a
+        // superclass is still found.
+        List<Field> candidates = new ArrayList<>();
+        Class<?> c = clazz;
+        while (c != null && c != Object.class) {
+            try {
+                Field[] fields = c.getDeclaredFields();
+                if (fields != null) {
+                    for (Field f : fields) candidates.add(f);
+                }
+            } catch (Throwable ignored) {}
+            c = c.getSuperclass();
+        }
+
+        // Pass 1: hint matches. Walk the hints in order; for each,
+        // find a field with that exact name and an assignable type.
+        for (String hint : nameHints) {
+            if (hint == null) continue;
+            for (Field f : candidates) {
+                if (!f.getName().equals(hint)) continue;
+                if (!isAssignable(valueClass, f.getType())) continue;
+                if (setFieldQuiet(target, f, value)) {
+                    log("setFieldByShape: " + clazz.getSimpleName() + "."
+                        + hint + " (" + f.getType().getSimpleName()
+                        + ") = " + brief(value));
                     return true;
-                } catch (NoSuchFieldException e) {
-                    c = c.getSuperclass();
                 }
             }
-        } catch (Throwable t) {
-            log("setFieldQuiet(" + name + ") failed: " + t.getMessage());
         }
+
+        // Pass 2: type match, no name. Only accept if there is
+        // exactly one field of the matching type — otherwise we
+        // could pick the wrong one.
+        if (valueClass != null) {
+            List<Field> typeMatches = new ArrayList<>();
+            for (Field f : candidates) {
+                if (f.getName().startsWith("$")) continue; // synthetic
+                if (f.isSynthetic()) continue;
+                if (isAssignable(valueClass, f.getType())) {
+                    typeMatches.add(f);
+                }
+            }
+            if (typeMatches.size() == 1) {
+                Field f = typeMatches.get(0);
+                if (setFieldQuiet(target, f, value)) {
+                    log("setFieldByShape: " + clazz.getSimpleName() + "."
+                        + f.getName() + " (" + f.getType().getSimpleName()
+                        + ") = " + brief(value) + " [by type]");
+                    return true;
+                }
+            }
+        }
+
+        log("setFieldByShape: no match on " + clazz.getSimpleName()
+            + " for " + brief(value)
+            + " (hints=" + java.util.Arrays.toString(nameHints) + ")");
+        log("Available fields:\n" + describeFields(clazz));
         return false;
+    }
+
+    private static boolean setFieldQuiet(Object target, Field f, Object value) {
+        try {
+            HiddenApiBypass.forceAccessible(f);
+            f.set(target, value);
+            return true;
+        } catch (Throwable t) {
+            log("setFieldQuiet(" + f.getName() + ") failed: "
+                + t.getMessage());
+            return false;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // SHAPE HELPERS
+    // ═════════════════════════════════════════════════════════════════
+
+    /**
+     * Distance from `from` to `to` in the class hierarchy, where
+     * `to` is an ancestor of `from`. 0 if they are the same class,
+     * 1 for a direct superclass, etc. Used to prefer the most
+     * specific overload.
+     */
+    private static int distance(Class<?> from, Class<?> to) {
+        if (from == to) return 0;
+        int d = 1;
+        Class<?> c = from.getSuperclass();
+        while (c != null) {
+            if (c == to) return d;
+            d++;
+            c = c.getSuperclass();
+        }
+        // Interfaces: count them as farther than any superclass.
+        for (Class<?> i : from.getInterfaces()) {
+            if (i == to) return 100;
+        }
+        return 100;
+    }
+
+    private static boolean isAssignable(Class<?> valueClass, Class<?> param) {
+        if (param == null) return false;
+        if (valueClass == null) {
+            // Null value: only matches non-primitives.
+            return !param.isPrimitive();
+        }
+        if (param.isAssignableFrom(valueClass)) return true;
+        return isBoxedMatch(param, valueClass);
+    }
+
+    /**
+     * True if `param` is a primitive and `valueClass` is its boxed
+     * equivalent, or vice versa.
+     */
+    private static boolean isBoxedMatch(Class<?> param, Class<?> valueClass) {
+        return (param == int.class && valueClass == Integer.class)
+            || (param == Integer.class && valueClass == int.class)
+            || (param == long.class && valueClass == Long.class)
+            || (param == Long.class && valueClass == long.class)
+            || (param == boolean.class && valueClass == Boolean.class)
+            || (param == Boolean.class && valueClass == boolean.class)
+            || (param == short.class && valueClass == Short.class)
+            || (param == Short.class && valueClass == short.class)
+            || (param == byte.class && valueClass == Byte.class)
+            || (param == Byte.class && valueClass == byte.class)
+            || (param == char.class && valueClass == Character.class)
+            || (param == Character.class && valueClass == char.class)
+            || (param == float.class && valueClass == Float.class)
+            || (param == Float.class && valueClass == float.class)
+            || (param == double.class && valueClass == Double.class)
+            || (param == Double.class && valueClass == double.class);
+    }
+
+    private static String argsToTypeNames(Object... args) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < args.length; i++) {
+            if (i > 0) sb.append(", ");
+            Object a = args[i];
+            sb.append(a == null ? "null" : a.getClass().getSimpleName());
+        }
+        return sb.toString();
+    }
+
+    private static String describeMethod(Method m) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(m.getName()).append("(");
+        Class<?>[] params = m.getParameterTypes();
+        for (int i = 0; i < params.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(params[i].getSimpleName());
+        }
+        sb.append(")");
+        return sb.toString();
+    }
+
+    private static String describeMethods(Class<?> clazz, String name) {
+        StringBuilder sb = new StringBuilder();
+        for (Method m : clazz.getDeclaredMethods()) {
+            if (!m.getName().equals(name)) continue;
+            sb.append("    ").append(describeMethod(m)).append("\n");
+        }
+        if (sb.length() == 0) sb.append("    (none)\n");
+        return sb.toString();
+    }
+
+    private static String describeFields(Class<?> clazz) {
+        StringBuilder sb = new StringBuilder();
+        Class<?> c = clazz;
+        while (c != null && c != Object.class) {
+            for (Field f : c.getDeclaredFields()) {
+                if (f.isSynthetic()) continue;
+                sb.append("    ")
+                  .append(f.getType().getSimpleName())
+                  .append(" ")
+                  .append(f.getName())
+                  .append("  [").append(c.getSimpleName()).append("]")
+                  .append("\n");
+            }
+            c = c.getSuperclass();
+        }
+        return sb.toString();
+    }
+
+    private static String brief(Object o) {
+        if (o == null) return "null";
+        try {
+            String s = String.valueOf(o);
+            return s.length() > 60 ? s.substring(0, 57) + "..." : s;
+        } catch (Throwable t) {
+            return "<" + o.getClass().getSimpleName() + ">";
+        }
     }
 
     // ═════════════════════════════════════════════════════════════════

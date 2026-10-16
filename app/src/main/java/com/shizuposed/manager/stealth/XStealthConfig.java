@@ -18,27 +18,27 @@ import java.util.Set;
  * XStealthConfig
  *
  * Shell-side view of XStealth's settings. Read once per process
- * from <shell-base>/modules/xstealth.json, which the manager
- * writes before launching a target under ShizuPosed.
+ * from <shell-base>/modules/xstealth.json.
  *
- * SCOPE
- * -----
- * The scope is a Set<String> of target package names. An empty set
- * means "all apps" — the module applies to every package. A
- * non-empty set means only those packages are affected.
+ * SMART FOREGROUND (Design B)
+ * ---------------------------
+ * There is no dedicated master toggle for smart foreground hiding.
+ * The feature is active when both of these are true:
  *
- * The decision is made in shouldApplyTo(pkg). XStealthModule calls
- * it at the top of handleLoadPackage().
+ *   1. At least one of hideDevOptions / hideAdb is on. Those are
+ *      the same toggles that gate XStealth's read interception;
+ *      there is no second switch. Turning both off disables both
+ *      the read interception and the state change.
  *
- * CACHED DETECTION VALUES
- * -----------------------
- * hideCachedDetectionValues — gates CachedValueCheck. Opt-in,
- * default FALSE. When on, hooks SharedPreferences reads for the
- * keys named in cachedValueKeys, and returns the same sanitized
- * value the live-read checks return.
+ *   2. smartForegroundScope is non-empty. The scope names the
+ *      packages whose foreground triggers the state change. An
+ *      empty scope means the state change never runs, even if
+ *      the signal toggles are on.
  *
- * cachedValueKeys — per-app allow-list. Package name -> list of
- * exact SharedPreferences key names. Empty by default.
+ * The user opts into the state change by adding apps to the
+ * scope, not by flipping a separate switch. This keeps the
+ * detail sheet to one control per signal, which is how it worked
+ * before this feature existed.
  */
 public final class XStealthConfig {
 
@@ -69,6 +69,13 @@ public final class XStealthConfig {
     public final boolean hideCachedDetectionValues;
 
     public final Map<String, List<String>> cachedValueKeys;
+
+    /**
+     * Packages whose foreground should trigger a state change to
+     * Developer Options / ADB. Empty by default. Non-empty turns
+     * on the state-change path when a signal toggle is also on.
+     */
+    public final Set<String> smartForegroundScope;
 
     public final Set<String> scope;
 
@@ -118,6 +125,16 @@ public final class XStealthConfig {
         }
         cachedValueKeys = Collections.unmodifiableMap(cvk);
 
+        Set<String> sfg = new HashSet<>();
+        JSONArray sfarr = o.optJSONArray("smartForegroundScope");
+        if (sfarr != null) {
+            for (int i = 0; i < sfarr.length(); i++) {
+                String p = sfarr.optString(i, null);
+                if (p != null && !p.isEmpty()) sfg.add(p);
+            }
+        }
+        smartForegroundScope = Collections.unmodifiableSet(sfg);
+
         Set<String> s = new HashSet<>();
         JSONArray arr = o.optJSONArray("scope");
         if (arr != null) {
@@ -153,6 +170,24 @@ public final class XStealthConfig {
         if (pkg == null || pkg.isEmpty()) return Collections.emptyList();
         List<String> list = cachedValueKeys.get(pkg);
         return list == null ? Collections.emptyList() : list;
+    }
+
+    public boolean isSmartForegroundScoped(String pkg) {
+        if (pkg == null || pkg.isEmpty()) return false;
+        return smartForegroundScope.contains(pkg);
+    }
+
+    /**
+     * True when the smart-foreground state change is enabled: at
+     * least one of the signal toggles is on and at least one app
+     * is in the smart-foreground scope.
+     *
+     * Callers that want to know whether it's worth starting the
+     * foreground monitor should check this.
+     */
+    public boolean isSmartForegroundActive() {
+        if (!hideDevOptions && !hideAdb) return false;
+        return !smartForegroundScope.isEmpty();
     }
 
     private static volatile XStealthConfig sCached;

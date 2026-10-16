@@ -216,7 +216,7 @@ public class SettingsFragment extends Fragment {
         tvShizukuStatus = view.findViewById(R.id.tvShizukuStatus);
         tvServiceStatus = view.findViewById(R.id.tvServiceStatus);
 
-        if (tvVersion != null) tvVersion.setText("1.0.6");
+        if (tvVersion != null) tvVersion.setText("1.1.5");
     }
 
     private void setupListeners() {

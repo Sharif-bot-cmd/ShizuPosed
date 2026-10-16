@@ -10,6 +10,7 @@ import android.os.Handler;
 import android.os.Looper;
 
 import com.shizuposed.manager.service.ShizuPosedService;
+import com.shizuposed.manager.updates.UpdateChecker;
 import com.shizuposed.manager.utils.Logger;
 
 import java.io.File;
@@ -58,24 +59,30 @@ public class ShizuPosedManagerApp extends Application {
             isShizukuAuthorized = false;
             serviceAutoStarted = false;
             notifiedAuthorized.set(false);
-            logger.w("Shizuku binder dead — stopping service");
 
-            // Tell the service to re-arm its onShizukuAuthorized() gate
-            // so the next grant re-triggers a full dex/module deploy.
+            // Do NOT stop ShizuPosedService here. The service has
+            // work that doesn't depend on Shizuku — ForegroundMonitor
+            // and the direct Settings.Global writes the
+            // smart-foreground feature uses. Stopping the service on
+            // binder death tears those down mid-session and can
+            // strand a smart-fg disable (adb_enabled = 0) with no
+            // restore path until the next boot.
+            //
+            // Shizuku-backed operations in the service already check
+            // isAuthorized() before every call and return early when
+            // the binder is gone. When the binder returns,
+            // ShizukuBinderWatcher sends ACTION_ENSURE_RUNNING and
+            // the service re-deploys. No stop is needed.
+            logger.w("Shizuku binder dead — service left running, "
+                + "Shizuku-backed ops will defer until reconnected");
+
+            // Re-arm the service's onShizukuAuthorized() gate so the
+            // next grant re-triggers a full dex/module deploy.
             try {
                 if (shizuPosedService != null) {
                     shizuPosedService.resetAuthorizedDispatch();
                 }
             } catch (Throwable ignored) {}
-
-            // Stop the service, since its authorization is gone.
-            try {
-                Intent stopIntent = new Intent(
-                    ShizuPosedManagerApp.this, ShizuPosedService.class);
-                stopService(stopIntent);
-            } catch (Throwable t) {
-                logger.e("Failed to stop service after binder death: " + t.getMessage());
-            }
         }
     };
 
@@ -99,14 +106,15 @@ public class ShizuPosedManagerApp extends Application {
                 isShizukuAuthorized = false;
                 notifiedAuthorized.set(false);
                 serviceAutoStarted = false;
-                logger.w("❌ Shizuku permission DENIED by user — ensuring service is stopped");
+                logger.w("❌ Shizuku permission DENIED by user — "
+                    + "service left running");
 
-                try {
-                    stopService(new Intent(
-                        ShizuPosedManagerApp.this, ShizuPosedService.class));
-                } catch (Throwable t) {
-                    logger.e("Failed to stop service after denial: " + t.getMessage());
-                }
+                // Do NOT stop the service on permission denial either.
+                // The service doesn't need the Shizuku grant to keep
+                // ForegroundMonitor running or to write
+                // Settings.Global directly. If the user later grants
+                // the permission, autoStartService() + onShizukuAuthorized()
+                // resume the deploy path without a restart.
             }
         }
     };
@@ -123,9 +131,67 @@ public class ShizuPosedManagerApp extends Application {
         createDirectories();
         setupNotificationChannel();
 
+        // Check GitHub Releases for a newer version. Runs on a
+        // background thread; throttled to once per 12 hours; fails
+        // silently if offline. Never blocks startup.
+        try {
+            String currentVersion = getPackageManager()
+                .getPackageInfo(getPackageName(), 0).versionName;
+            UpdateChecker.checkAsync(this, currentVersion);
+        } catch (Throwable t) {
+            logger.d("Update check skipped: " + t.getMessage());
+        }
+
         new Handler(Looper.getMainLooper()).post(this::deferredShizukuSetup);
 
         logger.i("ShizuPosed Manager initialized");
+    }
+
+    private void promptForBatteryWhitelist() {
+        try {
+            android.os.PowerManager pm = (android.os.PowerManager)
+                getSystemService(POWER_SERVICE);
+            if (pm == null) return;
+            String pkg = getPackageName();
+            if (pm.isIgnoringBatteryOptimizations(pkg)) {
+                logger.i("Battery optimization already ignored — FGS "
+                    + "should survive");
+                return;
+            }
+            if (!shouldAskForWhitelist()) return;
+            markWhitelistAsked();
+
+            logger.i("Requesting battery-optimization whitelist");
+            Intent intent = new Intent(
+                android.provider.Settings
+                    .ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+            intent.setData(android.net.Uri.parse("package:" + pkg));
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+        } catch (Throwable t) {
+            logger.w("Battery whitelist prompt failed: " + t.getMessage());
+        }
+    }
+
+    private static final String PREFS_ONBOARDING = "shizuposed_onboarding";
+    private static final String KEY_ASKED_BATTERY = "asked_battery";
+
+    private boolean shouldAskForWhitelist() {
+        try {
+            return !getSharedPreferences(PREFS_ONBOARDING, MODE_PRIVATE)
+                .getBoolean(KEY_ASKED_BATTERY, false);
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    private void markWhitelistAsked() {
+        try {
+            getSharedPreferences(PREFS_ONBOARDING, MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_ASKED_BATTERY, true)
+                .apply();
+        } catch (Throwable ignored) {}
     }
 
     private void deferredShizukuSetup() {
@@ -156,6 +222,9 @@ public class ShizuPosedManagerApp extends Application {
             }
 
             checkShizukuPermission();
+
+            new Handler(Looper.getMainLooper()).postDelayed(
+                this::promptForBatteryWhitelist, 3000L);
 
         } catch (Throwable t) {
             logger.e("deferredShizukuSetup failed: " + t.getMessage());
@@ -282,15 +351,11 @@ public class ShizuPosedManagerApp extends Application {
                 isShizukuAuthorized = false;
                 logger.w("⚠️ Shizuku permission NOT GRANTED");
 
-                if (serviceAutoStarted) {
-                    try {
-                        stopService(new Intent(
-                            ShizuPosedManagerApp.this, ShizuPosedService.class));
-                        serviceAutoStarted = false;
-                    } catch (Throwable t) {
-                        logger.e("Failed to stop unauthorized service: " + t.getMessage());
-                    }
-                }
+                // Do NOT stop the service just because the grant is
+                // missing. The service doesn't need it for
+                // ForegroundMonitor or for direct Settings.Global
+                // writes. Leave it running; the next grant re-arms
+                // the Shizuku-backed operations.
 
                 if (!permissionRequested) {
                     permissionRequested = true;
