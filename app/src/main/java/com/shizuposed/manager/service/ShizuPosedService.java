@@ -734,17 +734,6 @@ public class ShizuPosedService extends Service {
         }
     }
 
-    /**
-     * True if any package in the smart-foreground scope is currently
-     * the top resumed activity. Uses the same freshness logic as
-     * ForegroundMonitor — a package is foreground if its most recent
-     * event in the window was ACTIVITY_RESUMED and that resume is
-     * recent.
-     *
-     * Called from the worker thread during service setup and from
-     * restoreDevSettings, so it must be cheap. queryEvents on a
-     * 5-second window is a few ms.
-     */
     private boolean isAnyWatchedPackageForeground() {
         try {
             UsageStatsManager usm = (UsageStatsManager)
@@ -756,29 +745,47 @@ public class ShizuPosedService extends Service {
             if (scope == null || scope.isEmpty()) return false;
 
             long now = System.currentTimeMillis();
-            long windowStart = now - FOREGROUND_CHECK_WINDOW_MS;
+            long windowStart = now - 60_000L;
+            long freshness = 4_000L;
+
             UsageEvents events = usm.queryEvents(windowStart, now);
             if (events == null) return false;
 
             Map<String, Integer> lastEvent = new HashMap<>();
+            Map<String, Long> lastResumeTs = new HashMap<>();
+
             UsageEvents.Event e = new UsageEvents.Event();
             while (events.hasNextEvent()) {
                 events.getNextEvent(e);
                 String pkg = e.getPackageName();
                 if (pkg == null) continue;
                 int type = e.getEventType();
-                if (type == UsageEvents.Event.ACTIVITY_RESUMED
-                        || type == UsageEvents.Event.ACTIVITY_PAUSED
-                        || type == UsageEvents.Event.ACTIVITY_STOPPED) {
-                    lastEvent.put(pkg, type);
+                if (type != UsageEvents.Event.ACTIVITY_RESUMED
+                        && type != UsageEvents.Event.ACTIVITY_PAUSED
+                        && type != UsageEvents.Event.ACTIVITY_STOPPED) {
+                    continue;
+                }
+                lastEvent.put(pkg, type);
+                if (type == UsageEvents.Event.ACTIVITY_RESUMED) {
+                    Long prev = lastResumeTs.get(pkg);
+                    long ts = e.getTimeStamp();
+                    if (prev == null || ts > prev) {
+                        lastResumeTs.put(pkg, ts);
+                    }
                 }
             }
 
+            long freshest = now - freshness;
             for (String pkg : scope) {
                 Integer t = lastEvent.get(pkg);
-                if (t != null && t == UsageEvents.Event.ACTIVITY_RESUMED) {
-                    return true;
+                if (t == null || t != UsageEvents.Event.ACTIVITY_RESUMED) {
+                    continue;
                 }
+                Long ts = lastResumeTs.get(pkg);
+                if (ts == null || ts < freshest) {
+                    continue;
+                }
+                return true;
             }
             return false;
         } catch (Throwable t) {
