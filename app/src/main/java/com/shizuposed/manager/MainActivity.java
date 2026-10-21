@@ -40,7 +40,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class MainActivity extends AppCompatActivity {
-    private static final String VERSION_LABEL = "1.1.5";
+    private static final String VERSION_LABEL = "1.1.9";
     private ViewPager2 viewPager;
     private BottomNavigationView bottomNavigation;
     private Toolbar toolbar;
@@ -92,8 +92,17 @@ public class MainActivity extends AppCompatActivity {
         setupViewPager();
         setupBottomNavigation();
 
-        startServices();
+        // Request notification permission FIRST. If the notification
+        // permission is missing when ShizuPosedService.onCreate runs
+        // startForeground, the FGS contract can fail on some ROMs and
+        // kill the whole process — which is what produces the "blank
+        // screen then home" symptom. Asking here means the permission
+        // is settled before the service is ever started.
         checkAndRequestPermissions();
+
+        // Then try the service. If Shizuku is not yet authorized this
+        // is a no-op and will be retried from onResume / onShizukuPermissionGranted.
+        startServices();
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -142,18 +151,36 @@ public class MainActivity extends AppCompatActivity {
         }, 300);
     }
 
+    /**
+     * Called by ShizuPosedManagerApp when the Shizuku permission
+     * result listener fires with GRANTED.
+     *
+     * The only thing this does is refresh the UI state. It must NOT
+     * finish, recreate, or otherwise tear down the activity — doing
+     * so makes the user see a blank screen and land on the
+     * launcher, which is the bug this was added to fix.
+     *
+     * The service start that goes along with the grant is handled
+     * by ShizukuHelper.autoStartServiceIfPossible() and by
+     * ShizuPosedManagerApp.autoStartService(). Those already run on
+     * the main thread, and they handle their own restart logic.
+     * MainActivity does not need to (and must not) participate.
+     */
     public void onShizukuPermissionGranted() {
         runOnUiThread(() -> {
+            if (isFinishing() || isDestroyed()) return;
             shizukuChecked = true;
             notActiveDialogShownThisSession = false;
             updateToolbarFromHelper();
             refreshAll();
+            updateServiceMenuState();
             invalidateOptionsMenu();
         });
     }
 
     public void onServiceAutoStarted() {
         runOnUiThread(() -> {
+            if (isFinishing() || isDestroyed()) return;
             refreshAll();
             updateServiceMenuState();
         });
@@ -222,7 +249,7 @@ public class MainActivity extends AppCompatActivity {
                        "Please install Shizuku from:\n" +
                        "• Google Play Store\n" +
                        "• F-Droid\n" +
-                       "• GitHub: https://shizuku.rikka.app/")
+                       "• GitHub: https://github.com/rushiranpise/Shizuku-Next/")
             .setPositiveButton("Open Play Store", (d, w) -> {
                 try {
                     startActivity(new Intent(Intent.ACTION_VIEW,
@@ -281,6 +308,13 @@ public class MainActivity extends AppCompatActivity {
             ShizukuHelper.getInstance(this).refreshFromBinder();
         } catch (Throwable ignored) {}
 
+        // If Shizuku became authorized while the activity was
+        // backgrounded (e.g. the user granted in the Shizuku app and
+        // came back), start the service now. startServices() is a
+        // no-op if the service is already running or Shizuku is not
+        // authorized, so calling it here is safe.
+        startServices();
+
         shizukuChecked = false;
         mainHandler.postDelayed(() -> {
             if (isFinishing() || isDestroyed()) return;
@@ -297,15 +331,6 @@ public class MainActivity extends AppCompatActivity {
     private void initViews() {
         viewPager = findViewById(R.id.viewPager);
         toolbar = findViewById(R.id.toolbar);
-
-        // The layout names the concrete BottomNavigationView subclass.
-        // The previous version named the abstract NavigationBarView
-        // base, which the inflater cannot instantiate regardless of
-        // R8 — that was the source of the NoSuchMethodException in
-        // the 5.0 crash. ProGuard rules now also pin the constructors
-        // of both the base and the concrete class, so even if the
-        // layout tag is ever changed back by mistake, the reflective
-        // lookup still succeeds.
         bottomNavigation = findViewById(R.id.bottomNavigation);
     }
 

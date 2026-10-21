@@ -30,6 +30,20 @@ import android.util.Log;
  * query status. Until the module calls setActive(true), every
  * interposed function passes through unchanged and the Unsafe gate
  * is not installed.
+ *
+ * TRUSTED PACKAGE
+ * ---------------
+ * The native side checks whether a thread belongs to the framework
+ * by comparing its thread name against a prefix list. The standard
+ * build's prefix (com.shizuposed.manager.) is built into the C
+ * side. The stealth build's prefix (com.<x>.<y>.) is not known at
+ * compile time, so it is passed in at load time via
+ * nativeSetTrustedPackage.
+ *
+ * Without this call, the framework's own threads in the stealth
+ * build would be treated as untrusted, and the framework would
+ * scrub its own reads and dlsym calls. That breaks hooking. The
+ * call must happen before any hooks are installed.
  */
 public final class XStealthNative {
 
@@ -37,6 +51,7 @@ public final class XStealthNative {
 
     private static volatile boolean sLoaded = false;
     private static volatile boolean sAvailable = false;
+    private static volatile String sPackageName = null;
 
     private XStealthNative() {}
 
@@ -60,8 +75,81 @@ public final class XStealthNative {
         } catch (Throwable t) {
             sAvailable = false;
             Log.w(TAG, "libxstealth.so not loaded: " + t.getMessage());
+            return sAvailable;
         }
+
+        // Tell the native side which package prefix to trust. This
+        // must happen before any hooks are installed, because the
+        // trusted check is used by the read and dlsym interposers,
+        // which the framework itself goes through.
+        //
+        // In the standard build this is "com.shizuposed.manager",
+        // which the C side already knows. In the stealth build
+        // it's "com.<x>.<y>", which only this call can convey.
+        try {
+            String pkg = currentPackageName();
+            if (pkg != null && !pkg.isEmpty()) {
+                nativeSetTrustedPackage(pkg);
+                sPackageName = pkg;
+                Log.i(TAG, "trusted package set to " + pkg);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "nativeSetTrustedPackage failed: " + t.getMessage());
+            // Non-fatal: the built-in prefix list still covers the
+            // standard build. Stealth build's threads won't be
+            // recognized as trusted, but hooking still works —
+            // the framework's own reads just go through the
+            // scrubber, which is slow but not broken.
+        }
+
         return sAvailable;
+    }
+
+    /**
+     * Resolve the running package name.
+     *
+     * In a normal app process, ActivityThread.currentPackageName()
+     * returns it directly. In the shell-side XposedHook process,
+     * the manager package name is passed via the
+     * shizuposed.manager.package system property (see
+     * ShizuPosedService.launchAppUnderShizuPosed), so check that
+     * first.
+     *
+     * Fallback: the standard name, so old builds keep working.
+     */
+    private static String currentPackageName() {
+        String fromProp = System.getProperty("shizuposed.manager.package");
+        if (fromProp != null && !fromProp.isEmpty()) return fromProp;
+
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            java.lang.reflect.Method m = at.getMethod("currentPackageName");
+            Object v = m.invoke(null);
+            if (v instanceof String && !((String) v).isEmpty()) {
+                return (String) v;
+            }
+        } catch (Throwable ignored) {}
+
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            java.lang.reflect.Method cur = at.getMethod("currentActivityThread");
+            Object thread = cur.invoke(null);
+            if (thread != null) {
+                java.lang.reflect.Method getApp =
+                    at.getMethod("getApplication");
+                Object app = getApp.invoke(thread);
+                if (app != null) {
+                    java.lang.reflect.Method getPkg =
+                        app.getClass().getMethod("getPackageName");
+                    Object pkg = getPkg.invoke(app);
+                    if (pkg instanceof String && !((String) pkg).isEmpty()) {
+                        return (String) pkg;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        return "com.shizuposed.manager";
     }
 
     public static boolean isAvailable() {
@@ -100,11 +188,6 @@ public final class XStealthNative {
     // SETTINGS XML / PREAD / LIBART BACKUP
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Number of times the settings XML scrub has fired in this
-     * process. Non-zero means a detector tried to read the settings
-     * backing files and was stopped.
-     */
     public static int getSettingsXmlBlockedCount() {
         if (!sAvailable) return 0;
         try { return nativeGetSettingsXmlBlockedCount(); }
@@ -157,57 +240,30 @@ public final class XStealthNative {
     // STUB TEMPLATE — status and diagnostics
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Whether the native stub-template capture and verification
-     * succeeded on this device. When true, the hook-stub backends
-     * splice a byte-identical ART prologue into every stub they
-     * generate. When false, they fall back to their own shipped
-     * prologue — still correct, just not byte-identical.
-     */
     public static boolean isStubTemplateValid() {
         if (!sAvailable) return false;
         try { return nativeIsStubTemplateValid(); }
         catch (Throwable t) { return false; }
     }
 
-    /**
-     * Number of bytes in the common-prefix probe before verification
-     * stops mattering. Diagnostics only.
-     */
     public static int getStubTemplateConfidence() {
         if (!sAvailable) return 0;
         try { return nativeGetStubTemplateConfidence(); }
         catch (Throwable t) { return 0; }
     }
 
-    /**
-     * Full verification metadata: verified length, frame size, the
-     * per-register save offsets the verifier extracted, and whether
-     * the template passed verification.
-     */
     public static String getStubTemplateInfo() {
         if (!sAvailable) return "unavailable";
         try { return nativeGetStubTemplateInfo(); }
         catch (Throwable t) { return "error: " + t.getMessage(); }
     }
 
-    /**
-     * First 32 bytes of the verified template, hex-encoded. Intended
-     * for the on-device verification harness — a developer can
-     * compare this against a manually-read stub's first 32 bytes to
-     * confirm the splice happened.
-     */
     public static String dumpStubTemplate() {
         if (!sAvailable) return "unavailable";
         try { return nativeDumpStubTemplate(); }
         catch (Throwable t) { return "error: " + t.getMessage(); }
     }
 
-    /**
-     * Human-readable one-line summary of the template state. Safe
-     * to call before nativeInit() has run — returns "native:
-     * unavailable" in that case.
-     */
     public static String stubTemplateSummary() {
         if (!sAvailable) return "stub template: native unavailable";
 
@@ -328,4 +384,14 @@ public final class XStealthNative {
     public static native boolean nativeIsStubTemplateValid();
     public static native String nativeGetStubTemplateInfo();
     public static native String nativeDumpStubTemplate();
+
+    /**
+     * Tell the native side which package prefix to trust.
+     *
+     * See the class javadoc for why this is needed. In the
+     * standard build it's redundant — the C side already has the
+     * prefix built in. In the stealth build it's the only way the
+     * native side learns the scrambled package name.
+     */
+    public static native void nativeSetTrustedPackage(String packageName);
 }

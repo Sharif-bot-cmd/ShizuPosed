@@ -39,6 +39,20 @@ import java.util.Set;
  * scope, not by flipping a separate switch. This keeps the
  * detail sheet to one control per signal, which is how it worked
  * before this feature existed.
+ *
+ * STEALTH BUILD
+ * -------------
+ * Two fields carry the actual package name and status provider
+ * authority of the running manager. They are written by
+ * XStealthStatusWriter from the manager process, and read here by
+ * PackageCheck and RunningProcessCheck to decide which names to
+ * hide.
+ *
+ * In the standard build these are "com.shizuposed.manager" and
+ * "com.shizuposed.manager.status". In the stealth build they are
+ * the scrambled com.<x>.<y> equivalents. Reading them from the
+ * config instead of hardcoding means the same check code hides
+ * whichever build is actually installed.
  */
 public final class XStealthConfig {
 
@@ -79,6 +93,22 @@ public final class XStealthConfig {
 
     public final Set<String> scope;
 
+    /**
+     * Actual package name of the installed manager. Set by
+     * XStealthStatusWriter from the running manager's
+     * getPackageName(). Fallback is the standard name so an old
+     * config file that predates this field still hides the
+     * standard package.
+     */
+    public final String shizuPosedPackageName;
+
+    /**
+     * Actual status provider authority of the installed manager.
+     * Set by XStealthStatusWriter from the running manager's
+     * manifest. Fallback is the standard authority.
+     */
+    public final String statusAuthority;
+
     private XStealthConfig(JSONObject o) {
         enabled               = o.optBoolean("enabled", false);
         nextEnabled           = o.optBoolean("nextEnabled", false);
@@ -103,6 +133,11 @@ public final class XStealthConfig {
 
         hideCachedDetectionValues =
             o.optBoolean("hideCachedDetectionValues", false);
+
+        shizuPosedPackageName = o.optString(
+            "shizuPosedPackageName", "com.shizuposed.manager");
+        statusAuthority = o.optString(
+            "statusAuthority", "com.shizuposed.manager.status");
 
         Map<String, List<String>> cvk = new HashMap<>();
         JSONObject cvkObj = o.optJSONObject("cachedValueKeys");
