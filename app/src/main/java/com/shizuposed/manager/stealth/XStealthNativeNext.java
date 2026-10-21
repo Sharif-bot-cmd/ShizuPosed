@@ -17,6 +17,16 @@ import android.util.Log;
  * The library shares the same hidden path and string sets as
  * libxstealth.so, so a target sees consistent behavior from both
  * engines when both are active.
+ *
+ * TRUSTED PACKAGE
+ * ---------------
+ * The native side checks whether a thread belongs to the framework
+ * by comparing its thread name against a prefix list. The standard
+ * build's prefix (com.shizuposed.manager.) is not hardcoded — it
+ * is passed in at load time via nativeSetTrustedPackage. Without
+ * this call, the framework's own threads would be treated as
+ * untrusted, and the next engine's filters would block the
+ * framework's own syscalls — which breaks hooking.
  */
 public final class XStealthNativeNext {
 
@@ -47,8 +57,67 @@ public final class XStealthNativeNext {
         } catch (Throwable t) {
             sAvailable = false;
             Log.w(TAG, "libxstealth_next.so not loaded: " + t.getMessage());
+            return sAvailable;
         }
+
+        // Tell the native side which package prefix to trust. Must
+        // happen before any hooks are installed, because the
+        // trusted check gates the framework's own syscalls.
+        try {
+            String pkg = currentPackageName();
+            if (pkg != null && !pkg.isEmpty()) {
+                nativeSetTrustedPackage(pkg);
+                Log.i(TAG, "trusted package set to " + pkg);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "nativeSetTrustedPackage failed: " + t.getMessage());
+        }
+
         return sAvailable;
+    }
+
+    /**
+     * Resolve the running package name.
+     *
+     * Same logic as XStealthNative.currentPackageName(). In the
+     * shell-side XposedHook process, the manager package name is
+     * passed via the shizuposed.manager.package system property
+     * (see ShizuPosedService.launchAppUnderShizuPosed), so check
+     * that first. In a normal app process, ActivityThread knows it.
+     */
+    private static String currentPackageName() {
+        String fromProp = System.getProperty("shizuposed.manager.package");
+        if (fromProp != null && !fromProp.isEmpty()) return fromProp;
+
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            java.lang.reflect.Method m = at.getMethod("currentPackageName");
+            Object v = m.invoke(null);
+            if (v instanceof String && !((String) v).isEmpty()) {
+                return (String) v;
+            }
+        } catch (Throwable ignored) {}
+
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            java.lang.reflect.Method cur = at.getMethod("currentActivityThread");
+            Object thread = cur.invoke(null);
+            if (thread != null) {
+                java.lang.reflect.Method getApp =
+                    at.getMethod("getApplication");
+                Object app = getApp.invoke(thread);
+                if (app != null) {
+                    java.lang.reflect.Method getPkg =
+                        app.getClass().getMethod("getPackageName");
+                    Object pkg = getPkg.invoke(app);
+                    if (pkg instanceof String && !((String) pkg).isEmpty()) {
+                        return (String) pkg;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        return "com.shizuposed.manager";
     }
 
     public static boolean isAvailable() {
@@ -129,6 +198,12 @@ public final class XStealthNativeNext {
         catch (Throwable t) { return 0; }
     }
 
+    public static int getGetppidInterceptedCount() {
+        if (!sAvailable) return 0;
+        try { return nativeGetGetppidInterceptedCount(); }
+        catch (Throwable t) { return 0; }
+    }
+
     // ═════════════════════════════════════════════════════════════
     // JNI — single declaration block
     // ═════════════════════════════════════════════════════════════
@@ -142,13 +217,15 @@ public final class XStealthNativeNext {
     private static native int     nativeGetPatchCount();
     private static native String  nativeGetStrategy();
 
+    private static native void    nativeSetTrustedPackage(String packageName);
     private static native boolean nativeIsMmapGuardActive();
     private static native int     nativeGetMmapInterceptedCount();
     private static native String  nativeGetMmapGuardInfo();
     private static native int     nativeGetPread64InterceptedCount();
-    public static native int nativeGetOpenat2InterceptedCount();
-    public static native int nativeGetIoctlInterceptedCount();
-    public static native int nativeGetStatxInterceptedCount();
-    public static native int nativeGetFaccessat2InterceptedCount();
-    public static native int nativeGetFchmodat2InterceptedCount();
+    public  static native int     nativeGetOpenat2InterceptedCount();
+    public  static native int     nativeGetIoctlInterceptedCount();
+    public  static native int     nativeGetStatxInterceptedCount();
+    public  static native int     nativeGetFaccessat2InterceptedCount();
+    public  static native int     nativeGetFchmodat2InterceptedCount();
+    public  static native int     nativeGetGetppidInterceptedCount();
 }

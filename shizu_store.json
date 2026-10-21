@@ -8,10 +8,9 @@
   "detailed_description": "ShizuPosed is an Xposed-compatible hook framework that runs on a locked bootloader, without root, and without repackaging APKs. It uses Shizuku to launch a target app under its own control via app_process, then installs ART hooks from inside that same process.\n\n**What it does:**\n- Runs standard Xposed-API modules inside target apps\n- Works on Android 10+ without root or bootloader unlock\n- Installs hooks during the target's bootstrap, before Application.onCreate\n- Ships XStealth, a built-in privacy module for hiding from detection checks\n\n**What it isn't:**\n- Not LSPosed. ShizuPosed is a per-launch hook framework, not system-wide injection.\n- The target app has to be launched from ShizuPosed for hooks to install.\n- system_server and zygote-wide hooking are not reachable.\n\nIf you need zygote-wide coverage or system_server hooks, use LSPosed. If you can't or won't root, ShizuPosed is for you.",
 
   "developer_message": "Built for people who can't root or won't. If a module doesn't work, check the compatibility notes on XDA before reporting it as broken — many modules need system_server or zygote coverage, and that's a structural limit, not a bug.",
-  "changelog": "### 1.1.5\n\n- Monitor-triggered injection is now real; the process monitor spawns a routed launch for scoped apps.\n- Monitor-triggered injection is spawn-only. The user opens the app; the framework doesn't pop it to the foreground.\n- Scope editor hides protected-UID packages.\n- Update notifications via GitHub Releases.\n- Shell-side payload refreshes on update by content hash, not by name.",
 
-  "version_name": "1.1.5",
-  "version_code": 4800,
+  "version_name": "1.2.1",
+  "version_code": 5280,
   "min_sdk": 29,
   "target_sdk": 37,
   "license": "Apache-2.0",
