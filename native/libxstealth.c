@@ -586,6 +586,8 @@ static const char *TRUSTED_PREFIXES[] = {
     NULL
 };
 
+static char g_runtime_trusted_prefix[128] = {0};
+
 static volatile int g_xstealth_active = 0;
 static volatile int g_resolved = 0;
 static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -680,6 +682,10 @@ static bool is_trusted_caller(void) {
 
     for (int i = 0; TRUSTED_PREFIXES[i]; i++) {
         if (strstr(comm, TRUSTED_PREFIXES[i]) != NULL) return true;
+    }
+    if (g_runtime_trusted_prefix[0] != '\0'
+            && strstr(comm, g_runtime_trusted_prefix) != NULL) {
+        return true;
     }
     if (strstr(comm, "ShizuPosed") != NULL) return true;
     if (strstr(comm, "Xposed") != NULL) return true;
@@ -2814,18 +2820,32 @@ Java_com_shizuposed_manager_stealth_XStealthNative_nativeInit(
     return (g_key_symbols_resolved == 5) ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT void JNICALL
-Java_com_shizuposed_manager_stealth_XStealthNative_nativeSetActive(
-        JNIEnv *env, jclass clazz, jboolean active) {
-    (void) env;
-    (void) clazz;
 
-    g_xstealth_active = active ? 1 : 0;
-    if (g_xstealth_active) {
-        resolve_real_symbols();
-        install_unsafe_gate();
+JNIEXPORT void JNICALL
+Java_com_shizuposed_manager_stealth_XStealthNative_nativeSetTrustedPackage(
+        JNIEnv *env, jclass clazz, jstring packageName) {
+    (void) clazz;
+    if (packageName == NULL) {
+        g_runtime_trusted_prefix[0] = '\0';
+        LOGI("XStealth native: trusted package cleared");
+        return;
     }
-    LOGI("XStealth native: active=%d", g_xstealth_active);
+
+    const char *utf = (*env)->GetStringUTFChars(env, packageName, NULL);
+    if (utf == NULL) return;
+
+    size_t n = strlen(utf);
+    if (n >= sizeof(g_runtime_trusted_prefix) - 1) {
+        n = sizeof(g_runtime_trusted_prefix) - 2;
+    }
+    memcpy(g_runtime_trusted_prefix, utf, n);
+    g_runtime_trusted_prefix[n] = '.';
+    g_runtime_trusted_prefix[n + 1] = '\0';
+
+    (*env)->ReleaseStringUTFChars(env, packageName, utf);
+
+    LOGI("XStealth native: trusted package prefix = \"%s\"",
+         g_runtime_trusted_prefix);
 }
 
 JNIEXPORT jboolean JNICALL
