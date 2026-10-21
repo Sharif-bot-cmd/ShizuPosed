@@ -62,31 +62,53 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *   • Calls from a helper process the target spawned.
  *   • Native code that opens /dev/binder directly.
  *   • Calls made before the hooks are installed.
+ *
+ * STEALTH BUILD
+ * -------------
+ * The package name to hide is read from XStealthConfig at install
+ * time, not hardcoded. In the standard build it's
+ * "com.shizuposed.manager"; in the stealth build it's the
+ * scrambled com.<x>.<y>. This lets the same check code work for
+ * both builds.
  */
 public final class PackageCheck {
 
     private static final String TAG = "XStealth";
 
-    public static final String SHIZUKU_PKG    = "moe.shizuku.privileged.api";
-    public static final String SHIZUPOSED_PKG = "com.shizuposed.manager";
+    public static final String SHIZUKU_PKG = "moe.shizuku.privileged.api";
+
+    /**
+     * Actual package name to hide. Resolved from XStealthConfig
+     * at install() time. Falls back to the standard name so an
+     * old config that predates this field still hides the
+     * standard package.
+     */
+    private static volatile String sShizuPosedPackage = null;
+
+    private static String shizuPosedPackage() {
+        String cached = sShizuPosedPackage;
+        if (cached != null) return cached;
+        String fromConfig = null;
+        try {
+            XStealthConfig cfg = XStealthConfig.load();
+            if (cfg != null) fromConfig = cfg.shizuPosedPackageName;
+        } catch (Throwable ignored) {}
+        if (fromConfig != null && !fromConfig.isEmpty()) {
+            sShizuPosedPackage = fromConfig;
+            return fromConfig;
+        }
+        sShizuPosedPackage = "com.shizuposed.manager";
+        return sShizuPosedPackage;
+    }
 
     /** Binder descriptor for the package manager service. */
     private static final String PM_DESCRIPTOR =
         "android.content.pm.IPackageManager";
 
-    /**
-     * IBinder.DUMP_TRANSACTION. The numeric value is the raw
-     * 4-byte ASCII opcode 'DUMP' read as a little-endian int.
-     */
     private static final int DUMP_TRANSACTION = 1598311760;
 
-    /**
-     * Transaction code -> method name for the PM interface, built
-     * once per process.
-     */
     private static volatile Map<Integer, String> sPmCodes = null;
 
-    /** Diagnostics counters. */
     private static final AtomicLong sTransactTotal     = new AtomicLong();
     private static final AtomicLong sTransactPmRefused = new AtomicLong();
     private static final AtomicLong sDumpRefused       = new AtomicLong();
@@ -104,7 +126,11 @@ public final class PackageCheck {
         final boolean hideShizuku    = config.hideShizukuPackage;
         final boolean hideShizuPosed = config.hideShizuPosedPackage;
 
-        // ─── Level 1: PackageManager API ────────────────────────
+        // Resolve the actual package name once, before any hooks
+        // fire. Doing this at install time means the first query
+        // is as correct as every subsequent one.
+        shizuPosedPackage();
+
         hookGetPackageInfoInt(pmClass, hideShizuku, hideShizuPosed);
         hookGetApplicationInfoInt(pmClass, hideShizuku, hideShizuPosed);
         hookGetInstalledPackagesInt(pmClass, hideShizuku, hideShizuPosed);
@@ -132,7 +158,6 @@ public final class PackageCheck {
         hookResolveActivity(pmClass, hideShizuku, hideShizuPosed);
         hookQueryIntentServices(pmClass, hideShizuku, hideShizuPosed);
 
-        // ─── Level 2 + 3: Binder ────────────────────────────────
         buildPmCodeTable();
         hookBinderTransact(hideShizuku, hideShizuPosed);
         installTransactListener();
@@ -140,16 +165,16 @@ public final class PackageCheck {
         XposedBridge.log(TAG + ": PackageCheck installed ("
             + "pm=API, binder="
             + (sPmCodes != null ? "with-code-table" : "descriptor-only")
-            + ", dump=parsed)");
+            + ", dump=parsed, hidePkg=" + shizuPosedPackage() + ")");
         XStealthRegistry.record("PackageCheck");
     }
 
-    /** Snapshot for the detail sheet. */
     public static String describeBinder() {
         return "transact=" + sTransactTotal.get()
             + " pmRefused=" + sTransactPmRefused.get()
             + " dumpRefused=" + sDumpRefused.get()
-            + " pmCodes=" + (sPmCodes != null ? sPmCodes.size() : 0);
+            + " pmCodes=" + (sPmCodes != null ? sPmCodes.size() : 0)
+            + " hidePkg=" + shizuPosedPackage();
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -207,13 +232,11 @@ public final class PackageCheck {
                         Parcel data = (Parcel) p.args[1];
                         if (data == null) return;
 
-                        // ── DUMP_TRANSACTION ────────────────────
                         if (code == DUMP_TRANSACTION) {
                             checkDump(data, hideShizuku, hideShizuPosed);
                             return;
                         }
 
-                        // ── IPackageManager ─────────────────────
                         String descriptor = readInterfaceDescriptor(data);
                         if (descriptor == null
                                 || !descriptor.equals(PM_DESCRIPTOR)) {
@@ -242,38 +265,21 @@ public final class PackageCheck {
         }
     }
 
-    /**
-     * Parse a DUMP_TRANSACTION parcel and refuse if the args array
-     * names a hidden package.
-     *
-     * Uses Parcel.createStringArray() rather than readStringArray():
-     * readStringArray takes a pre-allocated out-parameter on some
-     * Android versions and returns an array on others, and the
-     * stub the compiler sees is inconsistent about which overload
-     * is available. createStringArray() is the one that has always
-     * returned the array directly.
-     */
     private static void checkDump(Parcel data,
                                    boolean hideShizuku,
                                    boolean hideShizuPosed)
             throws android.os.RemoteException {
         int pos = data.dataPosition();
         try {
-            // Try to read the descriptor first. If it's present,
-            // the parcel starts with a string.
             try { data.readString(); } catch (Throwable ignored) {}
-
-            // Read the file descriptor.
             try { data.readFileDescriptor(); } catch (Throwable ignored) {}
 
-            // Read the args array.
             String[] args = null;
             try {
                 args = data.createStringArray();
             } catch (Throwable ignored) {}
             if (args == null || args.length == 0) return;
 
-            // Is this a `dumpsys package ...` call?
             boolean isPackageDump = false;
             for (String a : args) {
                 if (a == null) continue;
@@ -285,7 +291,6 @@ public final class PackageCheck {
             }
             if (!isPackageDump) return;
 
-            // Does any arg name a hidden package?
             String hit = null;
             for (String a : args) {
                 if (a == null) continue;
@@ -303,7 +308,6 @@ public final class PackageCheck {
         } catch (android.os.RemoteException re) {
             throw re;
         } catch (Throwable parseErr) {
-            // Parcel shape not what we expected. Pass through.
         } finally {
             try { data.setDataPosition(pos); }
             catch (Throwable ignored) {}
@@ -861,8 +865,8 @@ public final class PackageCheck {
     private static boolean shouldHide(String pkg, boolean hideShizuku,
                                       boolean hideShizuPosed) {
         if (pkg == null) return false;
-        if (hideShizuku    && SHIZUKU_PKG.equals(pkg))    return true;
-        if (hideShizuPosed && SHIZUPOSED_PKG.equals(pkg)) return true;
+        if (hideShizuku && SHIZUKU_PKG.equals(pkg)) return true;
+        if (hideShizuPosed && shizuPosedPackage().equals(pkg)) return true;
         return false;
     }
 

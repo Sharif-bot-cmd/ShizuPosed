@@ -371,42 +371,63 @@ public class ShizuPosedService extends Service {
         super.onCreate();
         isServiceRunning = true;
 
+        // Create the notification channel before startForeground,
+        // because startForeground on Android 8+ requires the channel
+        // to exist. But keep the channel creation minimal — no
+        // Logger, no file I/O — so it can't eat into the 5-second
+        // FGS window.
         createNotificationChannel();
 
+        // Foreground FIRST. Android gives a startForegroundService()
+        // caller only 5 seconds to call startForeground() before it
+        // kills the whole process with
+        // ForegroundServiceDidNotStartInTimeException. On a slow ROM
+        // or a busy device, initialising the Logger (which opens
+        // files, reads prefs, and can block on shared prefs for
+        // hundreds of ms) can easily consume that budget. Doing
+        // startForeground before any of that makes the contract
+        // impossible to miss.
         try {
             startForeground(NOTIFICATION_ID,
                 buildNotification("Service running"));
             foregroundStarted.set(true);
-            logger = Logger.getInstance(this);
-            logger.i("ShizuPosedService foreground promoted");
         } catch (Throwable t) {
             foregroundStarted.set(false);
             android.util.Log.e("ShizuPosedService",
-                "startForeground failed — continuing as background service", t);
+                "startForeground failed in onCreate", t);
+            // Retry once on the main thread. If the second attempt
+            // fails too, the service runs as a background service
+            // and the caller's FGS contract will eventually kill us —
+            // but at least the first 5-second window is past.
             new Handler(Looper.getMainLooper()).postDelayed(() -> {
                 try {
                     startForeground(NOTIFICATION_ID,
                         buildNotification("Service running"));
                     foregroundStarted.set(true);
-                    if (logger != null) {
-                        logger.i("ShizuPosedService foreground promoted "
-                            + "on retry");
-                    }
                 } catch (Throwable t2) {
                     android.util.Log.e("ShizuPosedService",
                         "startForeground retry failed — staying background", t2);
                 }
-            }, 2000L);
+            }, 200);
         }
 
-        if (logger == null) {
+        // Now that the FGS contract is satisfied, set up the Logger.
+        // A Logger failure here can no longer kill the process.
+        try {
             logger = Logger.getInstance(this);
+        } catch (Throwable t) {
+            android.util.Log.e("ShizuPosedService",
+                "Logger init failed", t);
         }
-        logger.i("ShizuPosedService creating...");
+        if (logger != null) {
+            logger.i("ShizuPosedService creating...");
+        }
 
         if (REQUIRE_AUTHORIZATION && !isAuthorizedNow()) {
-            logger.w("onCreate: Shizuku not currently responsive — "
-                + "deferring deploy; will resume on authorization");
+            if (logger != null) {
+                logger.w("onCreate: Shizuku not currently responsive — "
+                    + "deferring deploy; will resume on authorization");
+            }
         }
 
         setupWorkerInfrastructure();
@@ -480,6 +501,9 @@ public class ShizuPosedService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // Foreground FIRST, before any other work. onStartCommand
+        // can be called after a service restart, where the 5-second
+        // FGS window is already ticking.
         try {
             startForeground(NOTIFICATION_ID,
                 buildNotification("Service running"));
@@ -494,7 +518,7 @@ public class ShizuPosedService extends Service {
         if (workerHandler == null) {
             setupWorkerInfrastructure();
         }
-
+   
         if (workerHandler == null) {
             if (intent != null
                     && ShizuPosedManagerApp.ACTION_SHIZUKU_AUTHORIZED
@@ -734,17 +758,6 @@ public class ShizuPosedService extends Service {
         }
     }
 
-    /**
-     * True if any package in the smart-foreground scope is currently
-     * the top resumed activity. Uses the same freshness logic as
-     * ForegroundMonitor — a package is foreground if its most recent
-     * event in the window was ACTIVITY_RESUMED and that resume is
-     * recent.
-     *
-     * Called from the worker thread during service setup and from
-     * restoreDevSettings, so it must be cheap. queryEvents on a
-     * 5-second window is a few ms.
-     */
     private boolean isAnyWatchedPackageForeground() {
         try {
             UsageStatsManager usm = (UsageStatsManager)
@@ -756,29 +769,47 @@ public class ShizuPosedService extends Service {
             if (scope == null || scope.isEmpty()) return false;
 
             long now = System.currentTimeMillis();
-            long windowStart = now - FOREGROUND_CHECK_WINDOW_MS;
+            long windowStart = now - 60_000L;
+            long freshness = 4_000L;
+
             UsageEvents events = usm.queryEvents(windowStart, now);
             if (events == null) return false;
 
             Map<String, Integer> lastEvent = new HashMap<>();
+            Map<String, Long> lastResumeTs = new HashMap<>();
+
             UsageEvents.Event e = new UsageEvents.Event();
             while (events.hasNextEvent()) {
                 events.getNextEvent(e);
                 String pkg = e.getPackageName();
                 if (pkg == null) continue;
                 int type = e.getEventType();
-                if (type == UsageEvents.Event.ACTIVITY_RESUMED
-                        || type == UsageEvents.Event.ACTIVITY_PAUSED
-                        || type == UsageEvents.Event.ACTIVITY_STOPPED) {
-                    lastEvent.put(pkg, type);
+                if (type != UsageEvents.Event.ACTIVITY_RESUMED
+                        && type != UsageEvents.Event.ACTIVITY_PAUSED
+                        && type != UsageEvents.Event.ACTIVITY_STOPPED) {
+                    continue;
+                }
+                lastEvent.put(pkg, type);
+                if (type == UsageEvents.Event.ACTIVITY_RESUMED) {
+                    Long prev = lastResumeTs.get(pkg);
+                    long ts = e.getTimeStamp();
+                    if (prev == null || ts > prev) {
+                        lastResumeTs.put(pkg, ts);
+                    }
                 }
             }
 
+            long freshest = now - freshness;
             for (String pkg : scope) {
                 Integer t = lastEvent.get(pkg);
-                if (t != null && t == UsageEvents.Event.ACTIVITY_RESUMED) {
-                    return true;
+                if (t == null || t != UsageEvents.Event.ACTIVITY_RESUMED) {
+                    continue;
                 }
+                Long ts = lastResumeTs.get(pkg);
+                if (ts == null || ts < freshest) {
+                    continue;
+                }
+                return true;
             }
             return false;
         } catch (Throwable t) {
@@ -2417,7 +2448,10 @@ public class ShizuPosedService extends Service {
                 +   "-Dshizuposed.shell.base=" + base + " "
                 +   "-Dshizuposed.shell.libs=" + libsDir + " "
                 +   "-Dshizuposed.hook.delay=" + hookDelayMs + " "
-                +   "/system/bin "
+                +   "-Dshizuposed.status.authority="
+                +       getStatusAuthority() + " "
+                +   "-Dshizuposed.manager.package="
+                +       getPackageName() + " "
                 +   "com.shizuposed.manager.core.XposedHook "
                 +   packageName + " 0 " + targetUid
                 +   " </dev/null >>" + logPath + " 2>&1 "
@@ -2735,6 +2769,27 @@ public class ShizuPosedService extends Service {
             }
             return false;
         }
+    }
+
+    private String getStatusAuthority() {
+        try {
+            android.content.pm.PackageInfo info = getPackageManager()
+                .getPackageInfo(getPackageName(),
+                    android.content.pm.PackageManager.GET_PROVIDERS);
+            if (info.providers != null) {
+                for (android.content.pm.ProviderInfo pi : info.providers) {
+                    if (pi.name != null
+                            && pi.name.endsWith("ModuleStatusProvider")) {
+                        return pi.authority;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.d("getStatusAuthority failed: " + t.getMessage());
+            }
+        }
+        return "com.shizuposed.manager.status";
     }
 
     // ═════════════════════════════════════════════════════════════

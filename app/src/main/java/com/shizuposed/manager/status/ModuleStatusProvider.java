@@ -2,6 +2,7 @@ package com.shizuposed.manager.status;
 
 import android.content.ContentProvider;
 import android.content.ContentValues;
+import android.content.Context;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
@@ -64,24 +65,34 @@ public class ModuleStatusProvider extends ContentProvider {
 
     private static final String TAG = "ShizuPosedProvider";
 
+    private static volatile String sResolvedAuthority = AUTHORITY;
+
     /** How long a marker scan stays valid. */
     private static final long MARKER_CACHE_TTL_MS = 3000L;
 
     public static Uri moduleUri(String packageName) {
-        return Uri.parse("content://" + AUTHORITY + "/module/" + packageName);
+        return Uri.parse("content://" + sResolvedAuthority
+            + "/module/" + packageName);
     }
 
     public static Uri activeUri(String modulePackage) {
-        return Uri.parse("content://" + AUTHORITY + "/active/" + modulePackage);
+        return Uri.parse("content://" + sResolvedAuthority
+            + "/active/" + modulePackage);
     }
 
     public static Uri scopeUri(String modulePackage) {
-        return Uri.parse("content://" + AUTHORITY + "/scope/" + modulePackage);
+        return Uri.parse("content://" + sResolvedAuthority
+            + "/scope/" + modulePackage);
     }
 
     public static Uri anyActiveUri(String modulePackage) {
-        return Uri.parse("content://" + AUTHORITY + "/any-active/" + modulePackage);
+        return Uri.parse("content://" + sResolvedAuthority
+            + "/any-active/" + modulePackage);
     }
+
+    public static String getResolvedAuthority() {
+            return sResolvedAuthority;
+        }
 
     private Logger logger;
 
@@ -97,7 +108,14 @@ public class ModuleStatusProvider extends ContentProvider {
     public boolean onCreate() {
         if (getContext() != null) {
             logger = Logger.getInstance(getContext());
-            if (logger != null) logger.i("ModuleStatusProvider created");
+            String resolved = authorityFromContext(getContext());
+            if (resolved != null && !resolved.isEmpty()) {
+                sResolvedAuthority = resolved;
+            }
+            if (logger != null) {
+                logger.i("ModuleStatusProvider created (authority="
+                    + sResolvedAuthority + ")");
+            }
         }
         return true;
     }
@@ -118,6 +136,24 @@ public class ModuleStatusProvider extends ContentProvider {
                 Log.e(TAG, "ensureModulesLoaded failed", t);
             }
         }
+    }
+
+    private static String authorityFromContext(Context ctx) {
+        if (ctx == null) return AUTHORITY;
+        try {
+            android.content.pm.PackageInfo info = ctx.getPackageManager()
+                .getPackageInfo(ctx.getPackageName(),
+                    android.content.pm.PackageManager.GET_PROVIDERS);
+            if (info.providers != null) {
+                for (android.content.pm.ProviderInfo pi : info.providers) {
+                    if (pi.name != null
+                            && pi.name.endsWith("ModuleStatusProvider")) {
+                        return pi.authority;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return AUTHORITY;
     }
 
     // ─────────────────────────────────────────────────────────────

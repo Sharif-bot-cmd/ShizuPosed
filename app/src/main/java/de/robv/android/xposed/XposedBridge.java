@@ -67,8 +67,11 @@ public final class XposedBridge {
     /** Logcat tag for framework-level diagnostics. */
     private static final String FRAMEWORK_TAG = "ShizuPosed";
 
-    /** Authority of ShizuPosed's ModuleStatusProvider. */
-    private static final String PROVIDER_AUTHORITY = "com.shizuposed.manager.status";
+    private static String providerAuthority() {
+        String prop = System.getProperty("shizuposed.status.authority");
+        if (prop != null && !prop.isEmpty()) return prop;
+        return "com.shizuposed.manager.status";
+    }
 
     private XposedBridge() {}
 
@@ -315,7 +318,7 @@ public final class XposedBridge {
         if (context == null || packageName == null) return false;
         try {
             ContentResolver cr = context.getContentResolver();
-            Uri uri = Uri.parse("content://" + PROVIDER_AUTHORITY
+            Uri uri = Uri.parse("content://" + providerAuthority()
                 + "/module/" + packageName);
             try (Cursor c = cr.query(uri, null, null, null, null)) {
                 if (c != null && c.moveToFirst()) {
@@ -336,7 +339,8 @@ public final class XposedBridge {
         if (context == null) return new String[0];
         try {
             ContentResolver cr = context.getContentResolver();
-            Uri uri = Uri.parse("content://" + PROVIDER_AUTHORITY + "/modules");
+            Uri uri = Uri.parse("content://" + providerAuthority()
+                + "/modules");
             try (Cursor c = cr.query(uri, null, null, null, null)) {
                 if (c == null) return new String[0];
                 int idx = c.getColumnIndex("package");
@@ -444,7 +448,7 @@ public final class XposedBridge {
             + "declare:\n"
             + "    <queries>\n"
             + "        <provider android:authorities=\""
-            + PROVIDER_AUTHORITY + "\" />\n"
+            + providerAuthority() + "\" />\n"
             + "    </queries>\n"
             + "Without it, the provider is invisible to this app and every "
             + "activation query returns false, regardless of marker state.");

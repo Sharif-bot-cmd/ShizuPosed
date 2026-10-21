@@ -14,8 +14,12 @@ import android.util.Log;
  * providing the same class name and method signatures, ShizuPosed
  * makes those modules behave as if they were running under LSPosed.
  *
- * All answers are backed by ShizuPosed's ModuleStatusProvider
- * (content://com.shizuposed.manager.status).
+ * All answers are backed by ShizuPosed's ModuleStatusProvider. The
+ * authority the provider is registered under is build-specific: the
+ * standard build uses "com.shizuposed.manager.status", the stealth
+ * build uses "com.<x>.<y>.status". The authority is read from the
+ * "shizuposed.status.authority" system property at runtime, which
+ * ShizuPosedService passes to every spawned app_process.
  *
  * Two distinct questions modules ask:
  *   • isModuleEnabled(pkg) — did the user turn this module on?
@@ -75,13 +79,28 @@ import android.util.Log;
 public final class LSPosedManager {
 
     /** Framework name reported to modules. */
-    public static final String FRAMEWORK_NAME = "1.1.5";
+    public static final String FRAMEWORK_NAME = "1.2.0";
 
     /** Reported API version. Matches XposedBridge.XPOSED_BRIDGE_VERSION. */
     public static final int API_VERSION = 100;
 
-    /** Authority of ShizuPosed's ModuleStatusProvider. */
-    private static final String PROVIDER_AUTHORITY = "com.shizuposed.manager.status";
+    /**
+     * Status provider authority for the running build.
+     *
+     * The stealth flavor uses a scrambled authority declared in
+     * its manifest. The authority is passed to every spawned
+     * app_process via -Dshizuposed.status.authority=..., so the
+     * module's process knows which authority to query.
+     *
+     * Fallback: the standard authority, for the case where the
+     * system property is missing (older builds, or a launch that
+     * didn't pass the property).
+     */
+    private static String providerAuthority() {
+        String prop = System.getProperty("shizuposed.status.authority");
+        if (prop != null && !prop.isEmpty()) return prop;
+        return "com.shizuposed.manager.status";
+    }
 
     private static final String LOG_TAG = "ShizuPosed";
 
@@ -94,11 +113,6 @@ public final class LSPosedManager {
     // FALLBACK CONTEXT
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Register a context to use when ActivityThread lookups fail.
-     * Called automatically by XposedBridge.log() so that later
-     * off-main-thread queries still have a usable Context.
-     */
     public static void setFallbackContext(Context ctx) {
         if (ctx != null) {
             Context app = ctx.getApplicationContext();
@@ -106,13 +120,6 @@ public final class LSPosedManager {
         }
     }
 
-    /**
-     * Accessor for the shared fallback context.
-     *
-     * XposedBridge uses this as the last step in its own context
-     * resolution, so both shims agree on which Context is in play
-     * when ActivityThread lookups fail.
-     */
     public static Context getFallbackContext() {
         return sFallbackContext;
     }
@@ -142,10 +149,12 @@ public final class LSPosedManager {
     }
 
     public static String getVersionName() {
-        return "(4800)";
+        return "(5210)";
     }
 
     public static String getManagerPackageName() {
+        String prop = System.getProperty("shizuposed.manager.package");
+        if (prop != null && !prop.isEmpty()) return prop;
         return "com.shizuposed.manager";
     }
 
@@ -153,10 +162,6 @@ public final class LSPosedManager {
     // ENABLED STATE
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * No-arg form. Derives the calling package from the stack.
-     * LSPosed declares this form.
-     */
     public static boolean isModuleEnabled() {
         String pkg = getCallingPackage();
         if (pkg == null) {
@@ -177,7 +182,7 @@ public final class LSPosedManager {
         if (context == null || packageName == null) return false;
         try {
             ContentResolver cr = context.getContentResolver();
-            Uri uri = Uri.parse("content://" + PROVIDER_AUTHORITY
+            Uri uri = Uri.parse("content://" + providerAuthority()
                 + "/module/" + packageName);
             try (Cursor c = cr.query(uri, null, null, null, null)) {
                 if (c != null && c.moveToFirst()) {
@@ -199,7 +204,8 @@ public final class LSPosedManager {
         if (ctx == null) return new String[0];
         try {
             ContentResolver cr = ctx.getContentResolver();
-            Uri uri = Uri.parse("content://" + PROVIDER_AUTHORITY + "/modules");
+            Uri uri = Uri.parse("content://" + providerAuthority()
+                + "/modules");
             try (Cursor c = cr.query(uri, null, null, null, null)) {
                 if (c == null) return new String[0];
                 int idx = c.getColumnIndex("package");
@@ -229,9 +235,6 @@ public final class LSPosedManager {
     // ACTIVE STATE
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * No-arg form. Derives the calling package from the stack.
-     */
     public static boolean isModuleActive() {
         String pkg = getCallingPackage();
         if (pkg == null) {
@@ -242,13 +245,6 @@ public final class LSPosedManager {
         return isModuleActive(pkg);
     }
 
-    /**
-     * Has this module loaded into a process for the given package?
-     *
-     * Reads the shell-side hooked markers via
-     * content://.../active/<pkg>. Returns true if any marker for
-     * <pkg> lists this module's package in its moduleList.
-     */
     public static boolean isModuleActive(String modulePackage) {
         Context ctx = currentApplication();
         if (ctx == null) {
@@ -263,7 +259,7 @@ public final class LSPosedManager {
         if (context == null || modulePackage == null) return false;
         try {
             ContentResolver cr = context.getContentResolver();
-            Uri uri = Uri.parse("content://" + PROVIDER_AUTHORITY
+            Uri uri = Uri.parse("content://" + providerAuthority()
                 + "/active/" + modulePackage);
             try (Cursor c = cr.query(uri, null, null, null, null)) {
                 if (c != null && c.moveToFirst()) {
@@ -280,30 +276,6 @@ public final class LSPosedManager {
         return false;
     }
 
-    /**
-     * Has this module been loaded into ANY process ShizuPosed has
-     * bootstrapped?
-     *
-     * This is the LSPosed-style "am I active anywhere" question.
-     * Under LSPosed, isModuleActive(getPackageName()) effectively
-     * answers this, because LSPosed injects into every process
-     * including the module's own UI. Under ShizuPosed the coverage
-     * is narrower, so a module that has only been loaded into its
-     * own UI would see false from the target-specific query.
-     *
-     * This method answers the "anywhere" question directly: true if
-     * any marker exists whose moduleList contains this module's
-     * package, regardless of which target the marker belongs to.
-     *
-     * Module UIs written for LSPosed that want to keep working
-     * under both frameworks should check, in this order:
-     *   1. Is my own hook installed in this process? (self-hook)
-     *   2. isModuleActive(getPackageName())
-     *   3. isModuleActiveAnywhere(getPackageName())
-     *
-     * The third check is ShizuPosed-specific. Modules that want to
-     * stay LSPosed-clean can skip it and rely on (1) instead.
-     */
     public static boolean isModuleActiveAnywhere(String modulePackage) {
         Context ctx = currentApplication();
         if (ctx == null) {
@@ -319,7 +291,7 @@ public final class LSPosedManager {
         if (context == null || modulePackage == null) return false;
         try {
             ContentResolver cr = context.getContentResolver();
-            Uri uri = Uri.parse("content://" + PROVIDER_AUTHORITY
+            Uri uri = Uri.parse("content://" + providerAuthority()
                 + "/any-active/" + modulePackage);
             try (Cursor c = cr.query(uri, null, null, null, null)) {
                 if (c != null && c.moveToFirst()) {
@@ -337,9 +309,6 @@ public final class LSPosedManager {
         return false;
     }
 
-    /**
-     * Packages the module has loaded into.
-     */
     public static String[] getModuleScope(String modulePackage) {
         Context ctx = currentApplication();
         if (ctx == null) return new String[0];
@@ -350,7 +319,7 @@ public final class LSPosedManager {
         if (context == null || modulePackage == null) return new String[0];
         try {
             ContentResolver cr = context.getContentResolver();
-            Uri uri = Uri.parse("content://" + PROVIDER_AUTHORITY
+            Uri uri = Uri.parse("content://" + providerAuthority()
                 + "/scope/" + modulePackage);
             try (Cursor c = cr.query(uri, null, null, null, null)) {
                 if (c == null) return new String[0];
@@ -392,7 +361,7 @@ public final class LSPosedManager {
             + "declare:\n"
             + "    <queries>\n"
             + "        <provider android:authorities=\""
-            + PROVIDER_AUTHORITY + "\" />\n"
+            + providerAuthority() + "\" />\n"
             + "    </queries>\n"
             + "Without it, the provider is invisible to this app and every "
             + "activation query returns false, regardless of marker state.");
