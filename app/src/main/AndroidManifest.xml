@@ -2,65 +2,30 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Required for BootReceiver to fire. -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-
-    <!-- WorkManager needs this on some ROMs for expedited work, harmless otherwise. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
-    <!-- Shizuku Permission -->
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
 
     <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
         tools:ignore="ProtectedPermissions" />
 
-    <!--
-        WRITE_SECURE_SETTINGS
-
-        Signature|privileged permission. Not grantable at runtime
-        through the normal runtime-permission dialog. Must be declared
-        in the manifest so the app can *request* it, and granted
-        through one of:
-
-          • pm grant (works when shell has GRANT_RUNTIME_PERMISSIONS
-            or the equivalent capability — not guaranteed on ColorOS)
-          • being installed as a priv-app under /system/priv-app/ with
-            an allowlist entry in privapp-permissions-*.xml
-          • adb install-time grant on some ROMs
-
-        Declaring it here is a prerequisite for pm grant to work. Without
-        the declaration, pm grant fails with "not requested by package"
-        and the grant is never recorded — which is what was happening
-        before. With the declaration, pm grant in ShizuPosedService can
-        actually take effect, and the direct ContentResolver write path
-        in writeGlobalSetting() becomes usable.
-
-        tools:ignore="ProtectedPermissions" is required because
-        WRITE_SECURE_SETTINGS is in the protected-permissions list and
-        the Android Gradle Plugin would otherwise warn/fail the build.
-    -->
     <uses-permission
         android:name="android.permission.WRITE_SECURE_SETTINGS"
         tools:ignore="ProtectedPermissions" />
 
-    <!--
-        QUERY_ALL_PACKAGES
-        Required on some OEM ROMs (OPPO, older Xiaomi) that do not honor
-        the intent-based <queries> block for getInstalledApplications().
-    -->
     <uses-permission
         android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
 
     <queries>
-        <provider android:authorities="com.shizuposed.manager.status" />
+        <provider android:authorities="${statusAuthority}" />
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
@@ -82,59 +47,25 @@
         android:enableOnBackInvokedCallback="true"
         tools:targetApi="37">
 
-        <!-- Shizuku Provider -->
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
-            android:authorities="${applicationId}.shizuku"
+            android:authorities="${shizukuAuthority}"
             android:enabled="true"
             android:exported="true"
             android:multiprocess="false"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
-        <!--
-            ModuleStatusProvider
-
-            Exported and world-readable so module UIs in their own
-            processes can query their own activation state. Read-only:
-            insert/update/delete throw UnsupportedOperationException in
-            ModuleStatusProvider. grantUriPermissions is left enabled so
-            the manager can hand out read grants via Intent if it ever
-            needs to (it does not currently).
-        -->
         <provider
             android:name=".status.ModuleStatusProvider"
-            android:authorities="com.shizuposed.manager.status"
+            android:authorities="${statusAuthority}"
             android:enabled="true"
             android:exported="true"
             android:multiprocess="false"
             android:grantUriPermissions="true" />
 
-        <!--
-            ShizukuBinderWatcher
-
-            A no-op ContentProvider whose only purpose is to give the
-            app a component Android creates eagerly and keeps alive for
-            the process lifetime. Inside its onCreate() it registers
-            Shizuku.addBinderReceivedListenerSticky and
-            addBinderDeadListener, so the app is notified whenever
-            Shizuku's server comes up or goes down — regardless of the
-            reason. When the binder is received, it starts
-            ShizuPosedService.
-
-            The case this exists for: Shizuku-Next's "ADB without
-            Developer options" switch takes Shizuku's server down while
-            a target app is in the foreground and brings it back when
-            the app exits. Without the watcher, nothing tells ShizuPosed
-            that the server has returned, and the service stays stopped
-            until the user opens the app.
-
-            The provider is not exported and has no public URI surface.
-            Android only needs it to exist so it will be instantiated.
-            No <intent-filter> and no <meta-data> are needed.
-        -->
         <provider
             android:name=".watcher.ShizukuBinderWatcher"
-            android:authorities="${applicationId}.shizuku-watcher"
+            android:authorities="${watcherAuthority}"
             android:enabled="true"
             android:exported="false" />
 
@@ -151,16 +82,6 @@
             </intent-filter>
         </activity>
 
-        <!--
-            ShizuPosedService
-
-            foregroundServiceType is specialUse. Android 15 forbids
-            starting a dataSync FGS from BOOT_COMPLETED; specialUse is
-            permitted at boot subject to the general background-start
-            rules, and it is the correct semantic type for this service.
-
-            The <property> tag is REQUIRED for specialUse on Android 14+.
-        -->
         <service
             android:name=".service.ShizuPosedService"
             android:enabled="true"
@@ -171,18 +92,6 @@
                 android:value="Privileged Shizuku-backed hooking and module deployment service" />
         </service>
 
-        <!--
-            Boot Receiver.
-
-            Kept android:enabled="false" — the receiver only does work if
-            you explicitly enable it at runtime (via PackageManager) and
-            the user has opted in to auto-start.
-
-            It no longer calls startForegroundService() directly. Instead
-            it enqueues a WorkManager job that retries until the platform
-            allows the FGS start (which on Android 15 is often only after
-            the app has been foregrounded at least once).
-        -->
         <receiver
             android:name=".receiver.BootReceiver"
             android:enabled="false"
@@ -195,7 +104,7 @@
 
         <provider
             android:name="androidx.core.content.FileProvider"
-            android:authorities="${applicationId}.fileprovider"
+            android:authorities="${fileProviderAuthority}"
             android:exported="false"
             android:grantUriPermissions="true">
             <meta-data
