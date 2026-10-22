@@ -420,11 +420,22 @@ public class ShizukuHelper {
         }
     }
 
+    /**
+     * Post the service start to the main thread.
+     *
+     * ShizuPosedManagerApp.autoStartService() internally calls
+     * startForegroundService, which must run on the main thread.
+     * The previous version wrapped the call in a lambda that was
+     * never posted — the outer if-condition was inside the lambda's
+     * body, but the lambda itself was constructed and discarded. So
+     * the service was never actually started from here. The call
+     * now goes directly through the Handler.
+     */
     private void autoStartServiceIfPossible() {
         if (!inAutoStart.compareAndSet(false, true)) return;
         try {
-            if (context instanceof ShizuPosedManagerApp) {
-                ShizuPosedManagerApp app = (ShizuPosedManagerApp) context;
+            final ShizuPosedManagerApp app = ShizuPosedManagerApp.getInstance();
+            if (app != null) {
                 new Handler(Looper.getMainLooper()).post(app::autoStartService);
             }
         } catch (Throwable t) {
@@ -518,9 +529,6 @@ public class ShizukuHelper {
             }
         }
 
-        // Last resort: filesystem check. The manager cannot exec
-        // /system/bin, but canRead() confirms the file exists.
-        // Shizuku's shell exec on this path will succeed.
         for (String absPath : APP_PROCESS_ABS_PATHS) {
             File f = new File(absPath);
             if (f.exists() && f.canRead()) {
@@ -536,11 +544,6 @@ public class ShizukuHelper {
         return null;
     }
 
-    /**
-     * Ask shell whether the given absolute path exists and is
-     * executable. Uses `test -x`, which is POSIX and works in every
-     * Android shell. Returns false on any error.
-     */
     private boolean shellCanExecute(String absPath) {
         try {
             String cmd = "test -x " + absPath + " && echo OK || echo NO";

@@ -3,6 +3,7 @@ package com.shizuposed.manager.stealth.checks;
 import android.app.ActivityManager;
 import android.os.Build;
 
+import com.shizuposed.manager.stealth.XStealthConfig;
 import com.shizuposed.manager.stealth.XStealthRegistry;
 
 import java.util.ArrayList;
@@ -45,21 +46,52 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Filtering on all three closes the case where a detector reads
  * the list and checks for any of these signals rather than only
  * the name.
+ *
+ * STEALTH BUILD
+ * -------------
+ * The package name to hide is read from XStealthConfig at install
+ * time, not hardcoded. In the standard build it's
+ * "com.shizuposed.manager"; in the stealth build it's the
+ * scrambled com.<x>.<y>.
  */
 public final class RunningProcessCheck {
 
     private static final String TAG = "XStealth";
 
     private static final String SHIZUKU_PKG    = "moe.shizuku.privileged.api";
-    private static final String SHIZUPOSED_PKG = "com.shizuposed.manager";
 
     /** UID of the shell user. Shizuku runs under this UID. */
     private static final int SHELL_UID = 2000;
+
+    /**
+     * Actual package name to hide. Resolved from XStealthConfig
+     * at install() time.
+     */
+    private static volatile String sShizuPosedPackage = null;
+
+    private static String shizuPosedPackage() {
+        String cached = sShizuPosedPackage;
+        if (cached != null) return cached;
+        String fromConfig = null;
+        try {
+            XStealthConfig cfg = XStealthConfig.load();
+            if (cfg != null) fromConfig = cfg.shizuPosedPackageName;
+        } catch (Throwable ignored) {}
+        if (fromConfig != null && !fromConfig.isEmpty()) {
+            sShizuPosedPackage = fromConfig;
+            return fromConfig;
+        }
+        sShizuPosedPackage = "com.shizuposed.manager";
+        return sShizuPosedPackage;
+    }
 
     private RunningProcessCheck() {}
 
     public static void install(XC_LoadPackage.LoadPackageParam lpparam) {
         Class<?> amClass = android.app.ActivityManager.class;
+
+        // Resolve once, before hooks fire.
+        shizuPosedPackage();
 
         hookRunningAppProcesses(amClass);
         hookRunningServices(amClass);
@@ -68,12 +100,13 @@ public final class RunningProcessCheck {
         hookProcessesInErrorState(amClass);
         hookMyMemoryState(amClass);
 
-        XposedBridge.log(TAG + ": RunningProcessCheck installed");
+        XposedBridge.log(TAG + ": RunningProcessCheck installed "
+            + "(hidePkg=" + shizuPosedPackage() + ")");
         XStealthRegistry.record("RunningProcessCheck");
     }
 
     // ═════════════════════════════════════════════════════════════
-    // getRunningAppProcesses
+    // HOOKS
     // ═════════════════════════════════════════════════════════════
 
     private static void hookRunningAppProcesses(Class<?> amClass) {
@@ -91,10 +124,6 @@ public final class RunningProcessCheck {
         }
     }
 
-    // ═════════════════════════════════════════════════════════════
-    // getRunningServices
-    // ═════════════════════════════════════════════════════════════
-
     private static void hookRunningServices(Class<?> amClass) {
         try {
             XposedHelpers.findAndHookMethod(
@@ -106,15 +135,8 @@ public final class RunningProcessCheck {
                     }
                 });
         } catch (Throwable t) {
-            // On API 26+ this method is not part of the public API
-            // for most callers. Hooking it fails silently, which is
-            // fine — it just means the hook isn't installed.
         }
     }
-
-    // ═════════════════════════════════════════════════════════════
-    // getRunningTasks
-    // ═════════════════════════════════════════════════════════════
 
     private static void hookRunningTasks(Class<?> amClass) {
         try {
@@ -127,19 +149,8 @@ public final class RunningProcessCheck {
                     }
                 });
         } catch (Throwable t) {
-            // Deprecated. May not be present on newer ROMs.
         }
     }
-
-    // ═════════════════════════════════════════════════════════════
-    // getHistoricalProcessExitReasons (Android 11+)
-    //
-    // Returns a list of recently-exited processes. A detector that
-    // saw Shizuku's process exit (or that killed it) can look at
-    // this list and find the exit reason. The list also reveals
-    // which processes were recently running, which can be used to
-    // infer that Shizuku was present.
-    // ═════════════════════════════════════════════════════════════
 
     private static void hookHistoricalProcessExitReasons(Class<?> amClass) {
         try {
@@ -154,13 +165,8 @@ public final class RunningProcessCheck {
                     }
                 });
         } catch (Throwable t) {
-            // Android 11+ only. Silent skip on older versions.
         }
     }
-
-    // ═════════════════════════════════════════════════════════════
-    // getProcessesInErrorState (older API)
-    // ═════════════════════════════════════════════════════════════
 
     private static void hookProcessesInErrorState(Class<?> amClass) {
         try {
@@ -173,17 +179,8 @@ public final class RunningProcessCheck {
                     }
                 });
         } catch (Throwable t) {
-            // Not present on all ROMs.
         }
     }
-
-    // ═════════════════════════════════════════════════════════════
-    // getMyMemoryState
-    //
-    // Returns a single RunningAppProcessInfo for the calling
-    // process. It carries the pkgList, which can contain hidden
-    // packages if the current process serves them.
-    // ═════════════════════════════════════════════════════════════
 
     private static void hookMyMemoryState(Class<?> amClass) {
         try {
@@ -205,7 +202,6 @@ public final class RunningProcessCheck {
                     }
                 });
         } catch (Throwable t) {
-            // Some ROMs don't expose this method.
         }
     }
 
@@ -239,18 +235,15 @@ public final class RunningProcessCheck {
             ActivityManager.RunningServiceInfo info =
                 (ActivityManager.RunningServiceInfo) o;
 
-            // Name check.
             if (info.service != null) {
                 String pkg = info.service.getPackageName();
                 if (shouldHideName(pkg)) continue;
             }
 
-            // UID check — RunningServiceInfo carries a uid field.
             try {
                 if (info.uid == SHELL_UID) continue;
             } catch (Throwable ignored) {}
 
-            // Process-name check.
             if (info.process != null && shouldHideName(info.process)) continue;
 
             out.add(info);
@@ -305,15 +298,12 @@ public final class RunningProcessCheck {
             ActivityManager.RunningAppProcessInfo info) {
         if (info == null) return false;
 
-        // 1. Name check.
         if (shouldHideName(info.processName)) return true;
 
-        // 2. UID check.
         try {
             if (info.uid == SHELL_UID) return true;
         } catch (Throwable ignored) {}
 
-        // 3. pkgList check.
         try {
             if (info.pkgList != null) {
                 for (String pkg : info.pkgList) {
@@ -327,20 +317,11 @@ public final class RunningProcessCheck {
 
     private static boolean shouldHideName(String name) {
         if (name == null) return false;
-        if (name.startsWith(SHIZUKU_PKG))    return true;
-        if (name.startsWith(SHIZUPOSED_PKG)) return true;
-        // Note: "app_process" alone is too broad — many legitimate
-        // Java processes are named app_process. Only hide it when
-        // it's the shell's helper process, which the UID check
-        // above catches. So we don't match on "app_process" here.
+        if (name.startsWith(SHIZUKU_PKG))         return true;
+        if (name.startsWith(shizuPosedPackage())) return true;
         return false;
     }
 
-    /**
-     * Remove hidden packages from a RunningAppProcessInfo's pkgList
-     * field. Modifies the struct in place — XStealth doesn't return
-     * copies, since callers may hold references to the original.
-     */
     private static void scrubPkgList(
             ActivityManager.RunningAppProcessInfo info) {
         if (info == null || info.pkgList == null) return;

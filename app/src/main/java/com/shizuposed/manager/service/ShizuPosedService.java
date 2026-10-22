@@ -52,6 +52,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class ShizuPosedService extends Service {
     private static final String CHANNEL_ID = "shizuposed_service";
     private static final String CHANNEL_NAME = "ShizuPosed Service";
+    private static final String SMART_FG_STATE_FILE = "smart_fg_state";
     private static final int NOTIFICATION_ID = 1001;
 
     private static final String SHELL_BASE_FILE = ".shell_base";
@@ -122,8 +123,6 @@ public class ShizuPosedService extends Service {
      * isn't still counted. 5 s is a comfortable margin.
      */
     private static final long FOREGROUND_CHECK_WINDOW_MS = 5_000L;
-
-    private static final String SMART_FG_STATE_FILE = "smart_fg_state";
 
     private static volatile boolean sSpawnFormResolved = false;
     private static volatile boolean sSetsidAvailable = false;
@@ -371,42 +370,63 @@ public class ShizuPosedService extends Service {
         super.onCreate();
         isServiceRunning = true;
 
+        // Create the notification channel before startForeground,
+        // because startForeground on Android 8+ requires the channel
+        // to exist. But keep the channel creation minimal — no
+        // Logger, no file I/O — so it can't eat into the 5-second
+        // FGS window.
         createNotificationChannel();
 
+        // Foreground FIRST. Android gives a startForegroundService()
+        // caller only 5 seconds to call startForeground() before it
+        // kills the whole process with
+        // ForegroundServiceDidNotStartInTimeException. On a slow ROM
+        // or a busy device, initialising the Logger (which opens
+        // files, reads prefs, and can block on shared prefs for
+        // hundreds of ms) can easily consume that budget. Doing
+        // startForeground before any of that makes the contract
+        // impossible to miss.
         try {
             startForeground(NOTIFICATION_ID,
                 buildNotification("Service running"));
             foregroundStarted.set(true);
-            logger = Logger.getInstance(this);
-            logger.i("ShizuPosedService foreground promoted");
         } catch (Throwable t) {
             foregroundStarted.set(false);
             android.util.Log.e("ShizuPosedService",
-                "startForeground failed — continuing as background service", t);
+                "startForeground failed in onCreate", t);
+            // Retry once on the main thread. If the second attempt
+            // fails too, the service runs as a background service
+            // and the caller's FGS contract will eventually kill us —
+            // but at least the first 5-second window is past.
             new Handler(Looper.getMainLooper()).postDelayed(() -> {
                 try {
                     startForeground(NOTIFICATION_ID,
                         buildNotification("Service running"));
                     foregroundStarted.set(true);
-                    if (logger != null) {
-                        logger.i("ShizuPosedService foreground promoted "
-                            + "on retry");
-                    }
                 } catch (Throwable t2) {
                     android.util.Log.e("ShizuPosedService",
                         "startForeground retry failed — staying background", t2);
                 }
-            }, 2000L);
+            }, 200);
         }
 
-        if (logger == null) {
+        // Now that the FGS contract is satisfied, set up the Logger.
+        // A Logger failure here can no longer kill the process.
+        try {
             logger = Logger.getInstance(this);
+        } catch (Throwable t) {
+            android.util.Log.e("ShizuPosedService",
+                "Logger init failed", t);
         }
-        logger.i("ShizuPosedService creating...");
+        if (logger != null) {
+            logger.i("ShizuPosedService creating...");
+        }
 
         if (REQUIRE_AUTHORIZATION && !isAuthorizedNow()) {
-            logger.w("onCreate: Shizuku not currently responsive — "
-                + "deferring deploy; will resume on authorization");
+            if (logger != null) {
+                logger.w("onCreate: Shizuku not currently responsive — "
+                    + "deferring deploy; will resume on authorization");
+            }
         }
 
         setupWorkerInfrastructure();
@@ -480,6 +500,9 @@ public class ShizuPosedService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // Foreground FIRST, before any other work. onStartCommand
+        // can be called after a service restart, where the 5-second
+        // FGS window is already ticking.
         try {
             startForeground(NOTIFICATION_ID,
                 buildNotification("Service running"));
@@ -494,7 +517,7 @@ public class ShizuPosedService extends Service {
         if (workerHandler == null) {
             setupWorkerInfrastructure();
         }
-
+   
         if (workerHandler == null) {
             if (intent != null
                     && ShizuPosedManagerApp.ACTION_SHIZUKU_AUTHORIZED
@@ -698,93 +721,16 @@ public class ShizuPosedService extends Service {
         });
     }
 
-    // ═════════════════════════════════════════════════════════════
-    // SMART FOREGROUND
-    // ═════════════════════════════════════════════════════════════
-
     private void reconcilePendingSmartFgState() {
         File stateFile = new File(getFilesDir(), SMART_FG_STATE_FILE);
         if (!stateFile.exists()) return;
 
-        if (!shizukuHelper.isAuthorized()) {
-            logger.w("startup: pending smart-fg state found but "
-                + "Shizuku not authorized — restore deferred");
-            SmartForegroundController.markPendingRestore(this);
-            return;
-        }
-
-        // Do not restore if a watched app is currently in the
-        // foreground. The state file means "a disable is in effect";
-        // if the app that triggered it is still open, the disable is
-        // still correct and must be left alone.
-        if (isAnyWatchedPackageForeground()) {
-            logger.i("startup: pending smart-fg state found, but a "
-                + "watched app is still foreground — keeping disable, "
-                + "restore deferred");
-            return;
-        }
-
-        logger.w("startup: pending smart-fg state found and no watched "
-            + "app is foreground — restoring prior values");
-        try {
-            String result = restoreDevSettings("(startup-reconcile)");
-            logger.i("startup: reconcile result: " + result);
-        } catch (Throwable t) {
-            logger.w("startup: reconcile threw: " + t.getMessage());
-        }
-    }
-
-    /**
-     * True if any package in the smart-foreground scope is currently
-     * the top resumed activity. Uses the same freshness logic as
-     * ForegroundMonitor — a package is foreground if its most recent
-     * event in the window was ACTIVITY_RESUMED and that resume is
-     * recent.
-     *
-     * Called from the worker thread during service setup and from
-     * restoreDevSettings, so it must be cheap. queryEvents on a
-     * 5-second window is a few ms.
-     */
-    private boolean isAnyWatchedPackageForeground() {
-        try {
-            UsageStatsManager usm = (UsageStatsManager)
-                getSystemService(Context.USAGE_STATS_SERVICE);
-            if (usm == null) return false;
-
-            Set<String> scope =
-                XStealthPrefs.getSmartForegroundScope(this);
-            if (scope == null || scope.isEmpty()) return false;
-
-            long now = System.currentTimeMillis();
-            long windowStart = now - FOREGROUND_CHECK_WINDOW_MS;
-            UsageEvents events = usm.queryEvents(windowStart, now);
-            if (events == null) return false;
-
-            Map<String, Integer> lastEvent = new HashMap<>();
-            UsageEvents.Event e = new UsageEvents.Event();
-            while (events.hasNextEvent()) {
-                events.getNextEvent(e);
-                String pkg = e.getPackageName();
-                if (pkg == null) continue;
-                int type = e.getEventType();
-                if (type == UsageEvents.Event.ACTIVITY_RESUMED
-                        || type == UsageEvents.Event.ACTIVITY_PAUSED
-                        || type == UsageEvents.Event.ACTIVITY_STOPPED) {
-                    lastEvent.put(pkg, type);
-                }
-            }
-
-            for (String pkg : scope) {
-                Integer t = lastEvent.get(pkg);
-                if (t != null && t == UsageEvents.Event.ACTIVITY_RESUMED) {
-                    return true;
-                }
-            }
-            return false;
-        } catch (Throwable t) {
-            logger.w("isAnyWatchedPackageForeground failed: "
-                + t.getMessage());
-            return false;
+        boolean deleted = stateFile.delete();
+        if (logger != null) {
+            logger.i("startup: deleting stale smart-fg state file "
+                + "(deleted=" + deleted + "). "
+                + "Old restore path is no longer used — ADB stays off "
+                + "until Shizuku is restarted.");
         }
     }
 
@@ -793,16 +739,13 @@ public class ShizuPosedService extends Service {
         boolean wantAdb = hideAdbPref && sWriteSecureEffective;
 
         if (!wantAdb) {
-            logger.i("smart-fg gate: hideAdbPref=" + hideAdbPref
-                + " sWriteSecureEffective=" + sWriteSecureEffective
-                + " — skipping adb_enabled write");
+            if (logger != null) {
+                logger.i("smart-fg gate: hideAdbPref=" + hideAdbPref
+                    + " sWriteSecureEffective=" + sWriteSecureEffective
+                    + " — skipping adb_enabled write");
+            }
             return "adb_enabled gated (pref=" + hideAdbPref
                 + " effective=" + sWriteSecureEffective + ")";
-        }
-
-        File stateFile = new File(getFilesDir(), SMART_FG_STATE_FILE);
-        if (stateFile.exists()) {
-            return "already disabled (saved state present)";
         }
 
         try {
@@ -816,110 +759,52 @@ public class ShizuPosedService extends Service {
                 || writeGlobalSetting("adb_wifi_enabled", "0");
 
             if (!okAdb || !okAdbWifi) {
-                if (stateFile.exists()) stateFile.delete();
-                logger.w("smart-fg: disable failed for " + pkg
-                    + " (adb=" + okAdb + " adbWifi=" + okAdbWifi
-                    + ") — no state written");
+                if (logger != null) {
+                    logger.w("smart-fg: disable failed for " + pkg
+                        + " (adb=" + okAdb + " adbWifi=" + okAdbWifi + ")");
+                }
                 return "write failed (adb=" + okAdb
                     + " adbWifi=" + okAdbWifi + ")";
             }
 
-            try (FileWriter w = new FileWriter(stateFile, false)) {
-                w.write("-");                           // line 1: dev, unused
-                w.write("\n");
-                w.write(currentAdb);                    // line 2: adb
-                w.write("\n");
-                w.write(hasAdbWifi ? currentAdbWifi : "-"); // line 3: adb_wifi
-                w.write("\n");
+            if (logger != null) {
+                logger.i("smart-fg: disabled adb_enabled for " + pkg
+                    + " (was " + currentAdb + "). "
+                    + "Not restored on exit — restarting Shizuku "
+                    + "re-enables ADB.");
             }
-            stateFile.setReadable(true, false);
-            SmartForegroundController.markPendingRestore(this);
-
-            logger.i("smart-fg: disabled for " + pkg
-                     + " (adb=" + currentAdb
-                     + " adbWifi=" + (hasAdbWifi ? currentAdbWifi : "n/a")
-                     + ")");
-            return "disabled";
+            return "disabled (no restore)";
         } catch (Throwable t) {
-            if (stateFile.exists()) stateFile.delete();
-            logger.w("smart-fg: disable failed: " + t.getMessage());
+            if (logger != null) {
+                logger.w("smart-fg: disable failed: " + t.getMessage());
+            }
             return "error: " + t.getMessage();
         }
     }
 
-    /**
-     * Restore the values captured in disableDevSettings.
-     *
-     * Never restores while a watched app is still foreground. A
-     * restore triggered by service restart, monitor restart, or
-     * recoverIfNeeded would otherwise undo the disable while the
-     * user is still inside the app that the disable exists for —
-     * which looked like "Dev Options and ADB turned back on
-     * without my consent". In that case, the restore is deferred
-     * (pending flag re-armed) and a later call runs it once the
-     * watched app has actually left.
-     */
     private String restoreDevSettings(String pkg) {
-        File stateFile = new File(getFilesDir(), SMART_FG_STATE_FILE);
-        if (!stateFile.exists()) {
-            return "nothing to restore";
-        }
-
-        if (isAnyWatchedPackageForeground()) {
-            logger.i("smart-fg: restore for " + pkg
-                + " skipped — a watched app is still foreground");
-            SmartForegroundController.markPendingRestore(this);
-            return "deferred (watched app still foreground)";
-        }
-
         try {
-            String dev = "-";
-            String adb = "-";
-            String adbWifi = "-";
-            try (BufferedReader r = new BufferedReader(
-                    new FileReader(stateFile))) {
-                String l1 = r.readLine();
-                String l2 = r.readLine();
-                String l3 = r.readLine();
-                if (l1 != null && !l1.isEmpty()) dev = l1.trim();
-                if (l2 != null && !l2.isEmpty()) adb = l2.trim();
-                if (l3 != null && !l3.isEmpty()) adbWifi = l3.trim();
-            }
-
-            boolean wantDev = !"-".equals(dev);
-            boolean wantAdb = !"-".equals(adb);
-            boolean wantAdbWifi = !"-".equals(adbWifi);
-
-            boolean okDev = !wantDev
-                || writeGlobalSetting("development_settings_enabled", dev);
-            boolean okAdb = !wantAdb
-                || writeGlobalSetting("adb_enabled", adb);
-            boolean okAdbWifi = !wantAdbWifi
-                || writeGlobalSetting("adb_wifi_enabled", adbWifi);
-
-            if (okDev && okAdb && okAdbWifi) {
-                stateFile.delete();
-                SmartForegroundController.clearPendingRestore(this);
-                logger.i("smart-fg: restored for " + pkg
-                         + " (dev=" + dev
-                         + " adb=" + adb
-                         + " adbWifi=" + adbWifi + ")");
-                return "restored";
-            } else {
-                SmartForegroundController.markPendingRestore(this);
-                logger.w("smart-fg: restore partial (dev=" + okDev
-                         + " adb=" + okAdb
-                         + " adbWifi=" + okAdbWifi
-                         + ") — state kept for retry");
-                return "partial: dev=" + okDev
-                    + " adb=" + okAdb
-                    + " adbWifi=" + okAdbWifi;
+            File stateFile = new File(getFilesDir(), SMART_FG_STATE_FILE);
+            if (stateFile.exists()) {
+                boolean deleted = stateFile.delete();
+                if (logger != null) {
+                    logger.i("smart-fg: deleted stale state file for "
+                        + pkg + " (deleted=" + deleted + ")");
+                }
             }
         } catch (Throwable t) {
-            SmartForegroundController.markPendingRestore(this);
-            logger.w("smart-fg: restore failed: " + t.getMessage());
-            return "error: " + t.getMessage();
+            if (logger != null) {
+                logger.w("smart-fg: state file cleanup failed: "
+                    + t.getMessage());
+            }
         }
+
+        if (logger != null) {
+            logger.i("smart-fg: restore for " + pkg
+                + " is a no-op — ADB stays off until the user "
+                + "restarts Shizuku");
+        }
+        return "no-op (user restarts Shizuku to re-enable ADB)";
     }
 
     private String readGlobalSetting(String key) {
@@ -2417,7 +2302,10 @@ public class ShizuPosedService extends Service {
                 +   "-Dshizuposed.shell.base=" + base + " "
                 +   "-Dshizuposed.shell.libs=" + libsDir + " "
                 +   "-Dshizuposed.hook.delay=" + hookDelayMs + " "
-                +   "/system/bin "
+                +   "-Dshizuposed.status.authority="
+                +       getStatusAuthority() + " "
+                +   "-Dshizuposed.manager.package="
+                +       getPackageName() + " "
                 +   "com.shizuposed.manager.core.XposedHook "
                 +   packageName + " 0 " + targetUid
                 +   " </dev/null >>" + logPath + " 2>&1 "
@@ -2735,6 +2623,27 @@ public class ShizuPosedService extends Service {
             }
             return false;
         }
+    }
+
+    private String getStatusAuthority() {
+        try {
+            android.content.pm.PackageInfo info = getPackageManager()
+                .getPackageInfo(getPackageName(),
+                    android.content.pm.PackageManager.GET_PROVIDERS);
+            if (info.providers != null) {
+                for (android.content.pm.ProviderInfo pi : info.providers) {
+                    if (pi.name != null
+                            && pi.name.endsWith("ModuleStatusProvider")) {
+                        return pi.authority;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.d("getStatusAuthority failed: " + t.getMessage());
+            }
+        }
+        return "com.shizuposed.manager.status";
     }
 
     // ═════════════════════════════════════════════════════════════

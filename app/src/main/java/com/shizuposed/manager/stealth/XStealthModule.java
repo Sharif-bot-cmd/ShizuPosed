@@ -44,14 +44,14 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * ------------
  *   Settings-based
  *     DevOptionsCheck       — Settings.Global + ContentResolver.query
- *                             + Binder IContentProvider (9.0)
+ *                             + Binder IContentProvider
  *     AdbCheck              — Settings.Secure + Settings.Global + query
- *                             + Binder IContentProvider (9.0)
+ *                             + Binder IContentProvider
  *     CachedValueCheck      — SharedPreferences reads (opt-in)
  *
  *   Accessibility
  *     AccessibilityCheck    — AccessibilityManager list enumeration
- *                             + Binder IAccessibilityManager (9.0)
+ *                             + Binder IAccessibilityManager
  *
  *   Subprocess
  *     SettingsFileCheck     — Runtime.exec + ProcessBuilder
@@ -61,7 +61,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *
  *   Package / process
  *     PackageCheck          — PackageManager lookups + Binder
- *                             IPackageManager + Binder DUMP (9.0)
+ *                             IPackageManager + Binder DUMP
  *     RunningProcessCheck   — ActivityManager lookups
  *
  *   Reflection / API
@@ -74,7 +74,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *
  *   Native
  *     XStealthNative        — libc interposition (file reads)
- *     XStealthNativeNext    — runtime syscall stub scanner (9.0)
+ *     XStealthNativeNext    — runtime syscall stub scanner
  *
  * BRIDGES
  * -------
@@ -178,8 +178,8 @@ public class XStealthModule implements IXposedHookLoadPackage {
 
         // ─── Package / process ───────────────────────────────────
         //
-        // PackageCheck now installs whenever the master is on,
-        // because it does more than package hiding: it hooks the
+        // PackageCheck installs whenever the master is on, because
+        // it does more than package hiding: it hooks the
         // IPackageManager descriptor for the Binder path, handles
         // DUMP_TRANSACTION for dumpsys package, and installs the
         // ProxyTransactListener for diagnostics. The per-target
@@ -196,9 +196,46 @@ public class XStealthModule implements IXposedHookLoadPackage {
             catch (Throwable t) { XposedBridge.log(TAG + ": Process hook failed: " + t); }
         }
 
+        // ─── Reflection / API protection ─────────────────────────
+        //
+        // Two names are recorded before install so the trust check
+        // inside ApiProtectionCheck knows about them:
+        //
+        //   • The module's own package, so class loads originating
+        //     from the module's code aren't refused. Matters when
+        //     a module's UI or its own classes go through a
+        //     classloader load path.
+        //
+        //   • The running manager's Android package name, so any
+        //     frame that carries the manager's runtime identity
+        //     (e.g. an exported component the target invokes) is
+        //     trusted. In the standard build this is
+        //     "com.shizuposed.manager"; in the stealth build it is
+        //     the scrambled name. Both are handled by the same
+        //     call.
         if (config.apiProtection) {
+            try {
+                ApiProtectionCheck.recordModulePackage(lpparam.packageName);
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": recordModulePackage failed: "
+                    + t.getMessage());
+            }
+
+            try {
+                String managerPkg = System.getProperty(
+                    "shizuposed.manager.package");
+                if (managerPkg != null && !managerPkg.isEmpty()) {
+                    ApiProtectionCheck.recordManagerPackage(managerPkg);
+                }
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": recordManagerPackage failed: "
+                    + t.getMessage());
+            }
+
             try { ApiProtectionCheck.install(lpparam); }
-            catch (Throwable t) { XposedBridge.log(TAG + ": ApiProtectionCheck failed: " + t); }
+            catch (Throwable t) {
+                XposedBridge.log(TAG + ": ApiProtectionCheck failed: " + t);
+            }
         }
 
         // ─── SystemProperties, Build, property scrub ─────────────
