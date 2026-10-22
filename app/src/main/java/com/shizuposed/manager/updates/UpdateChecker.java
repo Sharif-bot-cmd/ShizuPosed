@@ -221,6 +221,29 @@ public final class UpdateChecker {
         }
     }
 
+    public static void checkNowAsync(Context context,
+                                     String currentVersion,
+                                     boolean forceNotify) {
+        if (context == null || currentVersion == null) return;
+
+        final Context app = context.getApplicationContext();
+        new Thread(() -> {
+            try {
+                SharedPreferences prefs = app.getSharedPreferences(
+                    PREFS, Context.MODE_PRIVATE);
+                // Clear the throttle so the check runs.
+                prefs.edit().putLong(KEY_LAST_CHECK, 0L).apply();
+                if (forceNotify) {
+                    prefs.edit().remove(KEY_LAST_NOTIFIED_TAG).apply();
+                }
+                checkBlocking(app, currentVersion);
+            } catch (Throwable t) {
+                Logger l = Logger.getInstance(app);
+                if (l != null) l.d("checkNowAsync: failed: " + t.getMessage());
+            }
+        }, "ShizuPosed-update-check-manual").start();
+    }
+
     private static void postNotification(Context context,
                                           String tag,
                                           String htmlUrl) {

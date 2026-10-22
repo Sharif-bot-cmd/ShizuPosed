@@ -30,6 +30,7 @@ import com.shizuposed.manager.ShizuPosedManagerApp;
 import com.shizuposed.manager.receiver.BootReceiver;
 import com.shizuposed.manager.runtime.RuntimePrefs;
 import com.shizuposed.manager.service.ShizuPosedService;
+import com.shizuposed.manager.updates.UpdateChecker;
 import com.shizuposed.manager.utils.Logger;
 
 import java.io.File;
@@ -44,6 +45,7 @@ import java.util.concurrent.Executors;
  *   • Scan interval slider (ProcessMonitor refresh rate)
  *   • Hook delay slider (framework-to-bootstrap pause)
  *   • Maintenance actions (clear logs, clean all caches)
+ *   • Check for updates (GitHub Releases)
  *   • Config export
  *
  * The XStealth master toggle lives in the XStealth detail sheet,
@@ -77,13 +79,25 @@ import java.util.concurrent.Executors;
  * the sentinel package name MAINTENANCE_RESULT_PKG ("__logs__").
  * The receiver in this fragment filters on that sentinel so
  * maintenance results don't collide with launch results.
+ *
+ * CHECK FOR UPDATES
+ * -----------------
+ * The button calls UpdateChecker.checkNowAsync(), which bypasses
+ * the 12-hour throttle and posts a notification if a newer release
+ * exists. The result is delivered via the same notification path
+ * as the automatic check, so the user sees the same UI whether the
+ * check was triggered manually or automatically.
+ *
+ * If the current version is already latest, the notification is
+ * suppressed (UpdateChecker only notifies for a newer tag) and the
+ * button shows a "you're up to date" toast instead.
  */
 public class SettingsFragment extends Fragment {
 
     private MaterialSwitch swAutoStart, swDebugMode, swLogToFile;
     private Slider sliderScanInterval, sliderHookDelay;
     private TextView tvScanIntervalValue, tvHookDelayValue;
-    private Button btnClearLogs, btnCleanAll, btnExportConfig;
+    private Button btnClearLogs, btnCleanAll, btnExportConfig, btnCheckUpdates;
     private TextView tvVersion, tvShizukuStatus, tvServiceStatus;
 
     private Logger logger;
@@ -184,17 +198,10 @@ public class SettingsFragment extends Fragment {
         btnClearLogs = null;
         btnCleanAll = null;
         btnExportConfig = null;
+        btnCheckUpdates = null;
         tvVersion = null;
         tvShizukuStatus = null;
         tvServiceStatus = null;
-    }
-
-    @Override
-    public void onDetach() {
-        super.onDetach();
-        // Executor kept for fragment lifetime; do not shut down here
-        // because onDetach can happen on configuration change. It
-        // gets GC'd with the fragment.
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -212,11 +219,25 @@ public class SettingsFragment extends Fragment {
         btnClearLogs = view.findViewById(R.id.btnClearLogs);
         btnCleanAll = view.findViewById(R.id.btnCleanAll);
         btnExportConfig = view.findViewById(R.id.btnExportConfig);
+        btnCheckUpdates = view.findViewById(R.id.btnCheckUpdates);
         tvVersion = view.findViewById(R.id.tvVersion);
         tvShizukuStatus = view.findViewById(R.id.tvShizukuStatus);
         tvServiceStatus = view.findViewById(R.id.tvServiceStatus);
 
-        if (tvVersion != null) tvVersion.setText("1.1.5");
+        // Read the version from the installed package instead of
+        // hardcoding it. This is the same string UpdateChecker
+        // compares against the GitHub tag, so the footer and the
+        // check are always in sync.
+        if (tvVersion != null) {
+            try {
+                String v = requireContext().getPackageManager()
+                    .getPackageInfo(requireContext().getPackageName(), 0)
+                    .versionName;
+                tvVersion.setText(v != null ? v : "unknown");
+            } catch (Throwable t) {
+                tvVersion.setText("unknown");
+            }
+        }
     }
 
     private void setupListeners() {
@@ -228,6 +249,9 @@ public class SettingsFragment extends Fragment {
         }
         if (btnExportConfig != null) {
             btnExportConfig.setOnClickListener(v -> exportConfig());
+        }
+        if (btnCheckUpdates != null) {
+            btnCheckUpdates.setOnClickListener(v -> checkForUpdates());
         }
         if (swAutoStart != null) {
             swAutoStart.setOnCheckedChangeListener(autoStartListener);
@@ -267,6 +291,56 @@ public class SettingsFragment extends Fragment {
     }
 
     // ═════════════════════════════════════════════════════════════
+    // CHECK FOR UPDATES
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Manual update check. Bypasses the 12-hour throttle so the
+     * user gets an answer immediately.
+     *
+     * The check runs on a background thread (UpdateChecker handles
+     * that). If a newer version exists, the notification is posted
+     * as usual. If the current version is latest, the button shows
+     * a "you're up to date" toast instead of a notification.
+     *
+     * The "latest version" answer comes from UpdateChecker's
+     * internal state after the check completes, which is why the
+     * toast has to wait for the check. We do that by having
+     * UpdateChecker post a broadcast when it's done.
+     */
+    private void checkForUpdates() {
+        if (!isAdded()) return;
+
+        String currentVersion = null;
+        try {
+            currentVersion = requireContext().getPackageManager()
+                .getPackageInfo(requireContext().getPackageName(), 0)
+                .versionName;
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.w("checkForUpdates: cannot read version: "
+                    + t.getMessage());
+            }
+        }
+        if (currentVersion == null) {
+            Toast.makeText(requireContext(),
+                "Cannot read installed version",
+                Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        Toast.makeText(requireContext(),
+            "Checking for updates…", Toast.LENGTH_SHORT).show();
+
+        if (logger != null) {
+            logger.i("Manual update check requested (current="
+                + currentVersion + ")");
+        }
+
+        UpdateChecker.checkNowAsync(requireContext(), currentVersion, true);
+    }
+
+    // ═════════════════════════════════════════════════════════════
     // LOAD / SAVE
     // ═════════════════════════════════════════════════════════════
 
@@ -289,9 +363,6 @@ public class SettingsFragment extends Fragment {
         }
 
         // ── Sliders ───────────────────────────────────────────────
-        // The sliders display values in seconds (scan) and
-        // milliseconds (hook delay). RuntimePrefs stores everything
-        // in milliseconds.
         if (sliderScanInterval != null) {
             int ms = RuntimePrefs.getScanIntervalMs(requireContext());
             sliderScanInterval.setValue(ms / 1000f);

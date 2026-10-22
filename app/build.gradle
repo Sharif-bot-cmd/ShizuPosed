@@ -8,6 +8,34 @@ if (keystorePropsFile.exists()) {
     keystoreProps.load(new FileInputStream(keystorePropsFile))
 }
 
+def stealthSeed = project.findProperty('stealthSeed')
+    ?: (System.getProperty('user.name', 'user')
+        + '@' + System.getProperty('user.home', 'home')
+        + '/' + project.rootDir.absolutePath)
+
+def stealthDigest = java.security.MessageDigest.getInstance('SHA-256')
+stealthDigest.update(stealthSeed.getBytes('UTF-8'))
+def stealthHash = stealthDigest.digest()
+
+def alpha = 'abcdefghijklmnopqrstuvwxyz'
+
+// Extract enough bytes from the digest for 1 + 5 + 9 = 15
+// letters. Each byte picks one letter, modulo 26.
+def sb = new StringBuilder()
+for (int i = 0; i < 15; i++) {
+    int idx = (stealthHash[i] & 0xFF) % 26
+    sb.append(alpha.charAt(idx))
+}
+def allLetters = sb.toString()
+
+def seg1 = allLetters.substring(0, 1)
+def seg2 = allLetters.substring(1, 6)
+def seg3 = allLetters.substring(6, 15)
+
+ext.stealthApplicationId   = "${seg1}.${seg2}.${seg3}"
+ext.stealthStatusAuthority = "${seg1}.${seg2}.${seg3}.status"
+ext.stealthAppLabel        = 'Sync Service'
+
 android {
     namespace 'com.shizuposed.manager'
 
@@ -18,11 +46,52 @@ android {
         applicationId "com.shizuposed.manager"
         minSdk 29
         targetSdk 37
-        versionCode 4800
-        versionName "1.1.5"
+        versionCode 5300
+        versionName "1.2.2"
 
         ndk {
             abiFilters 'arm64-v8a'
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // FLAVORS
+    //
+    // standard: the normal build, applicationId
+    //           com.shizuposed.manager, authority
+    //           com.shizuposed.manager.status.
+    //
+    // stealth:  a separate APK with a randomly-generated
+    //           applicationId of the form com.<x>.<y> and a
+    //           matching status authority. Same signature, same
+    //           code, different package name. Cannot update the
+    //           standard build; must be installed separately.
+    // ═════════════════════════════════════════════════════════════
+
+    flavorDimensions "variant"
+
+    productFlavors {
+        standard {
+            dimension "variant"
+            applicationId "com.shizuposed.manager"
+            manifestPlaceholders = [
+                statusAuthority:      "com.shizuposed.manager.status",
+                shizukuAuthority:     "com.shizuposed.manager.shizuku",
+                watcherAuthority:     "com.shizuposed.manager.shizuku-watcher",
+                fileProviderAuthority: "com.shizuposed.manager.fileprovider",
+            ]
+        }
+
+        stealth {
+            dimension "variant"
+            applicationId project.ext.stealthApplicationId
+            manifestPlaceholders = [
+                statusAuthority:      project.ext.stealthStatusAuthority,
+                shizukuAuthority:     project.ext.stealthApplicationId + ".shizuku",
+                watcherAuthority:     project.ext.stealthApplicationId + ".shizuku-watcher",
+                fileProviderAuthority: project.ext.stealthApplicationId + ".fileprovider",
+            ]
+            resValue "string", "app_name", project.ext.stealthAppLabel
         }
     }
 
@@ -65,6 +134,7 @@ android {
         viewBinding true
         dataBinding true
         buildConfig true
+        resValues true
     }
 
     androidResources {
@@ -143,6 +213,33 @@ dependencies {
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.6.0'
 }
 
+// Capture the ext values as locals at configuration time. The
+// doLast closure must not touch `project` — the configuration
+// cache forbids it, and Gradle 9 enforces that as an error.
+def printStealthIdValue     = ext.stealthApplicationId
+def printStealthAuthority   = ext.stealthStatusAuthority
+def printStealthLabel       = ext.stealthAppLabel
+
+tasks.register('printStealthId') {
+    group = 'help'
+    description = 'Print the stealth package name that this build will use'
+
+    // Declare them as inputs so the task knows when to re-run,
+    // and so the configuration cache treats them as values, not
+    // references to live project state.
+    inputs.property('stealthId', printStealthIdValue)
+    inputs.property('stealthAuthority', printStealthAuthority)
+    inputs.property('stealthLabel', printStealthLabel)
+
+    doLast {
+        println "stealth applicationId:    ${printStealthIdValue}"
+        println "stealth status authority: ${printStealthAuthority}"
+        println "stealth app label:        ${printStealthLabel}"
+        println ""
+        println "Override with -PstealthSeed=<anything> for a different ID."
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
 //
@@ -150,17 +247,6 @@ dependencies {
 // Gradle script objects, so they can be called from doLast blocks
 // without breaking the configuration cache.
 // ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Extract the entries of a zip archive that match a selector into
- * a destination directory. Replaces the `copy { from zipTree(...) }`
- * DSL, which is not allowed inside a doLast block under the
- * configuration cache.
- *
- * @param archive  the zip/jar/aar to read
- * @param destDir  where to write the extracted entries
- * @param selector closure that returns true for entries to extract
- */
 
 def extractZipEntries = { File archive, File destDir, Closure<Boolean> selector ->
     if (!archive.exists()) return
@@ -411,9 +497,10 @@ tasks.register('checkXStealthBridge') {
     }
 }
 
-// Wire all six checks in front of the jniLibs merge.
 tasks.matching { it.name == 'mergeDebugJniLibFolders' ||
-                 it.name == 'mergeReleaseJniLibFolders' }.configureEach {
+                 it.name == 'mergeReleaseJniLibFolders' ||
+                 it.name.startsWith('mergeStealth') ||
+                 it.name.startsWith('mergeStandard') }.configureEach {
     dependsOn 'checkNativeShim'
     dependsOn 'checkAmiru'
     dependsOn 'checkCallSite'
@@ -496,14 +583,38 @@ if (makeDexPlatformJar == null) {
         "`sdkmanager \"platforms;android-${makeDexCompileSdkVersion}\"`.")
 }
 
-// ─── Debug compile classpath (after AGP creates the configuration) ────────
+// ─── Compile classpath (after AGP creates the configurations) ─────────────
+//
+// With flavors in place the configuration is named
+// standardDebugCompileClasspath, not debugCompileClasspath. Try
+// several names so the task keeps working across AGP versions and
+// any future renaming.
 
 def makeDexLibJars = []
 def makeDexAarFiles = []
 
 afterEvaluate {
-    def cp = configurations.findByName('debugCompileClasspath')
+    def cp = configurations.findByName('standardDebugCompileClasspath')
+    if (cp == null) {
+        cp = configurations.findByName('standardReleaseCompileClasspath')
+    }
+    if (cp == null) {
+        cp = configurations.findByName('debugCompileClasspath')
+    }
+    if (cp == null) {
+        cp = configurations.find { c ->
+            c.name.endsWith('CompileClasspath')
+                && c.name.contains('standard')
+        }
+    }
+    if (cp == null) {
+        cp = configurations.find { c ->
+            c.name.endsWith('CompileClasspath')
+        }
+    }
+
     if (cp != null) {
+        println "makeDex: resolving compile classpath from ${cp.name}"
         try {
             cp.resolve().each { f ->
                 if (f.name.endsWith('.jar')) {
@@ -513,10 +624,10 @@ afterEvaluate {
                 }
             }
         } catch (Throwable t) {
-            println "makeDex: warning — could not resolve debugCompileClasspath: ${t.message}"
+            println "makeDex: warning — could not resolve ${cp.name}: ${t.message}"
         }
     } else {
-        println "makeDex: warning — debugCompileClasspath not found"
+        println "makeDex: warning — no compile classpath configuration found"
     }
 }
 
@@ -528,15 +639,19 @@ tasks.register('makeDex') {
     description = 'Build XposedHook.dex from compiled classes + Pine'
     group = 'build'
 
-    dependsOn 'compileDebugJavaWithJavac'
+    dependsOn 'compileStandardDebugJavaWithJavac'
 
-    def classesDirProvider = layout.buildDirectory.dir('intermediates/javac/debug/classes')
+    def classesDirProvider = layout.buildDirectory.dir(
+        'intermediates/javac/standardDebug/classes')
     def alternateClassesDirProvider = layout.buildDirectory.dir(
+        'intermediates/javac/standardDebug/compileStandardDebugJavaWithJavac/classes')
+    def fallbackClassesDirProvider = layout.buildDirectory.dir(
+        'intermediates/javac/debug/classes')
+    def fallbackAltClassesDirProvider = layout.buildDirectory.dir(
         'intermediates/javac/debug/compileDebugJavaWithJavac/classes')
     def outDirProvider     = layout.buildDirectory.dir('outputs/dex')
     def outDexProvider     = outDirProvider.map { dir -> new File(dir.asFile, 'XposedHook.dex') }
     def pineJar            = file("${projectDir}/libs/pine-0.3.0.jar")
-    def projectDirCapture  = projectDir
 
     outputs.dir(outDirProvider)
     outputs.file(outDexProvider)
@@ -545,12 +660,11 @@ tasks.register('makeDex') {
         def outDir = outDirProvider.get().asFile
         def outDex = new File(outDir, 'XposedHook.dex')
 
-        // Locate the javac output directory. AGP 9.x moved it from
-        // build/intermediates/javac/debug/classes to a task-named
-        // subdirectory. Try the known paths in order.
         def candidates = [
             classesDirProvider.get().asFile,
             alternateClassesDirProvider.get().asFile,
+            fallbackClassesDirProvider.get().asFile,
+            fallbackAltClassesDirProvider.get().asFile,
         ]
         def classesDir = candidates.find { it.exists() }
         if (classesDir == null) {
@@ -558,8 +672,6 @@ tasks.register('makeDex') {
             candidates.each {
                 println "makeDex:   ${it.absolutePath} (exists=${it.exists()})"
             }
-            // Fall back to the primary candidate so downstream code
-            // has something to iterate.
             classesDir = candidates[0]
         } else {
             println "makeDex: using classes dir ${classesDir.absolutePath}"
@@ -577,7 +689,6 @@ tasks.register('makeDex') {
             }
         }
 
-        // Extract Pine classes.
         if (pineJar.exists()) {
             def pineExtract = new File(outDir, 'pine-classes')
             pineExtract.mkdirs()
@@ -599,7 +710,6 @@ tasks.register('makeDex') {
         }
         println "makeDex: ${wanted.size()} .class files matched"
 
-        // Extract classes.jar from each AAR into the output dir.
         def libJars = new ArrayList<String>(makeDexLibJars)
         for (File aar : makeDexAarFiles) {
             def cacheDir = new File(outDir, "aar-libs/${aar.name}")
@@ -615,9 +725,7 @@ tasks.register('makeDex') {
 
         libJars << makeDexPlatformJar.absolutePath
         println "makeDex: using platform jar ${makeDexPlatformJar.absolutePath}"
-        println "makeDex: platform dir ${makeDexPlatformDirUsed.absolutePath}"
 
-        // Build and run the d8 command.
         def cmd = [makeDexD8.absolutePath, '--release',
                    '--min-api', "${makeDexMinSdk}",
                    '--output', outDir.absolutePath]
@@ -657,12 +765,18 @@ tasks.register('makeDex') {
 // ═══════════════════════════════════════════════════════════════════════════
 
 tasks.matching { it.name == 'mergeDebugAssets' ||
-                 it.name == 'mergeReleaseAssets' }.configureEach {
+                 it.name == 'mergeReleaseAssets' ||
+                 it.name == 'mergeStealthDebugAssets' ||
+                 it.name == 'mergeStealthReleaseAssets' ||
+                 it.name == 'mergeStandardDebugAssets' ||
+                 it.name == 'mergeStandardReleaseAssets' }.configureEach {
     dependsOn 'makeDex'
 }
 
 tasks.matching { it.name == 'assembleDebug' ||
-                 it.name == 'assembleRelease' }.configureEach {
+                 it.name == 'assembleRelease' ||
+                 it.name == 'assembleStealth' ||
+                 it.name == 'assembleStandard' }.configureEach {
     dependsOn 'makeDex'
 }
 

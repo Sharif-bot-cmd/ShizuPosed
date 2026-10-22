@@ -97,7 +97,6 @@ public class ShizuPosedManagerApp extends Application {
                 logger.i("✅ Shizuku permission GRANTED by user!");
                 new Handler(Looper.getMainLooper()).post(() -> {
                     autoStartService();
-                    notifyServiceShizukuAuthorized();
                 });
                 if (instance != null && instance.getMainActivity() != null) {
                     instance.getMainActivity().onShizukuPermissionGranted();

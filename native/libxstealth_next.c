@@ -24,7 +24,7 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-#define NEXT_VERSION "0.16.0"
+#define NEXT_VERSION "0.17.0"
 
 #ifndef XSTEALTH_ENABLE_MMAP_GUARD
 #define XSTEALTH_ENABLE_MMAP_GUARD 1
@@ -62,6 +62,30 @@ static const char *HIDDEN_STRINGS[] = {
     "XStealthBridge",
     NULL
 };
+
+/* ─────────────────────────────────────────────────────────────
+ * Trusted-package prefix
+ *
+ * The framework's own threads are named after the manager's
+ * package. In the standard build that's "com.shizuposed.manager";
+ * in the stealth build it's the scrambled com.<x>.<y>.
+ *
+ * The prefix is set at load time by nativeSetTrustedPackage, called
+ * from XStealthNativeNext.load(). Without this, the stealth build's
+ * threads would be treated as untrusted, and the framework's own
+ * syscalls (open, stat, readlink, pread) would go through the
+ * blocking filters — which breaks hooking.
+ *
+ * The built-in list covers the standard build and legacy names.
+ * ───────────────────────────────────────────────────────────── */
+
+static const char *TRUSTED_PREFIXES[] = {
+    "ShizuPosed",
+    "Xposed",
+    NULL
+};
+
+static char g_runtime_trusted_prefix[128] = {0};
 
 /* ─────────────────────────────────────────────────────────────
  * Settings XML paths
@@ -188,13 +212,13 @@ static bool is_trusted_caller(void);
 #define MAX_PATCHES 16
 
 struct patch_record {
-    void *stub_addr;                 /* address the branch was written at */
+    void *stub_addr;
     void *handler;
     const char *name;
-    uint32_t saved_bytes;            /* original 4 bytes at stub_addr   */
-    uint32_t saved_svc;              /* the original SVC word, if scanner-patched */
-    uint32_t orig_prot;              /* original mprotect prot for page */
-    uint32_t shape;                  /* SHAPE_* or hop count for scanner */
+    uint32_t saved_bytes;
+    uint32_t saved_svc;
+    uint32_t orig_prot;
+    uint32_t shape;
 } __attribute__((packed));
 
 static struct patch_record g_patches[MAX_PATCHES];
@@ -257,9 +281,6 @@ static inline bool is_arm64_ret(uint32_t insn) {
     return (insn & 0xFFFFFC1F) == 0xD65F0000;
 }
 
-/*
- * MOVZ/MOVK Xd, #imm16 with Rd == x8.
- */
 static inline bool is_arm64_mov_x8_imm(uint32_t w) {
     if ((w & 0xff800000u) != 0xd2800000u
             && (w & 0xff800000u) != 0xf2800000u) {
@@ -268,17 +289,11 @@ static inline bool is_arm64_mov_x8_imm(uint32_t w) {
     return (w & 0x1fu) == 8u;
 }
 
-/*
- * ADRP x16, <page>.
- */
 static inline bool is_arm64_adrp_x16(uint32_t w) {
     if ((w & 0x9f000000u) != 0x90000000u) return false;
     return (w & 0x1fu) == 16u;
 }
 
-/*
- * LDR x16, [x16, #imm].
- */
 static inline bool is_arm64_ldr_x16_x16(uint32_t w) {
     if ((w & 0xffc00000u) != 0xf9400000u) return false;
     if ((w & 0x1fu) != 16u) return false;
@@ -286,9 +301,6 @@ static inline bool is_arm64_ldr_x16_x16(uint32_t w) {
     return true;
 }
 
-/*
- * BR x16.
- */
 static inline bool is_arm64_br_x16(uint32_t w) {
     return w == 0xd61f0200u;
 }
@@ -301,8 +313,6 @@ enum {
     SHAPE_BTI_ADRP  = 4,
     SHAPE_MOV_SVC   = 5,
     SHAPE_PLT       = 6,
-    /* SHAPE_SCANNED is a marker, not a shape. Records patched via
-     * the scanner carry their hop count in this field instead. */
 };
 
 static const char *shape_name(int s) {
@@ -396,32 +406,18 @@ static bool patch_word_at(int idx, void *patch_addr, void *handler,
 
 /* ═════════════════════════════════════════════════════════════
  * RUNTIME STUB SCANNER
- *
- * Instead of classifying a stub against a fixed list of shapes,
- * scan for the SVC instruction and patch it. Every ARM64 syscall
- * stub ends with SVC #0; the instructions before it prepare the
- * syscall number in x8. Patching the SVC routes the syscall
- * through the handler regardless of how the stub is shaped.
  * ═════════════════════════════════════════════════════════════ */
 
 #define SCAN_MAX_HOPS  4
 #define SCAN_MAX_WORDS 32
 
 struct resolved_stub {
-    uint32_t *svc_addr;     /* address of the SVC instruction */
-    uint32_t *stub_entry;   /* the original symbol, for logging */
-    int       hops;         /* how many B trampolines followed */
-    int       svc_offset;   /* words from stub entry to SVC */
+    uint32_t *svc_addr;
+    uint32_t *stub_entry;
+    int       hops;
+    int       svc_offset;
 };
 
-/*
- * find_stub_svc — scan a linear stub for its SVC.
- *
- * Returns the address of the SVC, or NULL if the stub doesn't
- * reach an SVC by fall-through within SCAN_MAX_WORDS. A branch
- * of any kind (B, BL, BR, BLR, RET) terminates the linear scan
- * and returns NULL — the caller decides whether to follow it.
- */
 static uint32_t *find_stub_svc(uint32_t *stub, int max_words) {
     uint32_t *p = stub;
     for (int i = 0; i < max_words; i++) {
@@ -442,18 +438,6 @@ static uint32_t *find_stub_svc(uint32_t *stub, int max_words) {
     return NULL;
 }
 
-/*
- * resolve_stub_svc — follow B trampolines to find a stub's SVC.
- *
- * Some bionic versions route every syscall stub through a shared
- * implementation via a single B instruction. This follows up to
- * SCAN_MAX_HOPS branches. If a shared implementation is reached
- * (a stub that isn't a compiled wrapper), the strategy fails —
- * the caller falls through to syscall-dispatch, which patches
- * the shared syscall() entry instead.
- *
- * Returns 1 on success, 0 on failure.
- */
 static int resolve_stub_svc(void *symbol, struct resolved_stub *out) {
     if (!symbol || !out) return 0;
 
@@ -471,17 +455,13 @@ static int resolve_stub_svc(void *symbol, struct resolved_stub *out) {
             return 1;
         }
 
-        /* No SVC by fall-through. Follow a single B if present. */
         int off = is_arm64_bti(stub[0]) ? 1 : 0;
         uint32_t w0 = stub[off];
 
         if (!is_arm64_b(w0)) {
-            /* Not a simple trampoline. Refuse. */
             return 0;
         }
 
-        /* B <offset> — sign-extend the 26-bit immediate and shift
-         * by 2 to get the byte offset. */
         int64_t imm = (int64_t)(w0 & 0x03FFFFFFu);
         if (imm & (1LL << 25)) {
             imm |= ~((1LL << 26) - 1);
@@ -493,18 +473,6 @@ static int resolve_stub_svc(void *symbol, struct resolved_stub *out) {
     return 0;
 }
 
-/*
- * patch_stub_by_svc — scanner-based patching.
- *
- * Resolves the symbol to its SVC, saves the original SVC word in
- * the patch record (so a handler can later invoke it via a
- * trampoline), and patches the SVC to branch to the handler.
- *
- * The handler is entered with the same register state the SVC
- * would have seen. It can return a synthetic value directly, or
- * (for the fall-through case) call the saved SVC through the
- * helper xstealth_next_call_saved_svc().
- */
 static bool patch_stub_by_svc(int idx, void *handler,
                                 const char *name,
                                 const char **aliases) {
@@ -533,7 +501,7 @@ static bool patch_stub_by_svc(int idx, void *handler,
     }
 
     g_patches[idx].saved_svc = saved_svc;
-    g_patches[idx].shape = (uint32_t)stub.hops;   /* hop count */
+    g_patches[idx].shape = (uint32_t)stub.hops;
 
     LOGI("patch_stub_by_svc(%s): SVC at %p+%d (entry %p, hops=%d, "
          "saved=%08x)",
@@ -544,10 +512,6 @@ static bool patch_stub_by_svc(int idx, void *handler,
 
 /* ═════════════════════════════════════════════════════════════
  * CLASSIFIER-BASED PATCHING (fallback)
- *
- * Retained from v0.15.0. Used when the scanner can't find an SVC
- * (e.g. a stub shape it can't follow). Patches at a hardcoded
- * offset based on the shape.
  * ═════════════════════════════════════════════════════════════ */
 
 static bool patch_stub_classified(int idx, void *handler,
@@ -730,16 +694,6 @@ static int strategy_plt_got_apply(void) {
 
 /* ─────────────────────────────────────────────────────────────
  * install_all_patches — the strategy ladder
- *
- *   1. stub-inline-by-svc        (scanner, no shape knowledge)
- *   2. stub-inline-classified    (hardcoded shapes, fallback)
- *   3. syscall-dispatch          (shared syscall() entry)
- *   4. plt-got                   (not implemented)
- *
- * The scanner runs first because it handles new bionic layouts
- * without a code change. The classifier runs only if the scanner
- * can't resolve a stub. The dispatch strategy runs only if both
- * per-stub strategies fail.
  * ───────────────────────────────────────────────────────────── */
 
 static void install_all_patches(void) {
@@ -1138,6 +1092,11 @@ int xstealth_next_getppid_handler(void) {
 /* ─────────────────────────────────────────────────────────────
  * is_trusted_caller — check whether the current thread belongs
  * to the framework.
+ *
+ * Matches the thread's comm against the built-in prefix list and
+ * the runtime prefix set by nativeSetTrustedPackage. The runtime
+ * prefix is what makes the stealth build work: its thread names
+ * carry the scrambled com.<x>.<y> prefix, not "ShizuPosed".
  * ───────────────────────────────────────────────────────────── */
 
 static bool is_trusted_caller(void) {
@@ -1158,13 +1117,20 @@ static bool is_trusted_caller(void) {
         if (comm[i] == '\n') { comm[i] = '\0'; break; }
     }
 
-    if (strstr(comm, "ShizuPosed") != NULL) return true;
-    if (strstr(comm, "Xposed") != NULL) return true;
+    for (int i = 0; TRUSTED_PREFIXES[i]; i++) {
+        if (strstr(comm, TRUSTED_PREFIXES[i]) != NULL) return true;
+    }
+
+    if (g_runtime_trusted_prefix[0] != '\0'
+            && strstr(comm, g_runtime_trusted_prefix) != NULL) {
+        return true;
+    }
+
     return false;
 }
 
 /* ─────────────────────────────────────────────────────────────
- * pread64 syscall handler.
+ * pread64 syscall handler
  * ───────────────────────────────────────────────────────────── */
 
 static long handle_pread64(int fd, void *buf, size_t count, off_t offset) {
@@ -1201,7 +1167,7 @@ static long handle_pread64(int fd, void *buf, size_t count, off_t offset) {
 }
 
 /* ─────────────────────────────────────────────────────────────
- * getppid syscall handler.
+ * getppid syscall handler
  * ───────────────────────────────────────────────────────────── */
 
 static long handle_getppid(void) {
@@ -1213,7 +1179,7 @@ static long handle_getppid(void) {
 }
 
 /* ─────────────────────────────────────────────────────────────
- * openat2 syscall handler.
+ * openat2 syscall handler
  * ───────────────────────────────────────────────────────────── */
 
 static long handle_openat2(int dirfd, const char *path,
@@ -1228,7 +1194,7 @@ static long handle_openat2(int dirfd, const char *path,
 }
 
 /* ─────────────────────────────────────────────────────────────
- * ioctl syscall handler.
+ * ioctl syscall handler
  * ───────────────────────────────────────────────────────────── */
 
 static long handle_ioctl(int fd, unsigned long request, void *arg) {
@@ -1257,7 +1223,7 @@ static long handle_ioctl(int fd, unsigned long request, void *arg) {
 }
 
 /* ─────────────────────────────────────────────────────────────
- * statx syscall handler.
+ * statx syscall handler
  * ───────────────────────────────────────────────────────────── */
 
 static long handle_statx(int dirfd, const char *path,
@@ -1272,7 +1238,7 @@ static long handle_statx(int dirfd, const char *path,
 }
 
 /* ─────────────────────────────────────────────────────────────
- * faccessat2 syscall handler.
+ * faccessat2 syscall handler
  * ───────────────────────────────────────────────────────────── */
 
 static long handle_faccessat2(int dirfd, const char *path,
@@ -1286,7 +1252,7 @@ static long handle_faccessat2(int dirfd, const char *path,
 }
 
 /* ─────────────────────────────────────────────────────────────
- * fchmodat2 syscall handler.
+ * fchmodat2 syscall handler
  * ───────────────────────────────────────────────────────────── */
 
 static long handle_fchmodat2(int dirfd, const char *path,
@@ -1598,6 +1564,33 @@ long xstealth_next_dispatch_handler(long number, ...) {
 /* ─────────────────────────────────────────────────────────────
  * JNI entry points
  * ───────────────────────────────────────────────────────────── */
+
+JNIEXPORT void JNICALL
+Java_com_shizuposed_manager_stealth_XStealthNativeNext_nativeSetTrustedPackage(
+        JNIEnv *env, jclass clazz, jstring packageName) {
+    (void) clazz;
+    if (packageName == NULL) {
+        g_runtime_trusted_prefix[0] = '\0';
+        LOGI("next: trusted package cleared");
+        return;
+    }
+
+    const char *utf = (*env)->GetStringUTFChars(env, packageName, NULL);
+    if (utf == NULL) return;
+
+    size_t n = strlen(utf);
+    if (n >= sizeof(g_runtime_trusted_prefix) - 1) {
+        n = sizeof(g_runtime_trusted_prefix) - 2;
+    }
+    memcpy(g_runtime_trusted_prefix, utf, n);
+    g_runtime_trusted_prefix[n] = '.';
+    g_runtime_trusted_prefix[n + 1] = '\0';
+
+    (*env)->ReleaseStringUTFChars(env, packageName, utf);
+
+    LOGI("next: trusted package prefix = \"%s\"",
+         g_runtime_trusted_prefix);
+}
 
 JNIEXPORT jboolean JNICALL
 Java_com_shizuposed_manager_stealth_XStealthNativeNext_nativeInit(
