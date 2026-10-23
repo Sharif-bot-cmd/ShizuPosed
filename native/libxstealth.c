@@ -499,6 +499,7 @@ static const struct proc_path_entry PROC_PATHS_TO_SCRUB[] = {
     { 29, 0, "/proc/self/status",       SCRUB_STATUS },
     { 29, 0, "/proc/self/stat",         SCRUB_STAT },
     { 29, 0, "/proc/self/mountinfo",    SCRUB_LINE },
+    { 29, 0, "/proc/self/mounts",       SCRUB_LINE },   // ← new
     { 29, 0, "/proc/self/task",         SCRUB_LINE },
     { 29, 0, "/proc/self/exe",          SCRUB_LINE },
     { 29, 0, "/proc/self/environ",      SCRUB_LINE },
@@ -508,6 +509,9 @@ static const struct proc_path_entry PROC_PATHS_TO_SCRUB[] = {
     { 29, 0, "/proc/net/tcp6",          SCRUB_NET_INET },
     { 29, 0, "/proc/net/udp",           SCRUB_NET_INET },
     { 29, 0, "/proc/net/udp6",          SCRUB_NET_INET },
+    { 29, 0, "/proc/net/route",         SCRUB_LINE },   // ← new
+    { 29, 0, "/proc/net/arp",           SCRUB_LINE },   // ← new
+    { 29, 0, "/proc/net/if_inet6",      SCRUB_LINE },   // ← new
     { 0, 0, NULL, 0 }
 };
 
@@ -585,6 +589,8 @@ static const char *TRUSTED_PREFIXES[] = {
     "com.shizuposed.manager.",
     NULL
 };
+
+static char g_runtime_trusted_prefix[128] = {0};
 
 static volatile int g_xstealth_active = 0;
 static volatile int g_resolved = 0;
@@ -680,6 +686,10 @@ static bool is_trusted_caller(void) {
 
     for (int i = 0; TRUSTED_PREFIXES[i]; i++) {
         if (strstr(comm, TRUSTED_PREFIXES[i]) != NULL) return true;
+    }
+    if (g_runtime_trusted_prefix[0] != '\0'
+            && strstr(comm, g_runtime_trusted_prefix) != NULL) {
+        return true;
     }
     if (strstr(comm, "ShizuPosed") != NULL) return true;
     if (strstr(comm, "Xposed") != NULL) return true;
@@ -1133,11 +1143,44 @@ static bool is_blocked_path(const char *path) {
 
 static const struct proc_path_entry *find_proc_entry(const char *path) {
     if (!path) return NULL;
+
+    /* Exact match first. */
     for (int i = 0; PROC_PATHS_TO_SCRUB[i].path; i++) {
         if (strcmp(path, PROC_PATHS_TO_SCRUB[i].path) == 0) {
             return &PROC_PATHS_TO_SCRUB[i];
         }
     }
+
+    /* Prefix match for /proc/<pid>/<file>. This catches
+     * /proc/12345/cmdline, /proc/12345/maps, etc. — the same files
+     * the exact-match table covers for /proc/self, but for any PID.
+     * A detector that reads another process's cmdline or maps to
+     * find the framework is caught here. */
+    if (strncmp(path, "/proc/", 6) == 0) {
+        const char *rest = path + 6;
+        if (*rest >= '0' && *rest <= '9') {
+            while (*rest >= '0' && *rest <= '9') rest++;
+            if (*rest == '/') {
+                const char *file = rest + 1;
+                if (strcmp(file, "cmdline") == 0) {
+                    static const struct proc_path_entry pid_cmdline =
+                        { 29, 0, "/proc/<pid>/cmdline", SCRUB_CMDLINE };
+                    return &pid_cmdline;
+                }
+                if (strcmp(file, "maps") == 0) {
+                    static const struct proc_path_entry pid_maps =
+                        { 29, 0, "/proc/<pid>/maps", SCRUB_LINE };
+                    return &pid_maps;
+                }
+                if (strcmp(file, "environ") == 0) {
+                    static const struct proc_path_entry pid_environ =
+                        { 29, 0, "/proc/<pid>/environ", SCRUB_ENVIRON };
+                    return &pid_environ;
+                }
+            }
+        }
+    }
+
     return NULL;
 }
 
@@ -1471,17 +1514,27 @@ static void scrub_buffer_stat(char *buf, ssize_t n) {
 
     /* Field 2: comm — starts with '(', ends with ')'. */
     if (p >= end || *p != '(') return;
+    char *comm_start = p + 1;
     char *close = memchr(p, ')', (size_t)(end - p));
     if (close == NULL) return;
+
+    /* Scrub comm if it contains a hidden string. */
+    size_t comm_len = (size_t)(close - comm_start);
+    for (int i = 0; HIDDEN_STRINGS[i]; i++) {
+        if (memmem(comm_start, comm_len, HIDDEN_STRINGS[i],
+                   strlen(HIDDEN_STRINGS[i]))) {
+            memset(comm_start, ' ', comm_len);
+            /* Keep the parens intact so the field structure parses. */
+            break;
+        }
+    }
+
     p = close + 1;
 
     /* Field 3: state — one char. */
     if (p >= end || *p != ' ') return;
     p++;
     if (p >= end) return;
-    /* state is a single character, possibly followed by '+' or
-     * similar modifiers in newer kernels. Skip to the next
-     * space. */
     while (p < end && *p != ' ' && *p != '\n') p++;
     if (p >= end || *p != ' ') return;
     p++;
@@ -1492,8 +1545,6 @@ static void scrub_buffer_stat(char *buf, ssize_t n) {
     size_t ppid_len = (size_t)(p - ppid_start);
     if (ppid_len == 0) return;
 
-    /* Rewrite: write "1" and pad the rest with spaces so the
-     * total line length is unchanged. */
     if (ppid_len >= 1) {
         ppid_start[0] = '1';
         for (size_t i = 1; i < ppid_len; i++) {
@@ -1865,8 +1916,6 @@ ssize_t readlink(const char *path, char *buf, size_t len) {
     if (g_xstealth_active && !is_trusted_caller()
             && path != NULL
             && strcmp(path, "/proc/self/fd/3") == 0) {
-        /* Answer with a synthetic socket:[N] form. The exact N
-         * doesn't matter; the *shape* matters. */
         static const char k_fd3_answer[] = "socket:[12345]";
         size_t n = sizeof(k_fd3_answer) - 1;
         if (len < n) {
@@ -1875,6 +1924,31 @@ ssize_t readlink(const char *path, char *buf, size_t len) {
         }
         memcpy(buf, k_fd3_answer, n);
         return (ssize_t) n;
+    }
+
+    /* New: scrub readlink of another process's exe symlink if it
+     * points at a hidden path. */
+    if (g_xstealth_active && !is_trusted_caller()
+            && path != NULL
+            && strncmp(path, "/proc/", 6) == 0) {
+        const char *rest = path + 6;
+        if (*rest >= '0' && *rest <= '9') {
+            while (*rest >= '0' && *rest <= '9') rest++;
+            if (strcmp(rest, "/exe") == 0) {
+                ssize_t n = real_readlink(path, buf, len);
+                if (n > 0 && (size_t)n < len) {
+                    buf[n] = '\0';
+                    if (is_hidden_path(buf)) {
+                        static const char k_answer[] = "/system/bin/app_process64";
+                        size_t alen = sizeof(k_answer) - 1;
+                        if (len < alen) { errno = ERANGE; return -1; }
+                        memcpy(buf, k_answer, alen);
+                        return (ssize_t) alen;
+                    }
+                }
+                return n;
+            }
+        }
     }
 
     return real_readlink(path, buf, len);
@@ -2814,18 +2888,32 @@ Java_com_shizuposed_manager_stealth_XStealthNative_nativeInit(
     return (g_key_symbols_resolved == 5) ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT void JNICALL
-Java_com_shizuposed_manager_stealth_XStealthNative_nativeSetActive(
-        JNIEnv *env, jclass clazz, jboolean active) {
-    (void) env;
-    (void) clazz;
 
-    g_xstealth_active = active ? 1 : 0;
-    if (g_xstealth_active) {
-        resolve_real_symbols();
-        install_unsafe_gate();
+JNIEXPORT void JNICALL
+Java_com_shizuposed_manager_stealth_XStealthNative_nativeSetTrustedPackage(
+        JNIEnv *env, jclass clazz, jstring packageName) {
+    (void) clazz;
+    if (packageName == NULL) {
+        g_runtime_trusted_prefix[0] = '\0';
+        LOGI("XStealth native: trusted package cleared");
+        return;
     }
-    LOGI("XStealth native: active=%d", g_xstealth_active);
+
+    const char *utf = (*env)->GetStringUTFChars(env, packageName, NULL);
+    if (utf == NULL) return;
+
+    size_t n = strlen(utf);
+    if (n >= sizeof(g_runtime_trusted_prefix) - 1) {
+        n = sizeof(g_runtime_trusted_prefix) - 2;
+    }
+    memcpy(g_runtime_trusted_prefix, utf, n);
+    g_runtime_trusted_prefix[n] = '.';
+    g_runtime_trusted_prefix[n + 1] = '\0';
+
+    (*env)->ReleaseStringUTFChars(env, packageName, utf);
+
+    LOGI("XStealth native: trusted package prefix = \"%s\"",
+         g_runtime_trusted_prefix);
 }
 
 JNIEXPORT jboolean JNICALL

@@ -30,6 +30,13 @@ import java.util.Set;
  * array. The shell-side config reads it from there. If the
  * preference is empty, the array is empty; a missing array on the
  * shell side is treated the same as an empty one.
+ *
+ * STEALTH BUILD
+ * -------------
+ * The config also carries the actual package name and status
+ * provider authority of the installed manager. This is how the
+ * shell-side checks learn which name to hide, since the stealth
+ * build's package name is not known at compile time.
  */
 public final class XStealthStatusWriter {
 
@@ -62,6 +69,16 @@ public final class XStealthStatusWriter {
         o.put("apiProtection",        XStealthPrefs.isApiProtectionEnabled(c));
         o.put("dexOptimize",          XStealthPrefs.isDexOptimizeEnabled(c));
 
+        // Actual package name and status authority of the running
+        // manager. In the standard build these are the well-known
+        // com.shizuposed.manager names; in the stealth build they
+        // are the scrambled com.<x>.<y> equivalents. The
+        // shell-side checks read them from here instead of
+        // hardcoding, so the same code hides whichever build is
+        // installed.
+        o.put("shizuPosedPackageName", c.getPackageName());
+        o.put("statusAuthority",       statusAuthorityOf(c));
+
         JSONArray scopeArr = new JSONArray();
         Set<String> scope = XStealthPrefs.getScope(c);
         if (scope != null) {
@@ -71,10 +88,6 @@ public final class XStealthStatusWriter {
         }
         o.put("scope", scopeArr);
 
-        // Smart foreground scope. Design B: the signal toggles
-        // (hideDevOptions / hideAdb above) decide *whether* the
-        // state change runs; this list decides *for which apps*.
-        // An empty array means the state change never runs.
         JSONArray sfScopeArr = new JSONArray();
         Set<String> sfScope = XStealthPrefs.getSmartForegroundScope(c);
         if (sfScope != null) {
@@ -85,6 +98,39 @@ public final class XStealthStatusWriter {
         o.put("smartForegroundScope", sfScopeArr);
 
         return o;
+    }
+
+    /**
+     * Resolve the status provider authority declared in this build's
+     * manifest.
+     *
+     * The standard build's authority is "com.shizuposed.manager.status".
+     * The stealth build's authority is "com.<x>.<y>.status". Reading
+     * it from PackageManager means the value is always correct for
+     * whichever build is running.
+     *
+     * Fallback: the standard authority, for the case where the
+     * provider isn't found (shouldn't happen, but doesn't break
+     * anything if it does).
+     */
+    private static String statusAuthorityOf(Context c) {
+        try {
+            android.content.pm.PackageInfo info = c.getPackageManager()
+                .getPackageInfo(c.getPackageName(),
+                    android.content.pm.PackageManager.GET_PROVIDERS);
+            if (info.providers != null) {
+                for (android.content.pm.ProviderInfo pi : info.providers) {
+                    if (pi.name != null
+                            && pi.name.endsWith("ModuleStatusProvider")) {
+                        return pi.authority;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Logger.getInstance(c).d(TAG + ": statusAuthorityOf failed: "
+                + t.getMessage());
+        }
+        return "com.shizuposed.manager.status";
     }
 
     public static File writeLocal(Context c) {

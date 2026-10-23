@@ -9,42 +9,69 @@ import java.io.File;
 /**
  * DexOptimizeWrapper
  *
- * Runs dex2oat on a module's cached dex before it is pushed to the
- * shell side, so the target process loads a pre-optimized dex instead
- * of triggering compilation on first use.
+ * Returns the dex path the caller should use. The current
+ * implementation does not perform optimization; see WHY below.
  *
- * The wrapper is designed to be transparent: if dex2oat succeeds, the
- * optimized output replaces the original dex. If it fails for any
- * reason — dex2oat missing, out of memory, incompatible filters,
- * permission error — the original dex is used unchanged. A broken
- * optimization never breaks module loading.
+ * WHY THIS IS A NO-OP
+ * -------------------
+ * The original implementation shelled out to `dex2oat` with
+ * `--dex-file=<in> --oat-file=<out>`, then copied `<out>` to
+ * `<pkg>.dex` on the shell side, where XposedHook loaded it with
+ * `DexClassLoader`.
  *
- * This is a performance improvement, not a security measure. Its
- * value is faster module loading on cold start.
+ * That does not produce a faster-loading dex, for three reasons:
+ *
+ *   1. `dex2oat` writes an OAT container to `--oat-file`. A
+ *      `DexClassLoader` does not load OAT containers; it loads
+ *      `.dex` files, or `.odex` files produced under specific
+ *      conditions that ART validates against the current boot
+ *      image hash, ISA, and other runtime configuration.
+ *
+ *   2. The ART runtime validates the OAT header on load. If the
+ *      file was produced by a shell-side dex2oat whose boot image
+ *      hash or ISA doesn't match the target process's runtime,
+ *      ART refuses it and the DexClassLoader falls back to
+ *      interpreting the original dex. Silent failure — no
+ *      speedup, no error the caller can see.
+ *
+ *   3. dex2oat produced the file as shell-UID ownership. Even
+ *      with mode 0644, the target's SELinux domain sometimes
+ *      can't read it. Same silent failure.
+ *
+ * The safe alternative is to let DexClassLoader handle
+ * optimization itself, in the target process, using the target's
+ * own dex2oat and runtime configuration. That produces a
+ * correctly-configured odex in the target's data directory. It's
+ * slower on first load (the first load has to compile), but it
+ * works.
+ *
+ * This wrapper therefore returns the input path unchanged. Callers
+ * that depend on the previous behavior should drop the
+ * dexOptimize pref — it was already a no-op in effect, and
+ * removing it makes that explicit.
+ *
+ * KEPT AS A STABLE API
+ * --------------------
+ * The class is retained so callers that reference it (e.g.
+ * ShizuPosedService.pushModulesToShellDir, gated on
+ * XStealthPrefs.isDexOptimizeEnabled) don't have to change. The
+ * toggle still works, it just has no measurable effect.
  */
 public final class DexOptimizeWrapper {
 
     private static final String TAG = "DexOptimize";
 
-    /** Compiler filters to try in order. */
-    private static final String[] FILTERS = {
-        "speed",
-        "speed-profile",
-        "quicken",
-    };
-
     private DexOptimizeWrapper() {}
 
     /**
-     * Optimize a dex file in place. Returns the path to the dex to
-     * use — either the optimized output or the original if
-     * optimization didn't run or failed.
+     * Returns the dex path the caller should use. Currently a
+     * pass-through; see the class doc for why.
      *
-     * @param ctx        context for logging
-     * @param shizuku    the Shizuku helper to run commands through
+     * @param ctx        unused; kept for signature compatibility
+     * @param shizuku    unused; kept for signature compatibility
      * @param dexPath    absolute path to the cached dex file
      * @param logger     logger, may be null
-     * @return the path to use, or the original path on failure
+     * @return the input path unchanged
      */
     public static String optimize(Context ctx,
                                   ShizukuHelper shizuku,
@@ -52,109 +79,29 @@ public final class DexOptimizeWrapper {
                                   Logger logger) {
         if (dexPath == null) return null;
 
-        File original = new File(dexPath);
-        if (!original.exists() || original.length() == 0) {
-            if (logger != null) {
-                logger.d(TAG + ": nothing to optimize at " + dexPath);
-            }
-            return dexPath;
-        }
-
-        // If we already have a valid optimized output, use it.
-        String optimizedPath = dexPath + ".oat";
-        File existingOptimized = new File(optimizedPath);
-        if (existingOptimized.exists() && existingOptimized.length() > 0
-                && existingOptimized.lastModified() >= original.lastModified()) {
-            if (logger != null) {
-                logger.d(TAG + ": using cached optimized dex at "
-                    + optimizedPath);
-            }
-            return optimizedPath;
-        }
-
-        if (shizuku == null || !shizuku.isAuthorized()) {
-            if (logger != null) {
-                logger.d(TAG + ": Shizuku unavailable, skipping optimize");
-            }
-            return dexPath;
-        }
-
-        // Try each filter in order. The first that succeeds wins.
-        // dex2oat writes to a temporary path so a partial run never
-        // leaves the optimized file in an inconsistent state.
-        String tempPath = optimizedPath + ".tmp";
-        for (String filter : FILTERS) {
-            if (tryOptimize(shizuku, dexPath, tempPath, filter, logger)) {
-                File temp = new File(tempPath);
-                File dst = new File(optimizedPath);
-                if (dst.exists()) dst.delete();
-                if (temp.renameTo(dst)) {
-                    dst.setReadable(true, false);
-                    if (logger != null) {
-                        logger.i(TAG + ": optimized " + dexPath
-                            + " with filter " + filter);
-                    }
-                    return optimizedPath;
-                }
-            }
-        }
+        // If a previous run left an .oat or .odex file lying
+        // around, the caller's caller (pushModulesToShellDir) may
+        // have its own expectations about which path to copy. The
+        // safest thing is to leave everything as-is and return
+        // the original dex path. The caller copies that path.
+        //
+        // Clean up any stale artifacts so disk usage doesn't grow
+        // on repeated installs. Best-effort, silent on failure.
+        try {
+            File oat = new File(dexPath + ".oat");
+            if (oat.exists()) oat.delete();
+            File oatTmp = new File(dexPath + ".oat.tmp");
+            if (oatTmp.exists()) oatTmp.delete();
+            File odex = new File(dexPath + ".odex");
+            if (odex.exists()) odex.delete();
+            File vdex = new File(dexPath + ".vdex");
+            if (vdex.exists()) vdex.delete();
+        } catch (Throwable ignored) {}
 
         if (logger != null) {
-            logger.d(TAG + ": no filter succeeded for " + dexPath
-                + ", using original");
+            logger.d(TAG + ": returning original dex for " + dexPath
+                + " (optimization disabled; see class doc)");
         }
-        // Clean up any partial output.
-        try { new File(tempPath).delete(); } catch (Throwable ignored) {}
         return dexPath;
-    }
-
-    private static boolean tryOptimize(ShizukuHelper shizuku,
-                                       String dexPath,
-                                       String outPath,
-                                       String filter,
-                                       Logger logger) {
-        try {
-            // The commands here mirror what the platform's own
-            // PackageManager does when it optimizes an APK. They
-            // are run via Shizuku because the target shell UID is
-            // the one that will eventually load the dex.
-            String cmd = "dex2oat"
-                + " --dex-file=" + dexPath
-                + " --oat-file=" + outPath
-                + " --instruction-set=arm64"
-                + " --compiler-filter=" + filter
-                + " --runtime-arg -Xms64m"
-                + " --runtime-arg -Xmx512m"
-                + " 2>&1";
-
-            ShellUtils.CommandResult r = shizuku.executeCommand(cmd);
-            if (r == null) {
-                if (logger != null) {
-                    logger.d(TAG + ": " + filter + " produced no result");
-                }
-                return false;
-            }
-            // dex2oat is chatty on stderr. Success is when the
-            // output file exists and has content, not when exit code
-            // is 0.
-            File out = new File(outPath);
-            if (out.exists() && out.length() > 0) {
-                if (logger != null) {
-                    logger.d(TAG + ": " + filter + " succeeded ("
-                        + out.length() + " bytes)");
-                }
-                return true;
-            }
-            if (logger != null) {
-                logger.d(TAG + ": " + filter + " failed: "
-                    + r.getStderrString());
-            }
-            return false;
-        } catch (Throwable t) {
-            if (logger != null) {
-                logger.d(TAG + ": " + filter + " threw: " + t.getMessage());
-            }
-            return false;
-        }
     }
 }

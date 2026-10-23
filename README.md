@@ -6,6 +6,20 @@ ShizuPosed runs Xposed-API modules inside target apps without root. No bootloade
 
 ---
 
+## Two builds
+
+ShizuPosed ships as two APKs with the same code and the same signature:
+
+**Standard** — the normal build. Package name `com.shizuposed.manager`. Its updates work like any other app's.
+
+**Stealth** — a separate build with a scrambled package name of the form `<letter>.<letters>.<letters>`, like `h.sghdt.kihyturd`. Nothing in that name hints at ShizuPosed. Its status provider authority is scrambled the same way.
+
+Pick the standard build unless you have a reason not to. Pick the stealth build if a target app checks for `com.shizuposed.manager` by name, or if you want the launcher to show something other than "ShizuPosed". The stealth build is a separate install — it cannot update the standard one, and vice versa. Switching between them means uninstalling the one you have, installing the other, and setting it up from scratch.
+
+Details are in [Installation](#installation) and [The stealth build](#the-stealth-build).
+
+---
+
 ## What this is, and what it isn't
 
 ShizuPosed is **not** a drop-in replacement for LSPosed. It uses a different injection primitive — `app_process` into a target it starts — because that's the only injection path that reliably works without root on modern Android. That choice is what makes ShizuPosed possible, and it's also what sets the ceiling.
@@ -349,70 +363,31 @@ Three classes install it: `PackageCheck` covers `IPackageManager`, `AdbCheck` an
 
 ### Smart foreground hiding (opt-in)
 
-XStealth's Java and native checks intercept reads of Developer
-Options and ADB state. They cover every read path the target app
-takes through libc, through the settings API, and through the
-content resolver.
+XStealth's Java and native checks intercept reads of Developer Options and ADB state. They cover every read path the target app takes through libc, through the settings API, and through the content resolver.
 
-They do not cover two paths: a Binder call directly to
-`ISettingsProvider` (which bypasses the Java API and the content
-resolver), and a native read of the settings database's backing
-store (which bypasses the file interposers by using SQLite
-directly).
+They do not cover two paths: a Binder call directly to `ISettingsProvider` (which bypasses the Java API and the content resolver), and a native read of the settings database's backing store (which bypasses the file interposers by using SQLite directly).
 
-Smart foreground hiding closes those paths by changing the
-*underlying state* rather than intercepting the read. When a
-scoped app comes to the foreground, the manager writes
-`development_settings_enabled` and `adb_enabled` to 0 through
-Shizuku. When the app leaves, the manager restores the prior
-values.
+Smart foreground hiding closes those paths by changing the *underlying state* rather than intercepting the read. When a scoped app comes to the foreground, the manager writes `adb_wifi_enabled` and `adb_enabled` to 0 through Shizuku. When the app leaves, the manager restores the prior values.
 
-Because the settings are genuinely off during that window, every
-reader sees 0 — including the paths XStealth's read interception
-doesn't cover.
+Because the settings are genuinely off during that window, every reader sees 0 — including the paths XStealth's read interception doesn't cover.
 
 #### The cost
 
-Shizuku requires Developer Options to be enabled. When the
-settings are off, Shizuku's server stops. ShizuPosed's service
-loses its binder and shuts down. The framework is idle for the
-duration of the window.
+Shizuku requires Developer Options to be enabled. When the settings are off, Shizuku's server stops. ShizuPosed's service loses its binder and shuts down. The framework is idle for the duration of the window.
 
-When the scoped app exits, the settings are restored, Shizuku's
-server comes back, and `ShizuBinderWatcher` restarts ShizuPosed's
-service. This is the same trade-off Shizuku-Next's "ADB without
-Developer options" switch makes.
+When the scoped app exits, the settings are restored, Shizuku's server comes back, and `ShizuBinderWatcher` restarts ShizuPosed's service. This is the same trade-off Shizuku-Next's "ADB without Developer options" switch makes.
 
 #### What you lose
 
-  * **Apps launched during the window are not hooked.** If the
-    user opens a second scoped app while the first is still in
-    the foreground, the second app is not launched through
-    ShizuPosed, and modules scoped to it do not load.
-  * **The foreground-detection race.** The monitor detects the
-    transition using `UsageStatsManager`, which polls. The poll
-    interval is 500 ms. An app that reads its settings in
-    `Application.attachBaseContext` before the monitor's next
-    poll sees the previous value. XStealth's read interception
-    does not have this race — the hooks install during bootstrap
-    — so the two mechanisms are complementary: read interception
-    covers the early reads, the state change covers the late ones.
-  * **`PACKAGE_USAGE_STATS`.** The monitor uses
-    `UsageStatsManager`, which requires the user to grant the
-    permission through Settings → Special app access → Usage
-    access. Without it, the monitor does not start.
+  * **Apps launched during the window are not hooked.** If the user opens a second scoped app while the first is still in the foreground, the second app is not launched through ShizuPosed, and modules scoped to it do not load.
+  * **The foreground-detection race.** The monitor detects the transition using `UsageStatsManager`, which polls. The poll interval is 500 ms. An app that reads its settings in `Application.attachBaseContext` before the monitor's next poll sees the previous value. XStealth's read interception does not have this race — the hooks install during bootstrap — so the two mechanisms are complementary: read interception covers the early reads, the state change covers the late ones.
+  * **`PACKAGE_USAGE_STATS`.** The monitor uses `UsageStatsManager`, which requires the user to grant the permission through Settings → Special app access → Usage access. Without it, the monitor does not start.
 
 #### When to use it
 
-Enable it when a scoped app is known to read the settings through
-a path XStealth does not intercept. The usual tell: XStealth is on,
-the app's scope is set, but the app still reports Developer
-Options as enabled.
+Enable it when a scoped app is known to read the settings through a path XStealth does not intercept. The usual tell: XStealth is on, the app's scope is set, but the app still reports Developer Options as enabled.
 
-Do not enable it by default. XStealth's read interception covers
-the common cases, and the state change's cost — Shizuku and the
-service going down for the duration — is not worth paying unless
-it's necessary.
+Do not enable it by default. XStealth's read interception covers the common cases, and the state change's cost — Shizuku and the service going down for the duration — is not worth paying unless it's necessary.
 
 ### What each layer covers
 
@@ -538,12 +513,12 @@ The shell-side `XposedHook` writes one JSON marker per process it bootstraps to 
     Module UI process
       → XposedBridge.isModuleActive(pkg)
         → LSPosedManager.isModuleActive(pkg)
-          → ContentResolver.query(content://com.shizuposed.manager.status/active/<pkg>)
+          → ContentResolver.query(content://<status-authority>/active/<pkg>)
             → ModuleStatusProvider
               → reads <manager files>/.markers/*.json
               → returns active=1 or active=0
 
-The `any-active` route follows the same chain with a different endpoint.
+The `<status-authority>` is `com.shizuposed.manager.status` in the standard build, and `<x>.<y>.status` in the stealth build. The `any-active` route follows the same chain with a different endpoint.
 
 ### The Android 11+ package visibility requirement
 
@@ -553,7 +528,7 @@ On Android 11 and later, a module that queries the status provider from its own 
         <provider android:authorities="com.shizuposed.manager.status" />
     </queries>
 
-Without that declaration, every query returns an empty cursor — indistinguishable from "no marker." Both `XposedBridge` and `LSPosedManager` log a warning to logcat when this happens, with the exact manifest snippet to add. The warning tag is `ShizuPosed` (or `Xposed` for calls through `XposedBridge`).
+In the stealth build, the authority is different. The module has to declare whichever authority matches the build it's running against. Without that declaration, every query returns an empty cursor — indistinguishable from "no marker." Both `XposedBridge` and `LSPosedManager` log a warning to logcat when this happens, with the exact manifest snippet to add. The warning tag is `ShizuPosed` (or `Xposed` for calls through `XposedBridge`).
 
 ### Modules that check their own activation state
 
@@ -677,13 +652,46 @@ Upstream Shizuku works. Shevery is also supported, though some of its privileged
 
 Install Shizuku (Shizuku-Next recommended) from the link above, then start it via ADB or via the Shizuku app's own start flow.
 
-Install the ShizuPosed Manager APK:
+Download the build you want from the Releases page:
 
-    adb install -r app-release.apk
+  * `app-standard-release.apk` — the normal build.
+  * `app-stealth-release.apk` — the scrambled-name build.
+
+Unless you have a specific reason to pick the stealth build, pick the standard one. Its updates work like any other app's, and everything in this README refers to it by name.
+
+Install it:
+
+    adb install -r app-standard-release.apk
+
+Or `app-stealth-release.apk` for the stealth build.
 
 Open the manager. It requests Shizuku permission on first launch. Add a module from the Modules tab, or use one that auto-detects. Edit the module's scope to choose which apps it applies to — protected-UID packages won't appear in the picker. Then either tap **Launch App under ShizuPosed** and pick a scoped app, or just open a scoped app normally; the process monitor will trigger a spawn-only injection for it.
 
 Activation isn't retroactive for a process already running. The monitor catches a scoped app when it starts; an app that was already running before the module was scoped is not retroactively hooked.
+
+### The stealth build
+
+The stealth build has a scrambled package name of the form `<letter>.<letters>.<letters>`, like `h.sghdt.kihyturd`. Its status provider authority is scrambled the same way. A target app that checks for `com.shizuposed.manager` by name finds nothing, and a check for `com.shizuposed.manager.status` finds nothing either.
+
+It's a separate app to Android:
+
+  * It cannot update the standard build, and the standard build cannot update it. Installing one over the other fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`.
+  * It does not share settings, modules, or Shizuku permissions with the standard build.
+  * Its launcher label is **Sync Service** by default, so you can tell the two apart if both are installed.
+
+Switching between builds means uninstalling one, installing the other, and setting it up from scratch. Modules you added to one don't appear in the other.
+
+Before installing the stealth build over an existing standard install, clear the shell-side cache so the new build starts fresh:
+
+    rm -rf /data/user/0/com.android.shell/files/.syscall_cache
+
+On devices where that path isn't writable, use the fallback:
+
+    rm -rf /data/local/tmp/shizuposed
+
+Either is safe if the directory doesn't exist.
+
+The stealth build does not hide behavior. A target app that detects the hook by checking its own method entry points, or by running its own runtime-integrity SDK, still detects the hook regardless of which build you're running. The scrambled name closes name-based checks only.
 
 ---
 
@@ -699,7 +707,7 @@ Five tabs.
 
 **Logs** shows the manager's own log with live search and a clear button.
 
-**Settings** has the runtime toggles, scan interval and hook delay sliders, the Maintenance section, and config export.
+**Settings** has the runtime toggles, scan interval and hook delay sliders, the Maintenance section, a **Check for updates** button, and config export.
 
 ### Module detail sheet
 
@@ -754,7 +762,7 @@ Note: `Hide Developer Options` and `Hide ADB enabled` change what a target *read
 
 ShizuPosed is built from sources in this repository. The APK is reproducible from a clean checkout with the documented toolchain.
 
-**Signed builds.** The manager APK is signed with the project's release key.
+**Signed builds.** Both the standard and stealth APKs are signed with the project's release key.
 
 **Native library provenance.** Each `.so` is built from the `.c` file with the same name in the `native/` directory of this repository.
 
@@ -769,8 +777,19 @@ ShizuPosed is built from sources in this repository. The APK is reproducible fro
     export ANDROID_HOME=$HOME/Android/Sdk
     git clone <repo>
     cd ShizuPosed
-    ./gradlew clean :app:assembleDebug
-    adb install -r app/build/outputs/apk/debug/app-debug.apk
+    ./gradlew clean :app:assembleStandardRelease
+    adb install -r app/build/outputs/apk/standard/release/app-standard-release.apk
+
+To build the stealth APK as well:
+
+    ./gradlew :app:assembleStealthRelease
+    adb install -r app/build/outputs/apk/stealth/release/app-stealth-release.apk
+
+The stealth build's package name is derived from a per-machine seed. To see what this machine will produce:
+
+    ./gradlew printStealthId
+
+The same machine produces the same name on every build. Pass `-PstealthSeed=<anything>` to get a different name for that build.
 
 ### The native libraries
 
@@ -780,7 +799,7 @@ The five native libraries and `libcallsite.so` build with the Android NDK. On Te
 
 The `app/build.gradle` includes six verification tasks. Skip all six with:
 
-    ./gradlew assembleRelease -PskipNativeCheck=true
+    ./gradlew assembleStandardRelease -PskipNativeCheck=true
 
 ### Configuration cache
 
@@ -834,6 +853,8 @@ These are structural, not bugs to be fixed.
 
 **Modules that require LSPosed.** Some modules do their work in `system_server`. Others check for LSPosed-specific signals — the LSPosed manager package, `org.lsposed.*` server classes, or coverage that assumes zygote-wide injection — and display "not activated" under any framework whose coverage is narrower. That's a compatibility gap, not a ShizuPosed bug. The module's UI needs to check its own hook or use `isModuleActiveAnywhere`.
 
+**The stealth build is a separate install.** It cannot update the standard build, and vice versa. Switching between them means uninstalling one, installing the other, and setting it up again. Its scrambled package name hides the manager from name-based checks; it does not hide the hook from behavior-based ones.
+
 **Amiru-specific:** object arguments arrive as `null`, `thisObject` arrives as `null`, after-hooks aren't dispatched, constructors aren't hookable, ARM64 only.
 
 **Native engines:** in-process only, object arguments and `thisObject` arrive as `null`, after-hooks aren't dispatched, ARM64 only.
@@ -885,6 +906,6 @@ This isn't a ShizuPosed bug. Without root, no framework is going to beat BioCatc
 
 ## Acknowledgements
 
-Rikka, for Shizuku — the primitive that makes all of this possible. canyie, for Pine, the primary ART hooking engine. LSPosed, for the API generation ShizuPosed targets, and for the design of the module status provider contract.
+Rikka, for Shizuku; the primitive that makes all of this possible. canyie, for Pine, the primary ART hooking engine. LSPosed, for the API generation ShizuPosed targets, and for the design of the module status provider contract.
 
 And every module author who kept the `de.robv.android.xposed.*` API alive long enough for an alternative to matter.

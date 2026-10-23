@@ -2,41 +2,13 @@ package com.shizuposed.manager.stealth;
 
 import android.util.Log;
 
-/**
- * XStealthNative
- *
- * Java side of libxstealth.so. The native library interposes libc
- * file and process inspection calls to hide ShizuPosed's presence
- * from native-side detection. It also neutralizes reflection-based
- * acquisition of sun.misc.Unsafe at the ART structure level, blocks
- * direct reads of the settings XML, and closes the dlsym and ptrace
- * escapes.
- *
- * STUB TEMPLATE COORDINATION
- * --------------------------
- * Beyond its own interposers, libxstealth.so also captures and
- * verifies the ARM64 prologue template that the two hook-stub
- * backends (libamiru.so and libshizuposed.so) splice into their
- * generated stubs. The template is captured once at nativeInit()
- * from two probe methods' entry points, verified instruction by
- * instruction, and made available to the backends through an
- * exported getter. This class exposes the resulting metadata
- * through a small set of diagnostics so the manager UI can report
- * whether the shape work is active on this device.
- *
- * The library is loaded by XStealthModule inside the target process.
- * Its JNI_OnLoad resolves the real libc symbols and captures the
- * JavaVM. Its JNI surface lets the module turn hiding on or off and
- * query status. Until the module calls setActive(true), every
- * interposed function passes through unchanged and the Unsafe gate
- * is not installed.
- */
 public final class XStealthNative {
 
     private static final String TAG = "XStealthNative";
 
     private static volatile boolean sLoaded = false;
     private static volatile boolean sAvailable = false;
+    private static volatile long sLoadedAtMs = 0L;
 
     private XStealthNative() {}
 
@@ -55,13 +27,82 @@ public final class XStealthNative {
 
         try {
             System.load(libDir + "/libxstealth.so");
+            sLoadedAtMs = System.currentTimeMillis();
             sAvailable = nativeInit();
-            Log.i(TAG, "libxstealth.so loaded, available=" + sAvailable);
+            Log.i(TAG, "libxstealth.so loaded, available=" + sAvailable
+                + " (at " + sLoadedAtMs + ")");
         } catch (Throwable t) {
             sAvailable = false;
             Log.w(TAG, "libxstealth.so not loaded: " + t.getMessage());
+            return sAvailable;
         }
+
+        // Tell the native side which package prefix to trust. Must
+        // happen before any hooks are installed, because the
+        // trusted check gates the framework's own syscalls.
+        try {
+            String pkg = currentPackageName();
+            if (pkg != null && !pkg.isEmpty()) {
+                nativeSetTrustedPackage(pkg);
+                Log.i(TAG, "trusted package set to " + pkg);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "nativeSetTrustedPackage failed: " + t.getMessage());
+        }
+
         return sAvailable;
+    }
+
+    /**
+     * When the library loaded, in milliseconds since epoch. Zero
+     * if load has not run. Used for diagnostics: compare this
+     * against the target's first read of the settings file to
+     * confirm the interposers were in place.
+     */
+    public static long getLoadedAtMs() {
+        return sLoadedAtMs;
+    }
+
+    /**
+     * Resolve the running package name.
+     *
+     * Same logic as XStealthBridge.currentPackageName(). In the
+     * shell-side XposedHook process, the manager package name is
+     * passed via the shizuposed.manager.package system property.
+     */
+    private static String currentPackageName() {
+        String fromProp = System.getProperty("shizuposed.manager.package");
+        if (fromProp != null && !fromProp.isEmpty()) return fromProp;
+
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            java.lang.reflect.Method m = at.getMethod("currentPackageName");
+            Object v = m.invoke(null);
+            if (v instanceof String && !((String) v).isEmpty()) {
+                return (String) v;
+            }
+        } catch (Throwable ignored) {}
+
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            java.lang.reflect.Method cur = at.getMethod("currentActivityThread");
+            Object thread = cur.invoke(null);
+            if (thread != null) {
+                java.lang.reflect.Method getApp =
+                    at.getMethod("getApplication");
+                Object app = getApp.invoke(thread);
+                if (app != null) {
+                    java.lang.reflect.Method getPkg =
+                        app.getClass().getMethod("getPackageName");
+                    Object pkg = getPkg.invoke(app);
+                    if (pkg instanceof String && !((String) pkg).isEmpty()) {
+                        return (String) pkg;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        return "com.shizuposed.manager";
     }
 
     public static boolean isAvailable() {
@@ -100,11 +141,6 @@ public final class XStealthNative {
     // SETTINGS XML / PREAD / LIBART BACKUP
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Number of times the settings XML scrub has fired in this
-     * process. Non-zero means a detector tried to read the settings
-     * backing files and was stopped.
-     */
     public static int getSettingsXmlBlockedCount() {
         if (!sAvailable) return 0;
         try { return nativeGetSettingsXmlBlockedCount(); }
@@ -157,57 +193,30 @@ public final class XStealthNative {
     // STUB TEMPLATE — status and diagnostics
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Whether the native stub-template capture and verification
-     * succeeded on this device. When true, the hook-stub backends
-     * splice a byte-identical ART prologue into every stub they
-     * generate. When false, they fall back to their own shipped
-     * prologue — still correct, just not byte-identical.
-     */
     public static boolean isStubTemplateValid() {
         if (!sAvailable) return false;
         try { return nativeIsStubTemplateValid(); }
         catch (Throwable t) { return false; }
     }
 
-    /**
-     * Number of bytes in the common-prefix probe before verification
-     * stops mattering. Diagnostics only.
-     */
     public static int getStubTemplateConfidence() {
         if (!sAvailable) return 0;
         try { return nativeGetStubTemplateConfidence(); }
         catch (Throwable t) { return 0; }
     }
 
-    /**
-     * Full verification metadata: verified length, frame size, the
-     * per-register save offsets the verifier extracted, and whether
-     * the template passed verification.
-     */
     public static String getStubTemplateInfo() {
         if (!sAvailable) return "unavailable";
         try { return nativeGetStubTemplateInfo(); }
         catch (Throwable t) { return "error: " + t.getMessage(); }
     }
 
-    /**
-     * First 32 bytes of the verified template, hex-encoded. Intended
-     * for the on-device verification harness — a developer can
-     * compare this against a manually-read stub's first 32 bytes to
-     * confirm the splice happened.
-     */
     public static String dumpStubTemplate() {
         if (!sAvailable) return "unavailable";
         try { return nativeDumpStubTemplate(); }
         catch (Throwable t) { return "error: " + t.getMessage(); }
     }
 
-    /**
-     * Human-readable one-line summary of the template state. Safe
-     * to call before nativeInit() has run — returns "native:
-     * unavailable" in that case.
-     */
     public static String stubTemplateSummary() {
         if (!sAvailable) return "stub template: native unavailable";
 
@@ -312,20 +321,26 @@ public final class XStealthNative {
 
     private static native boolean nativeHasLibartBackup();
     private static native String  nativeGetLibartBackupInfo();
-    private static native int nativeGetSysfsBlockedCount();
-    private static native int nativeGetGetppidInterceptedCount();
+    private static native int     nativeGetSysfsBlockedCount();
+    private static native int     nativeGetGetppidInterceptedCount();
 
     public static native int nativeGetOpenat2BlockedCount();
     public static native int nativeGetIoctlBlockedCount();
     public static native int nativeGetNetlinkInterceptedCount();
     public static native int nativeGetNetlinkDroppedCount();
 
-    // Phase 2b — stub template diagnostics. The C symbols live in
-    // libxstealth.c and are exposed through RegisterNatives at
-    // JNI_OnLoad. All four are safe to call before the template is
-    // captured; they return 0 / false / a status string.
     public static native int nativeGetStubTemplateConfidence();
     public static native boolean nativeIsStubTemplateValid();
     public static native String nativeGetStubTemplateInfo();
     public static native String nativeDumpStubTemplate();
+
+    /**
+     * Tell the native side which package prefix to trust.
+     *
+     * In the standard build the prefix is
+     * "com.shizuposed.manager." and is redundant (the C side
+     * already has it built in). In the stealth build the prefix
+     * is the scrambled name, which only this call conveys.
+     */
+    public static native void nativeSetTrustedPackage(String packageName);
 }

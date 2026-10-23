@@ -54,6 +54,20 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * The pin is best-effort. It defeats the naive "count the methods"
  * check. It does not defeat a detector that inspects the actual
  * Method objects or their declaring classes.
+ *
+ * STEALTH BUILD
+ * -------------
+ * PROTECTED_PREFIXES and TRUSTED_PACKAGES are Java package
+ * prefixes, not Android application IDs. The stealth build
+ * changes the app's applicationId, not the Java package of its
+ * classes, so those prefixes stay valid.
+ *
+ * recordManagerPackage is still called at install time with the
+ * running manager's getPackageName(), so any frame that resolves
+ * to the manager's Android identity — via ActivityThread, an
+ * exported component invoked by the target, or an inter-process
+ * call — is treated as trusted regardless of what package name
+ * the manager was built under.
  */
 public final class ApiProtectionCheck {
 
@@ -111,7 +125,36 @@ public final class ApiProtectionCheck {
 
     private ApiProtectionCheck() {}
 
+    /**
+     * Record a module's package name so class loads and class
+     * lookups originating from that package are treated as
+     * trusted. Called from the module load path.
+     */
     public static void recordModulePackage(String pkg) {
+        if (pkg == null || pkg.isEmpty()) return;
+        TRUSTED_PACKAGES.add(pkg);
+    }
+
+    /**
+     * Record the running manager's Android package name.
+     *
+     * In the standard build this is "com.shizuposed.manager",
+     * which is already in TRUSTED_PACKAGES. In the stealth build
+     * it is a scrambled name like "h.sghdt.kihyturd", which is
+     * not. Adding it here means any stack frame that carries the
+     * manager's Android identity — via ActivityThread, an
+     * exported component invoked by the target, or an inter-process
+     * call — is treated as trusted.
+     *
+     * This is a belt-and-suspenders addition. The Java package
+     * prefixes in TRUSTED_PACKAGES already cover the manager's own
+     * classes in both builds, because the Java package is the same
+     * in both. But if a future refactor ever moves the manager's
+     * classes out of the com.shizuposed.* namespace, or if a
+     * third-party component inherits the manager's Android
+     * identity, this covers the gap.
+     */
+    public static void recordManagerPackage(String pkg) {
         if (pkg == null || pkg.isEmpty()) return;
         TRUSTED_PACKAGES.add(pkg);
     }
@@ -145,23 +188,12 @@ public final class ApiProtectionCheck {
     // BASELINE CAPTURE
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Pin baselines for the static list of common detection targets.
-     */
     private static void captureStaticBaselines(ClassLoader classLoader) {
         for (String className : FINGERPRINT_TARGETS) {
             captureOne(className, classLoader);
         }
     }
 
-    /**
-     * Pin baselines for every class the framework has hooked a
-     * method on. Ask HookEngine for the set.
-     *
-     * HookEngine is a framework class, so it's available without a
-     * classloader dance. If the class isn't loadable for any reason
-     * — e.g. an older build — skip and rely on the static baselines.
-     */
     private static void captureDynamicBaselines(ClassLoader classLoader) {
         try {
             Set<String> hookedClasses = HookEngine.getHookedClassNames();
@@ -184,10 +216,6 @@ public final class ApiProtectionCheck {
         }
     }
 
-    /**
-     * Pin a single baseline. No-op if the class isn't loadable or
-     * a baseline already exists for it.
-     */
     private static void captureOne(String className, ClassLoader classLoader) {
         if (className == null || className.isEmpty()) return;
         if (METHOD_COUNT_BASELINE.containsKey(className)) return;
@@ -197,8 +225,6 @@ public final class ApiProtectionCheck {
             int count = clazz.getDeclaredMethods().length;
             METHOD_COUNT_BASELINE.put(className, count);
         } catch (Throwable ignored) {
-            // Class not present on this Android version, or not
-            // loadable from the target's loader. Skip.
         }
     }
 
@@ -409,8 +435,6 @@ public final class ApiProtectionCheck {
 
                             String selfName = self.getName();
 
-                            // Pin the method count for fingerprint
-                            // targets (static or dynamic).
                             Integer baseline = METHOD_COUNT_BASELINE.get(selfName);
                             if (baseline != null
                                     && original.length > baseline) {
@@ -420,8 +444,6 @@ public final class ApiProtectionCheck {
                                 return;
                             }
 
-                            // Filter methods declared by protected
-                            // classes.
                             Method[] filtered = filterMethods(original);
                             if (filtered.length != original.length) {
                                 param.setResult(filtered);

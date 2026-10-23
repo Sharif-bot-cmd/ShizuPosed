@@ -8,6 +8,7 @@ import androidx.annotation.Nullable;
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.shizuposed.manager.ShizukuHelper;
 import com.shizuposed.manager.model.ModuleInfo;
 import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.stealth.XStealthModule;
@@ -41,8 +42,8 @@ import java.util.zip.ZipFile;
  *     module dex so XposedHook can load it from the shell side.
  *   • Reading assets/scope.list to populate ModuleInfo.recommendedApps.
  *
- * UNINSTALL SEMANTICS (R-6.5+)
- * ----------------------------
+ * UNINSTALL SEMANTICS
+ * -------------------
  * Two distinct uninstall operations:
  *
  *   • uninstallModule(pkg) — legacy deregister-only path. Removes
@@ -50,16 +51,17 @@ import java.util.zip.ZipFile;
  *     Used by the scanner's automatic purge pass.
  *
  *   • uninstallModuleCompletely(ctx, pkg, callback) — full uninstall.
- *     Deregisters AND dispatches ACTION_DELETE so the user is
- *     prompted to remove the actual APK. Must be called from an
- *     Activity context.
+ *     Deregisters AND removes the APK. The APK removal goes through
+ *     Shizuku's `pm uninstall` when Shizuku is authorized, which
+ *     does not require user interaction. If Shizuku is not
+ *     available, falls back to an ACTION_DELETE intent — the user
+ *     gets the system dialog and confirms.
  *
- * MANUAL ADD PROTECTION (R-6.5+)
- * ------------------------------
- * Manual entries carry ModuleInfo.manuallyAdded=true. The scanner
- * skips purging them. Additionally, if a manual install's APK path
- * was inside the app cache, installModule() copies the APK into
- * filesDir/imported_modules/ so the path survives cache cleanup.
+ *     The pm uninstall call is synchronous: it blocks until the
+ *     shell command returns. This is what makes the removal stick
+ *     without a race — if the callback fired before pm uninstall
+ *     finished, a subsequent loadModules() could re-discover the
+ *     still-installed APK and re-register it.
  */
 public class ModuleLoader {
     private static final String TAG = "ModuleLoader";
@@ -358,11 +360,6 @@ public class ModuleLoader {
             } catch (PackageManager.NameNotFoundException ignored) {
             }
 
-            // ── APKPATH RESOLUTION ──────────────────────────────
-            // Prefer the installed APK path. If the caller passed a
-            // transient cache path AND the package isn't actually
-            // installed, copy the APK into ShizuPosed's private
-            // storage so the path survives cache cleanup.
             String installedApkPath = findModuleApkPath(module.packageName);
             if (installedApkPath != null && !installedApkPath.isEmpty()) {
                 module.apkPath = installedApkPath;
@@ -505,10 +502,22 @@ public class ModuleLoader {
     /**
      * Legacy deregister-only uninstall.
      *
-     * Removes the module's JSON descriptor and cached dex, but
-     * leaves the module's APK installed on the device. Used by the
-     * scanner's purge pass and by callers that only want to stop
-     * ShizuPosed from loading a module.
+     * Removes the module's descriptor, its dex cache (including any
+     * ART-optimized artifacts), its shell-side mirror, and any
+     * activation marker left by a previous launch. Leaves the APK
+     * installed on the device.
+     *
+     * The dex-optimization step (DexOptimizeWrapper) writes output
+     * alongside the plain dex. Depending on which optimizer ran and
+     * how it was invoked, that output lands in one of two places:
+     *
+     *   • A sibling file (<pkg>.odex, <pkg>.vdex) next to <pkg>.dex.
+     *   • An oat/ subdirectory (oat/arm64/<pkg>.odex, .vdex).
+     *
+     * Both are cleaned. The plain dex is also cleaned. The shell-side
+     * mirror is cleaned via Shizuku, because a stale descriptor there
+     * would keep the module loading into newly-bootstrapped targets
+     * even after the user removed it.
      */
     public boolean uninstallModule(String packageName) {
         try {
@@ -519,11 +528,13 @@ public class ModuleLoader {
                 return false;
             }
 
+            // ── 1. Descriptor ────────────────────────────────
             File moduleFile = new File(moduleDir, packageName + ".json");
             if (moduleFile.exists() && moduleFile.delete()) {
                 logger.i("Deleted module file: " + moduleFile.getAbsolutePath());
             }
 
+            // ── 2. In-memory cache ───────────────────────────
             ModuleInfo removed;
             cacheLock.writeLock().lock();
             try {
@@ -538,14 +549,55 @@ public class ModuleLoader {
                 logger.w("Module not found in cache: " + packageName);
             }
 
-            File externalDex = new File(dexCacheDir, packageName + ".dex");
-            if (externalDex.exists() && externalDex.delete()) {
-                logger.i("Deleted cached dex: " + externalDex.getAbsolutePath());
+            // ── 3. Local dex and any optimized derivatives ───
+            deleteDexArtifacts(dexCacheDir, packageName);
+            deleteDexArtifacts(legacyDexCacheDir, packageName);
+
+            // ── 4. Staged copies on external storage ─────────
+            // The staging dir mirrors what pushModulesToShellDir
+            // writes locally before copying to the shell side.
+            try {
+                File external = context.getExternalFilesDir(null);
+                if (external != null) {
+                    File stagingModules = new File(external, "modules");
+                    File stagedJson = new File(stagingModules,
+                        packageName + ".json");
+                    File stagedDex = new File(stagingModules,
+                        packageName + ".dex");
+                    if (stagedJson.exists() && stagedJson.delete()) {
+                        logger.i("Deleted staged json: "
+                            + stagedJson.getAbsolutePath());
+                    }
+                    if (stagedDex.exists() && stagedDex.delete()) {
+                        logger.i("Deleted staged dex: "
+                            + stagedDex.getAbsolutePath());
+                    }
+                }
+            } catch (Throwable t) {
+                if (logger != null) {
+                    logger.w("uninstallModule: staged cleanup failed: "
+                        + t.getMessage());
+                }
             }
-            File legacyDex = new File(legacyDexCacheDir, packageName + ".dex");
-            if (legacyDex.exists() && legacyDex.delete()) {
-                logger.i("Deleted legacy dex: " + legacyDex.getAbsolutePath());
+
+            // ── 5. Imported APK (manually-added modules) ─────
+            try {
+                File importedApk = new File(
+                    new File(context.getFilesDir(), "imported_modules"),
+                    packageName + ".apk");
+                if (importedApk.exists() && importedApk.delete()) {
+                    logger.i("Deleted imported APK: "
+                        + importedApk.getAbsolutePath());
+                }
+            } catch (Throwable t) {
+                if (logger != null) {
+                    logger.w("uninstallModule: imported APK cleanup failed: "
+                        + t.getMessage());
+                }
             }
+
+            // ── 6. Shell-side mirror and marker ──────────────
+            cleanupShellSide(packageName);
 
             return true;
         } catch (Exception e) {
@@ -555,12 +607,124 @@ public class ModuleLoader {
     }
 
     /**
-     * Full uninstall: deregister the module AND request the system
-     * to uninstall the underlying APK.
+     * Delete the plain dex and every optimized derivative for this
+     * package under the given base directory.
      *
-     * Must be called from an Activity context because ACTION_DELETE
-     * requires user confirmation in a system dialog.
+     * Covers:
+     *   • <base>/<pkg>.dex          (plain copy of the APK-as-dex)
+     *   • <base>/<pkg>.odex         (DexOptimizeWrapper output)
+     *   • <base>/<pkg>.vdex         (ART verification output)
+     *   • <base>/oat/arm64/<pkg>.odex, .vdex
+     *   • <base>/oat/arm/<pkg>.odex, .vdex
+     *
+     * The oat subdirectory layout is what the Android dexopt tools
+     * use when they're invoked in their default mode; the sibling
+     * layout is what DexOptimizeWrapper writes when it runs the
+     * optimizer directly. Both are cleaned.
      */
+    private void deleteDexArtifacts(File baseDir, String packageName) {
+        if (baseDir == null || packageName == null) return;
+        if (!baseDir.exists() || !baseDir.isDirectory()) return;
+
+        String[] suffixes = { ".dex", ".odex", ".vdex" };
+
+        for (String suffix : suffixes) {
+            File f = new File(baseDir, packageName + suffix);
+            if (f.exists() && f.delete()) {
+                if (logger != null) {
+                    logger.i("Deleted " + f.getAbsolutePath());
+                }
+            }
+        }
+
+        // oat/<arch>/<pkg>.odex and .vdex
+        String[] archDirs = { "arm64", "arm" };
+        for (String arch : archDirs) {
+            File oatDir = new File(baseDir, "oat/" + arch);
+            if (!oatDir.exists() || !oatDir.isDirectory()) continue;
+
+            for (String suffix : new String[]{ ".odex", ".vdex" }) {
+                File f = new File(oatDir, packageName + suffix);
+                if (f.exists() && f.delete()) {
+                    if (logger != null) {
+                        logger.i("Deleted " + f.getAbsolutePath());
+                    }
+                }
+            }
+        }
+    }
+
+    private void cleanupShellSide(String packageName) {
+        if (packageName == null) return;
+        try {
+            ShizukuHelper sh = ShizukuHelper.getInstance(context);
+            if (sh == null || !sh.isAvailable() || !sh.isAuthorized()) {
+                if (logger != null) {
+                    logger.d("cleanupShellSide: Shizuku not authorized, "
+                        + "skipping shell-side cleanup for " + packageName);
+                }
+                return;
+            }
+
+            String base = ShizuPosedService.getResolvedShellBase();
+            if (base == null || base.isEmpty()) return;
+
+            String modulesDir = base + "/modules";
+            String hookedDir  = base + "/hooked";
+
+            StringBuilder script = new StringBuilder();
+            script.append("rm -f \"")
+                  .append(modulesDir).append("/").append(packageName)
+                  .append(".json\" \"")
+                  .append(modulesDir).append("/").append(packageName)
+                  .append(".dex\" \"")
+                  .append(modulesDir).append("/").append(packageName)
+                  .append(".odex\" \"")
+                  .append(modulesDir).append("/").append(packageName)
+                  .append(".vdex\" \"")
+                  .append(hookedDir).append("/").append(packageName)
+                  .append(".json\"; ");
+            script.append("echo CLEANED");
+
+            String cmd = "/system/bin/sh -c '"
+                + script.toString().replace("'", "'\\''") + "'";
+
+            com.shizuposed.manager.utils.ShellUtils.CommandResult r =
+                sh.executeCommand(cmd);
+
+            if (r != null && r.isSuccess()
+                    && r.getStdoutString() != null
+                    && r.getStdoutString().contains("CLEANED")) {
+                if (logger != null) {
+                    logger.i("cleanupShellSide: removed shell-side artifacts for "
+                        + packageName);
+                }
+            } else if (logger != null) {
+                logger.w("cleanupShellSide: rm returned non-success for "
+                    + packageName
+                    + " stdout=[" + (r != null ? r.getStdoutString() : "null")
+                    + "] stderr=[" + (r != null ? r.getStderrString() : "null")
+                    + "]");
+            }
+
+            // Refresh the marker mirror so the status provider stops
+            // seeing the removed marker immediately.
+            try {
+                MarkerCache.refresh(context);
+            } catch (Throwable t) {
+                if (logger != null) {
+                    logger.d("cleanupShellSide: MarkerCache.refresh failed: "
+                        + t.getMessage());
+                }
+            }
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.w("cleanupShellSide failed for " + packageName
+                    + ": " + t.getMessage());
+            }
+        }
+    }
+
     public boolean uninstallModuleCompletely(Context activityContext,
                                              String packageName,
                                              UninstallCallback callback) {
@@ -583,25 +747,11 @@ public class ModuleLoader {
             return false;
         }
 
-        if (activityContext == null) {
-            if (logger != null) {
-                logger.w("uninstallModuleCompletely: activityContext is null, "
-                    + "falling back to deregister-only");
-            }
-            boolean ok = uninstallModule(packageName);
-            if (callback != null) {
-                callback.onResult(ok ? UNINSTALL_DEREGISTERED_ONLY : UNINSTALL_FAILED,
-                    ok ? "Deregistered (no context available for APK removal)"
-                       : "Deregistration failed");
-            }
-            return ok;
-        }
-
         boolean deregistered = uninstallModule(packageName);
         if (!deregistered) {
             if (logger != null) {
                 logger.w("uninstallModuleCompletely: deregistration failed for "
-                    + packageName + " — not dispatching uninstall intent");
+                    + packageName);
             }
             if (callback != null) {
                 callback.onResult(UNINSTALL_FAILED,
@@ -610,48 +760,119 @@ public class ModuleLoader {
             return false;
         }
 
+        boolean installed = isPackageInstalled(packageName);
+        if (!installed) {
+            if (logger != null) {
+                logger.i("uninstallModuleCompletely: " + packageName
+                    + " was not installed — deregistered only");
+            }
+            if (callback != null) {
+                callback.onResult(UNINSTALL_DEREGISTERED_ONLY,
+                    "Module removed (its APK was not installed)");
+            }
+            return true;
+        }
+
+        // ── Primary path: pm uninstall via Shizuku ────────────
+        // The shell UID can remove packages without user interaction.
+        // This is the only path that works for headless modules,
+        // and it's the only path that produces a result the caller
+        // can rely on synchronously.
+        try {
+            ShizukuHelper sh = ShizukuHelper.getInstance(context);
+            if (sh != null && sh.isAvailable() && sh.isAuthorized()) {
+                String cmd = "pm uninstall " + packageName;
+                if (logger != null) {
+                    logger.i("uninstallModuleCompletely: running `" + cmd + "`");
+                }
+
+                com.shizuposed.manager.utils.ShellUtils.CommandResult r =
+                    sh.executeCommand(cmd);
+
+                boolean success = r != null
+                    && r.isSuccess()
+                    && r.getStdoutString() != null
+                    && r.getStdoutString().contains("Success");
+
+                if (success) {
+                    if (logger != null) {
+                        logger.i("uninstallModuleCompletely: pm uninstall "
+                            + "succeeded for " + packageName);
+                    }
+                    if (callback != null) {
+                        callback.onResult(UNINSTALL_OK,
+                            "Module removed");
+                    }
+                    return true;
+                }
+
+                if (logger != null) {
+                    logger.w("uninstallModuleCompletely: pm uninstall "
+                        + "returned non-success for " + packageName
+                        + " stdout=[" + (r != null ? r.getStdoutString() : "null")
+                        + "] stderr=[" + (r != null ? r.getStderrString() : "null")
+                        + "]");
+                }
+                // Fall through to the ACTION_DELETE fallback.
+            } else if (logger != null) {
+                logger.i("uninstallModuleCompletely: Shizuku not authorized "
+                    + "— using ACTION_DELETE fallback for " + packageName);
+            }
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.w("uninstallModuleCompletely: pm uninstall threw for "
+                    + packageName + ": " + t.getMessage());
+            }
+            // Fall through to the ACTION_DELETE fallback.
+        }
+
+        // ── Fallback path: ACTION_DELETE intent ───────────────
+        // Only reached if Shizuku is unavailable or pm uninstall
+        // failed. Requires an Activity context — the system dialog
+        // is hosted by the activity the intent is dispatched from.
+        // Headless modules won't have a usable dialog; if this
+        // fallback is reached for one, the user will see the dialog
+        // but the module's package may be a system app that can't
+        // be removed.
+        if (activityContext == null) {
+            if (logger != null) {
+                logger.w("uninstallModuleCompletely: no activity context, "
+                    + "cannot dispatch ACTION_DELETE for " + packageName);
+            }
+            if (callback != null) {
+                callback.onResult(UNINSTALL_DEREGISTERED_ONLY,
+                    "Module removed from ShizuPosed, but the APK could not "
+                    + "be removed (no activity context)");
+            }
+            return true;
+        }
+
         try {
             android.content.Intent intent = new android.content.Intent(
                 android.content.Intent.ACTION_DELETE);
             intent.setData(android.net.Uri.parse("package:" + packageName));
             intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
-
-            boolean installed = isPackageInstalled(packageName);
-            if (!installed) {
-                if (logger != null) {
-                    logger.i("uninstallModuleCompletely: " + packageName
-                        + " was not installed — deregistered only");
-                }
-                if (callback != null) {
-                    callback.onResult(UNINSTALL_DEREGISTERED_ONLY,
-                        "Module deregistered (APK was already not installed)");
-                }
-                return true;
-            }
-
             activityContext.startActivity(intent);
 
             if (logger != null) {
-                logger.i("uninstallModuleCompletely: dispatched uninstall "
-                    + "intent for " + packageName);
-            }
-
-            if (callback != null) {
-                callback.onResult(UNINSTALL_OK,
-                    "Deregistered and uninstall prompt shown");
-            }
-            return true;
-
-        } catch (Throwable t) {
-            if (logger != null) {
-                logger.w("uninstallModuleCompletely: failed to dispatch "
-                    + "uninstall intent for " + packageName + ": "
-                    + t.getMessage());
+                logger.i("uninstallModuleCompletely: dispatched "
+                    + "ACTION_DELETE for " + packageName);
             }
             if (callback != null) {
                 callback.onResult(UNINSTALL_DEREGISTERED_ONLY,
-                    "Deregistered, but could not open uninstall dialog: "
-                    + t.getMessage());
+                    "Module removed from ShizuPosed. Confirm the system "
+                    + "dialog to remove the APK.");
+            }
+            return true;
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.w("uninstallModuleCompletely: ACTION_DELETE failed "
+                    + "for " + packageName + ": " + t.getMessage());
+            }
+            if (callback != null) {
+                callback.onResult(UNINSTALL_DEREGISTERED_ONLY,
+                    "Module removed from ShizuPosed, but the APK could not "
+                    + "be removed: " + t.getMessage());
             }
             return true;
         }
@@ -695,13 +916,11 @@ public class ModuleLoader {
     public boolean ensureCachedDex(ModuleInfo module) {
         if (module == null || module.packageName == null) return false;
 
-        // 1. Already valid.
         if (module.cachedDexPath != null
                 && new File(module.cachedDexPath).exists()) {
             return true;
         }
 
-        // 2. External dex cache.
         File externalDex = new File(dexCacheDir, module.packageName + ".dex");
         if (externalDex.exists() && externalDex.length() > 0) {
             module.cachedDexPath = externalDex.getAbsolutePath();
@@ -714,7 +933,6 @@ public class ModuleLoader {
             return true;
         }
 
-        // 3. Legacy dex cache.
         File legacyDex = new File(legacyDexCacheDir, module.packageName + ".dex");
         if (legacyDex.exists() && legacyDex.length() > 0) {
             File dst = new File(dexCacheDir, module.packageName + ".dex");
@@ -741,7 +959,6 @@ public class ModuleLoader {
             return true;
         }
 
-        // 4. Re-derive from APK.
         if (module.apkPath != null && new File(module.apkPath).exists()) {
             try {
                 scanModuleForEntryPoints(module);
@@ -819,12 +1036,6 @@ public class ModuleLoader {
     // MANUAL ADD PROTECTION HELPERS
     // ═════════════════════════════════════════════════════════════════
 
-    /**
-     * True if the given absolute path is inside the app's cache
-     * directory. Cache paths are transient — the system may delete
-     * them at any time, and ModulesFragment.addModuleFromDialog()
-     * deletes the copy after install.
-     */
     private boolean isInCacheDir(String absPath) {
         if (absPath == null) return false;
         try {
@@ -835,17 +1046,6 @@ public class ModuleLoader {
         }
     }
 
-    /**
-     * Copy an APK from a transient location into ShizuPosed's own
-     * private storage, under filesDir/imported_modules/. Returns
-     * the durable path, or null on failure.
-     *
-     * This exists so a manually-added module keeps working even
-     * after the caller's cache copy is deleted, and even after the
-     * module's own package name doesn't resolve through
-     * PackageManager (which is common for modules that hook by
-     * targeting another app's package).
-     */
     private String copyApkToPrivateStorage(String srcPath, String packageName) {
         if (srcPath == null || packageName == null) return null;
         try {

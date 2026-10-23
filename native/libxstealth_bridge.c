@@ -85,6 +85,8 @@ static int raw_close(int fd) {
     return (int) syscall(SYS_close, fd);
 }
 
+static char g_hidden_package[128] = {0};
+
 static int is_hidden_string(const char *s) {
     if (s == NULL) return 0;
 
@@ -96,7 +98,14 @@ static int is_hidden_string(const char *s) {
     if (strstr(s, "ShizuPosedXStealth")  != NULL) return 1;
     if (strstr(s, "XStealthNative")      != NULL) return 1;
     if (strstr(s, "XStealthNativeNext")  != NULL) return 1;
-    return strstr(s, "XStealthBridge") != NULL;
+    if (strstr(s, "XStealthBridge")      != NULL) return 1;
+
+    if (g_hidden_package[0] != '\0'
+            && strstr(s, g_hidden_package) != NULL) {
+        return 1;
+    }
+
+    return 0;
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -371,23 +380,6 @@ ssize_t readlink(const char *path, char *buf, size_t bufsize) {
     return n;
 }
 
-/* ─────────────────────────────────────────────────────────────
- * read
- *
- * Filters reads of /proc/<pid>/{status,cmdline,comm,maps,smaps}
- * when the PID's process name matches a hidden string. Returns
- * ENOENT for those, matching what a caller would see if the
- * process had exited between the open and the read.
- *
- * v0.3.0: maps and smaps added. Without them, a detector that
- * enumerates /proc/[pid]/maps can still find ShizuPosed's memory
- * layout even though the process name itself is hidden.
- *
- * Reads of /proc/self and /proc/thread-self are deliberately
- * not filtered here; that's libxstealth.c's job, and it needs to
- * see the real content for its own scrubbing.
- * ───────────────────────────────────────────────────────────── */
-
 static int fd_is_proc_pid_file(int fd, char *pidbuf, size_t pidbufsize) {
     if (fd < 0 || pidbuf == NULL || pidbufsize < 2) return 0;
     if (real_readlink == NULL) return 0;
@@ -514,17 +506,28 @@ Java_com_shizuposed_manager_stealth_XStealthBridge_nativeInit(JNIEnv *env,
 }
 
 JNIEXPORT void JNICALL
-Java_com_shizuposed_manager_stealth_XStealthBridge_nativeSetActive(
-        JNIEnv *env, jclass clazz, jboolean active) {
-    (void) env; (void) clazz;
-
-    g_bridge_active = active ? 1 : 0;
-    if (g_bridge_active) {
-        pthread_mutex_lock(&g_bridge_lock);
-        g_tracked_count = 0;
-        pthread_mutex_unlock(&g_bridge_lock);
+Java_com_shizuposed_manager_stealth_XStealthBridge_nativeSetHiddenPackage(
+        JNIEnv *env, jclass clazz, jstring packageName) {
+    (void) clazz;
+    if (packageName == NULL) {
+        g_hidden_package[0] = '\0';
+        ALOGI("XStealthBridge: hidden package cleared");
+        return;
     }
-    ALOGI("XStealthBridge: active=%d", g_bridge_active);
+
+    const char *utf = (*env)->GetStringUTFChars(env, packageName, NULL);
+    if (utf == NULL) return;
+
+    size_t n = strlen(utf);
+    if (n >= sizeof(g_hidden_package) - 1) {
+        n = sizeof(g_hidden_package) - 2;
+    }
+    memcpy(g_hidden_package, utf, n);
+    g_hidden_package[n] = '\0';
+
+    (*env)->ReleaseStringUTFChars(env, packageName, utf);
+
+    ALOGI("XStealthBridge: hidden package = \"%s\"", g_hidden_package);
 }
 
 JNIEXPORT jboolean JNICALL
@@ -542,7 +545,7 @@ Java_com_shizuposed_manager_stealth_XStealthBridge_nativeDescribe(
     snprintf(buf, sizeof(buf),
              "libxstealth_bridge %s active=%d tracked_dirs=%d "
              "procPidReadsBlocked=%d procEntriesSkipped=%d",
-             "0.3.0", g_bridge_active, g_tracked_count,
+             "0.4.0", g_bridge_active, g_tracked_count,
              g_proc_pid_reads_blocked,
              g_proc_entries_skipped);
     return (*env)->NewStringUTF(env, buf);
@@ -580,7 +583,7 @@ JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void) vm; (void) reserved;
 
-    ALOGI("JNI_OnLoad: libxstealth_bridge %s", "0.3.0");
+    ALOGI("JNI_OnLoad: libxstealth_bridge %s", "0.4.0");
 
     void *libandroid = dlopen("libandroid.so", RTLD_NOW);
     if (libandroid != NULL) {

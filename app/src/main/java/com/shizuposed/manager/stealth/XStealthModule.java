@@ -40,18 +40,45 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * native engine on top of the primary one. It's controlled by its
  * own toggle and has no effect when the master toggle is off.
  *
+ * NATIVE PRELOAD
+ * --------------
+ * The native libraries load at the top of handleLoadPackage, before
+ * any of the Java-layer checks. The target's earliest code — its
+ * Application.attachBaseContext, any thread it starts from there,
+ * and any native code it loads during handleBindApplication — runs
+ * after handleLoadPackage returns. Loading the native engines here
+ * means the libc interposers are in place by the time the target's
+ * code runs.
+ *
+ * The window this closes: a target that reads
+ * /data/system/users/0/settings_global.xml directly through libc
+ * during Application.attachBaseContext, or that opens the file and
+ * holds the fd for a later pread. The Java-layer checks in
+ * DevOptionsCheck and AdbCheck never see those reads; the native
+ * interposers do, but only if the library is loaded first. Loading
+ * it at the top of handleLoadPackage is the earliest point at which
+ * the config, the scope, and the target's classloader are all
+ * known.
+ *
+ * What this does NOT close: a target that reads the value through
+ * a native /dev/binder call to SettingsProvider. That call reaches
+ * system_server's in-memory cache, not the file. No userspace
+ * library can intercept it. The only fix for that path is the
+ * state change — smart-foreground — which writes adb_enabled=0 to
+ * the underlying store, so the cached value is 0 too.
+ *
  * CHECK LAYERS
  * ------------
  *   Settings-based
  *     DevOptionsCheck       — Settings.Global + ContentResolver.query
- *                             + Binder IContentProvider (9.0)
+ *                             + Binder IContentProvider
  *     AdbCheck              — Settings.Secure + Settings.Global + query
- *                             + Binder IContentProvider (9.0)
+ *                             + Binder IContentProvider
  *     CachedValueCheck      — SharedPreferences reads (opt-in)
  *
  *   Accessibility
  *     AccessibilityCheck    — AccessibilityManager list enumeration
- *                             + Binder IAccessibilityManager (9.0)
+ *                             + Binder IAccessibilityManager
  *
  *   Subprocess
  *     SettingsFileCheck     — Runtime.exec + ProcessBuilder
@@ -61,7 +88,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *
  *   Package / process
  *     PackageCheck          — PackageManager lookups + Binder
- *                             IPackageManager + Binder DUMP (9.0)
+ *                             IPackageManager + Binder DUMP
  *     RunningProcessCheck   — ActivityManager lookups
  *
  *   Reflection / API
@@ -74,7 +101,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *
  *   Native
  *     XStealthNative        — libc interposition (file reads)
- *     XStealthNativeNext    — runtime syscall stub scanner (9.0)
+ *     XStealthNativeNext    — runtime syscall stub scanner
  *
  * BRIDGES
  * -------
@@ -120,6 +147,54 @@ public class XStealthModule implements IXposedHookLoadPackage {
         XposedBridge.log(TAG + ": activating for " + lpparam.packageName
             + (config.nextEnabled ? " (Next)" : "")
             + (config.isScopeAllApps() ? " (all apps)" : ""));
+
+        // ─── Native layer, FIRST ─────────────────────────────────
+        //
+        // Load the native engines before any of the Java hooks.
+        // The target's Application.attachBaseContext, any thread
+        // it starts from there, and any native code it loads
+        // during handleBindApplication all run after this method
+        // returns. Loading the libc interposers here means they're
+        // in place by the time the target's code runs.
+        //
+        // This is the earliest point at which the config has been
+        // read, the scope has been checked, and the target is
+        // known to be in scope. It cannot be moved earlier.
+        try {
+            String libDir = System.getProperty("shizuposed.shell.libs",
+                "/data/user/0/com.android.shell/files/libs");
+            if (XStealthNative.load(libDir)) {
+                XStealthNative.setActive(true);
+                XposedBridge.log(TAG + ": native hiding active (preloaded)");
+            } else {
+                XposedBridge.log(TAG + ": native hiding unavailable");
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": native hiding failed: "
+                + t.getMessage());
+        }
+
+        if (config.nextEnabled) {
+            try {
+                String libDir = System.getProperty("shizuposed.shell.libs",
+                    "/data/user/0/com.android.shell/files/libs");
+                if (XStealthNativeNext.load(libDir)) {
+                    XStealthNativeNext.setActive(true);
+                    if (XStealthNativeNext.isActive()) {
+                        XposedBridge.log(TAG
+                            + ": Next hiding active (preloaded)");
+                    } else {
+                        XposedBridge.log(TAG
+                            + ": Next hiding failed to install");
+                    }
+                } else {
+                    XposedBridge.log(TAG + ": Next library unavailable");
+                }
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": Next hiding failed: "
+                    + t.getMessage());
+            }
+        }
 
         // ─── Settings-based checks ───────────────────────────────
 
@@ -178,8 +253,8 @@ public class XStealthModule implements IXposedHookLoadPackage {
 
         // ─── Package / process ───────────────────────────────────
         //
-        // PackageCheck now installs whenever the master is on,
-        // because it does more than package hiding: it hooks the
+        // PackageCheck installs whenever the master is on, because
+        // it does more than package hiding: it hooks the
         // IPackageManager descriptor for the Binder path, handles
         // DUMP_TRANSACTION for dumpsys package, and installs the
         // ProxyTransactListener for diagnostics. The per-target
@@ -196,9 +271,43 @@ public class XStealthModule implements IXposedHookLoadPackage {
             catch (Throwable t) { XposedBridge.log(TAG + ": Process hook failed: " + t); }
         }
 
+        // ─── Reflection / API protection ─────────────────────────
+        //
+        // Two names are recorded before install so the trust check
+        // inside ApiProtectionCheck knows about them:
+        //
+        //   • The module's own package, so class loads originating
+        //     from the module's code aren't refused.
+        //
+        //   • The running manager's Android package name, so any
+        //     frame that carries the manager's runtime identity
+        //     (e.g. an exported component the target invokes) is
+        //     trusted. In the standard build this is
+        //     "com.shizuposed.manager"; in the stealth build it is
+        //     the scrambled name.
         if (config.apiProtection) {
+            try {
+                ApiProtectionCheck.recordModulePackage(lpparam.packageName);
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": recordModulePackage failed: "
+                    + t.getMessage());
+            }
+
+            try {
+                String managerPkg = System.getProperty(
+                    "shizuposed.manager.package");
+                if (managerPkg != null && !managerPkg.isEmpty()) {
+                    ApiProtectionCheck.recordManagerPackage(managerPkg);
+                }
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": recordManagerPackage failed: "
+                    + t.getMessage());
+            }
+
             try { ApiProtectionCheck.install(lpparam); }
-            catch (Throwable t) { XposedBridge.log(TAG + ": ApiProtectionCheck failed: " + t); }
+            catch (Throwable t) {
+                XposedBridge.log(TAG + ": ApiProtectionCheck failed: " + t);
+            }
         }
 
         // ─── SystemProperties, Build, property scrub ─────────────
@@ -229,42 +338,6 @@ public class XStealthModule implements IXposedHookLoadPackage {
             registerBridgeListeners();
         }
 
-        // ─── Native layer ────────────────────────────────────────
-
-        if (config.hideProcFs) {
-            try {
-                String libDir = System.getProperty("shizuposed.shell.libs",
-                    "/data/user/0/com.android.shell/files/libs");
-                if (XStealthNative.load(libDir)) {
-                    XStealthNative.setActive(true);
-                    XposedBridge.log(TAG + ": native hiding active");
-                } else {
-                    XposedBridge.log(TAG + ": native hiding unavailable");
-                }
-            } catch (Throwable t) {
-                XposedBridge.log(TAG + ": native hiding failed: " + t.getMessage());
-            }
-        }
-
-        if (config.nextEnabled) {
-            try {
-                String libDir = System.getProperty("shizuposed.shell.libs",
-                    "/data/user/0/com.android.shell/files/libs");
-                if (XStealthNativeNext.load(libDir)) {
-                    XStealthNativeNext.setActive(true);
-                    if (XStealthNativeNext.isActive()) {
-                        XposedBridge.log(TAG + ": Next hiding active");
-                    } else {
-                        XposedBridge.log(TAG + ": Next hiding failed to install");
-                    }
-                } else {
-                    XposedBridge.log(TAG + ": Next library unavailable");
-                }
-            } catch (Throwable t) {
-                XposedBridge.log(TAG + ": Next hiding failed: " + t.getMessage());
-            }
-        }
-
         if (XStealthRegistry.count() > 0) {
             sActive = true;
         }
@@ -287,23 +360,6 @@ public class XStealthModule implements IXposedHookLoadPackage {
      * load or a binder call would create a behavior the target
      * could detect, which is exactly what XStealth exists to
      * prevent.
-     *
-     * What the listeners actually do:
-     *
-     *   • ClassLoadListener: if the target loads a class in the
-     *     Xposed shim namespace, log it. ApiProtectionCheck already
-     *     refuses Class.forName for that namespace; this is the
-     *     loadClass path, which ApiProtectionCheck does not hook.
-     *     Observing here tells the user when a target is trying to
-     *     probe for Xposed by reflection.
-     *
-     *   • LoaderCreatedListener: log when the target constructs a
-     *     dynamic loader at runtime. Diagnostic only.
-     *
-     *   • ApplicationThreadBackend.Listener: observe lifecycle
-     *     binder calls for diagnostics. Always returns true (never
-     *     blocks), because blocking would change the target's
-     *     behavior.
      */
     private static void registerBridgeListeners() {
         // ── ClassLoadListener ────────────────────────────────────
@@ -344,17 +400,7 @@ public class XStealthModule implements IXposedHookLoadPackage {
                     // Observational only. Return true to let the
                     // call through. A false return would block the
                     // lifecycle event, which the target would
-                    // notice (the service never starts, the
-                    // activity never launches) and could use as a
-                    // detection signal.
-                    if (methodName != null
-                            && methodName.startsWith("schedule")) {
-                        // Debug-level log. Kept behind a check so
-                        // verbose logging stays opt-in via
-                        // XStealthConfig if you later add a
-                        // "bridgeVerbose" toggle.
-                        // XposedBridge.log(TAG + ": binder " + methodName);
-                    }
+                    // notice and could use as a detection signal.
                     return true;
                 });
             XposedBridge.log(TAG + ": ApplicationThread listener registered");

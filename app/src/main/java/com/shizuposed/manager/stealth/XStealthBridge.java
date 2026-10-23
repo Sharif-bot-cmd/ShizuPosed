@@ -20,6 +20,20 @@ import de.robv.android.xposed.XposedBridge;
  * /proc/self/cmdline reads. Loading the bridge without the
  * primary library still works — the bridge's own interposers
  * function independently — but the coverage is reduced.
+ *
+ * HIDDEN PACKAGE
+ * --------------
+ * The native side filters paths, readlink targets, and process
+ * comms against a list of hidden strings. That list includes
+ * "shizuposed", "libxstealth", etc. — the names the standard
+ * build uses. The stealth build's package name is a scrambled
+ * <letter>.<letters>.<letters> like "h.sghdt.kihyturd", which
+ * is not known at compile time, so it is passed to the native
+ * side at load time via nativeSetHiddenPackage.
+ *
+ * Without this call, the bridge's filters miss any path that
+ * contains the stealth package name — the marker files, the
+ * module config files, and the manager's own data-dir entries.
  */
 public final class XStealthBridge {
 
@@ -45,6 +59,21 @@ public final class XStealthBridge {
             System.load(path);
             sLoaded = true;
             XposedBridge.log(TAG + ": loaded " + path);
+
+            // Tell the native side which package name to treat as
+            // hidden. Must happen before nativeSetActive(true) is
+            // called, so the first filtered readlink already sees
+            // the correct list.
+            try {
+                String pkg = currentPackageName();
+                if (pkg != null && !pkg.isEmpty()) {
+                    nativeSetHiddenPackage(pkg);
+                    XposedBridge.log(TAG + ": hidden package = " + pkg);
+                }
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + ": nativeSetHiddenPackage threw: " + t);
+            }
+
             try {
                 boolean ok = nativeInit();
                 XposedBridge.log(TAG + ": nativeInit returned " + ok);
@@ -58,6 +87,50 @@ public final class XStealthBridge {
             XposedBridge.log(TAG + ": load failed: " + t.getMessage());
             return false;
         }
+    }
+
+    /**
+     * Resolve the running package name.
+     *
+     * Same logic as XStealthNative.currentPackageName(). In the
+     * shell-side XposedHook process, the manager package name is
+     * passed via the shizuposed.manager.package system property
+     * (see ShizuPosedService.launchAppUnderShizuPosed), so check
+     * that first. In a normal app process, ActivityThread knows it.
+     */
+    private static String currentPackageName() {
+        String fromProp = System.getProperty("shizuposed.manager.package");
+        if (fromProp != null && !fromProp.isEmpty()) return fromProp;
+
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            java.lang.reflect.Method m = at.getMethod("currentPackageName");
+            Object v = m.invoke(null);
+            if (v instanceof String && !((String) v).isEmpty()) {
+                return (String) v;
+            }
+        } catch (Throwable ignored) {}
+
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            java.lang.reflect.Method cur = at.getMethod("currentActivityThread");
+            Object thread = cur.invoke(null);
+            if (thread != null) {
+                java.lang.reflect.Method getApp =
+                    at.getMethod("getApplication");
+                Object app = getApp.invoke(thread);
+                if (app != null) {
+                    java.lang.reflect.Method getPkg =
+                        app.getClass().getMethod("getPackageName");
+                    Object pkg = getPkg.invoke(app);
+                    if (pkg instanceof String && !((String) pkg).isEmpty()) {
+                        return (String) pkg;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        return "com.shizuposed.manager";
     }
 
     public static void setActive(boolean active) {
@@ -93,6 +166,13 @@ public final class XStealthBridge {
     private static native boolean nativeIsActive();
     private static native String  nativeDescribe();
     private static native int     nativeGetCoverage();
-    public static native int nativeGetProcPidReadsBlockedCount();
-    public static native int nativeGetProcEntriesSkippedCount();
+    public  static native int     nativeGetProcPidReadsBlockedCount();
+    public  static native int     nativeGetProcEntriesSkippedCount();
+
+    /**
+     * Tell the native side which package name to treat as hidden.
+     * Called from load() before nativeInit(), so the first filtered
+     * path, readlink, or comm check already sees the correct list.
+     */
+    private static native void    nativeSetHiddenPackage(String packageName);
 }

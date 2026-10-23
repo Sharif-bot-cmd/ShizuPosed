@@ -55,12 +55,24 @@ public final class ForegroundMonitor {
     private static final long QUERY_WINDOW_MS = 60_000L;
 
     /**
-     * How long a watched package must remain out of the
-     * foreground before the exit listener fires. Covers
-     * SplashActivity → MainActivity handoffs, IME pop-ups,
-     * permission dialogs, and Toast interruptions during launch.
+     * Dwell applied to a normal exit (steady-state departure).
      */
-    private static final long EXIT_DWELL_MS = 4000L;
+    private static final long EXIT_DWELL_MS = 4_000L;
+
+    /**
+     * Dwell applied to the first exit after an enter. Covers slow
+     * ACTIVITY_RESUMED handoffs — apps with a long splash screen
+     * (Facebook, Messenger) take 5–8 seconds before the main
+     * activity emits RESUMED, and during that gap the freshness
+     * window expires and the normal exit dwell would fire.
+     */
+    private static final long FIRST_EXIT_DWELL_MS = 10_000L;
+
+    /** Dwell chosen for the current exit; set when the dwell starts. */
+    private long mPendingDwell = EXIT_DWELL_MS;
+
+    /** When mActiveWatched was entered, or 0 if not entered. */
+    private long mEnteredAt = 0L;
 
     /**
      * A resume only counts as "foreground" if it happened within
@@ -175,6 +187,8 @@ public final class ForegroundMonitor {
         mRunning = true;
         mActiveWatched = null;
         mExitPendingSince = 0L;
+        mEnteredAt = 0L;
+        mPendingDwell = EXIT_DWELL_MS;
 
         // Seed the active-watched state from the current
         // foreground package WITHOUT firing enter. If the user is
@@ -217,6 +231,7 @@ public final class ForegroundMonitor {
         String last = mActiveWatched;
         mActiveWatched = null;
         mExitPendingSince = 0L;
+        mEnteredAt = 0L;
         if (last != null && mListener != null) {
             try {
                 Logger.getInstance(mContext).i(
@@ -262,6 +277,7 @@ public final class ForegroundMonitor {
         long now = System.currentTimeMillis();
 
         if (currentIsWatched) {
+            // A watched package is (or may be) in the foreground.
             if (mActiveWatched != null
                     && !mActiveWatched.equals(current)
                     && mExitPendingSince != 0L) {
@@ -271,13 +287,14 @@ public final class ForegroundMonitor {
                     + " -> " + current);
                 mActiveWatched = null;
                 mExitPendingSince = 0L;
+                mEnteredAt = 0L;
                 dispatchExit(previous);
             } else if (mActiveWatched != null
                     && mActiveWatched.equals(current)
                     && mExitPendingSince != 0L) {
                 Logger.getInstance(mContext).i(
                     TAG + ": exit cancelled for " + current
-                    + " (returned within " + EXIT_DWELL_MS + "ms)");
+                    + " (returned within " + mPendingDwell + "ms)");
                 mExitPendingSince = 0L;
             }
 
@@ -304,19 +321,29 @@ public final class ForegroundMonitor {
         }
 
         if (mExitPendingSince == 0L) {
-            mExitPendingSince = now;
+            long now2 = System.currentTimeMillis();
+            long dwell;
+            if (mEnteredAt != 0L
+                    && (now2 - mEnteredAt) < 15_000L) {
+                dwell = FIRST_EXIT_DWELL_MS;
+            } else {
+                dwell = EXIT_DWELL_MS;
+            }
+            mPendingDwell = dwell;
+            mExitPendingSince = now2;
             Logger.getInstance(mContext).i(
                 TAG + ": " + mActiveWatched
                 + " left foreground — starting "
-                + EXIT_DWELL_MS + "ms exit dwell");
+                + dwell + "ms exit dwell");
             return;
         }
 
         long elapsed = now - mExitPendingSince;
-        if (elapsed >= EXIT_DWELL_MS) {
+        if (elapsed >= mPendingDwell) {
             String exiting = mActiveWatched;
             mActiveWatched = null;
             mExitPendingSince = 0L;
+            mEnteredAt = 0L;
             Logger.getInstance(mContext).i(
                 TAG + ": exit confirmed for " + exiting
                 + " after " + elapsed + "ms");
@@ -329,6 +356,7 @@ public final class ForegroundMonitor {
     }
 
     private void dispatchEnter(String pkg) {
+        mEnteredAt = System.currentTimeMillis();
         if (mListener == null) return;
         try {
             Logger.getInstance(mContext).i(

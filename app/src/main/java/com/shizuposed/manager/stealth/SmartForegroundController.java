@@ -2,6 +2,7 @@ package com.shizuposed.manager.stealth;
 
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 
 import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.utils.Logger;
@@ -34,6 +35,24 @@ import java.util.Set;
  * There is one source of truth (XStealthPrefs) and one mirror
  * (xstealth.json). The manager never reads the shell-side mirror;
  * it can't reach that file.
+ *
+ * NO RESTORE
+ * ----------
+ * The previous design saved the prior adb_enabled value on disable
+ * and restored it on exit. That produced a flip-flop bug: if the
+ * monitor mis-detected the exit, the restore ran while the app was
+ * still open, ADB came back on mid-session, and the app's check
+ * saw it.
+ *
+ * The current design does not restore. ADB goes to 0 on enter and
+ * stays there. The user restarts Shizuku when they want ADB back
+ * — starting Shizuku's ADB server is what sets adb_enabled to 1.
+ * The user's own restart is the restore.
+ *
+ * This works transparently with Shizuku-Next's "ADB without
+ * Developer options" switch, because Shizuku stays alive without
+ * ADB in that mode. On upstream Shizuku, the user has to restart
+ * Shizuku manually after each scoped session. That's the cost.
  */
 public final class SmartForegroundController {
 
@@ -78,16 +97,6 @@ public final class SmartForegroundController {
      * Called after the config changes (from the detail sheet or
      * the scope picker). Stops any existing monitor and starts a
      * new one if the config still enables the feature.
-     *
-     * The gate reads from XStealthPrefs — the manager's own
-     * SharedPreferences. XStealthConfig.load() reads a file the
-     * manager cannot access; using it here was a bug.
-     *
-     * Only hideAdb is required. hideDevOptions no longer drives the
-     * foreground state change — see the class doc. If the user has
-     * hideDevOptions on but hideAdb off, the monitor does not start,
-     * because there is nothing for it to do (the service only
-     * writes adb_enabled).
      */
     public synchronized void restartMonitor() {
         if (mMonitor != null) {
@@ -131,6 +140,10 @@ public final class SmartForegroundController {
             public void onForegroundExited(String packageName) {
                 Logger.getInstance(mContext).i(
                     TAG + ": exited " + packageName);
+                // The exit still dispatches an action so the
+                // service can clean up any stale state file left
+                // by an older build. The service does not restore
+                // adb_enabled — see the class doc.
                 sendServiceAction(ShizuPosedService.ACTION_RESTORE_DEV_SETTINGS,
                                   packageName);
             }
@@ -153,70 +166,42 @@ public final class SmartForegroundController {
     }
 
     /**
-     * Issue a recovery restore if a previous process died while a
-     * disable was in effect.
+     * Clear the pending-restore flag from a previous install.
      *
-     * The pending flag is NOT cleared here. It is cleared by
-     * ShizuPosedService.restoreDevSettings() only after both
-     * settings have been written back successfully. Clearing it
-     * before the restore runs means a failure (Shizuku not yet
-     * authorized, service killed mid-restore, watched app still
-     * foreground) drops the retry, leaves smart_fg_state on disk,
-     * and the next service start sees a stale state file. Letting
-     * the service clear the flag keeps the retry alive until the
-     * restore actually succeeds.
-     *
-     * If the service can't reach Shizuku yet, the flag stays set
-     * and the next SmartForegroundController.start() or next
-     * service boot retries. That's the intended behavior — a
-     * failed restore must not be forgotten.
+     * The old design set this flag on disable and cleared it on
+     * restore. The new design never uses it. If an old install
+     * left it set, clear it here so nothing tries to act on it.
      */
     private void recoverIfNeeded() {
         try {
-            android.content.SharedPreferences prefs =
-                mContext.getSharedPreferences(PREFS_NAME,
-                                              Context.MODE_PRIVATE);
-            if (!prefs.getBoolean(KEY_PENDING_RESTORE, false)) return;
-
-            Logger.getInstance(mContext).w(
-                TAG + ": pending restore flag set — issuing restore");
-
-            // Do not clear the flag here. ShizuPosedService's
-            // restoreDevSettings() will call clearPendingRestore()
-            // once the settings are actually written back. If the
-            // restore is deferred (watched app still foreground,
-            // grant not effective, service not ready), the flag
-            // remains set and the retry happens on the next
-            // controller start or service boot.
-            Intent i = new Intent(mContext, ShizuPosedService.class);
-            i.setAction(ShizuPosedService.ACTION_RESTORE_DEV_SETTINGS);
-            i.putExtra(ShizuPosedService.EXTRA_SMART_FG_PACKAGE, "(recovery)");
-            mContext.startService(i);
+            SharedPreferences prefs = mContext.getSharedPreferences(
+                PREFS_NAME, Context.MODE_PRIVATE);
+            if (prefs.getBoolean(KEY_PENDING_RESTORE, false)) {
+                Logger.getInstance(mContext).i(TAG
+                    + ": clearing stale pending-restore flag from "
+                    + "previous install (old restore path is gone)");
+                prefs.edit().putBoolean(KEY_PENDING_RESTORE, false).apply();
+            }
         } catch (Throwable t) {
-            Logger.getInstance(mContext).w(
-                TAG + ": recovery failed: " + t.getMessage());
+            Logger.getInstance(mContext).w(TAG
+                + ": recoverIfNeeded failed: " + t.getMessage());
         }
     }
 
+    /**
+     * Kept as a no-op for API compatibility with callers that
+     * still reference it. The new smart-foreground design does not
+     * use the pending-restore flag.
+     */
     public static void markPendingRestore(Context context) {
-        try {
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                   .edit()
-                   .putBoolean(KEY_PENDING_RESTORE, true)
-                   .apply();
-        } catch (Throwable t) {
-            // non-fatal
-        }
+        // No-op. See class doc.
     }
 
+    /**
+     * Kept as a no-op for API compatibility with callers that
+     * still reference it.
+     */
     public static void clearPendingRestore(Context context) {
-        try {
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                   .edit()
-                   .putBoolean(KEY_PENDING_RESTORE, false)
-                   .apply();
-        } catch (Throwable t) {
-            // non-fatal
-        }
+        // No-op. See class doc.
     }
 }
