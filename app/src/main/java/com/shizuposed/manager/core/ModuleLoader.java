@@ -1158,28 +1158,97 @@ public class ModuleLoader {
         File apk = new File(apkPath);
         if (!apk.exists()) return scope;
 
-        try (ZipFile zip = new ZipFile(apk)) {
-            ZipEntry entry = zip.getEntry("assets/scope.list");
-            if (entry == null) return scope;
+        // Paths to try, in order. Each is treated as a text file
+        // where every non-empty, non-comment line is a package name.
+        String[] textPaths = {
+            "assets/scope.list",                // canonical LSPosed
+            "META-INF/xposed/scope.list",       // some LSPosed variants
+            "assets/scope.txt",                 // older convention
+            "assets/xposed_scope.list",         // fork convention
+            "assets/scope",                     // no extension
+        };
 
-            try (InputStream is = zip.getInputStream(entry);
-                 BufferedReader reader = new BufferedReader(new InputStreamReader(is))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    String trimmed = line.trim();
-                    if (!trimmed.isEmpty() && !trimmed.startsWith("#")) {
-                        scope.add(trimmed);
+        // module.prop path. If present, parse its scope= lines.
+        String modulePropPath = "META-INF/xposed/module.prop";
+
+        try (ZipFile zip = new ZipFile(apk)) {
+            for (String path : textPaths) {
+                ZipEntry entry = zip.getEntry(path);
+                if (entry == null) continue;
+
+                int before = scope.size();
+                try (InputStream is = zip.getInputStream(entry);
+                     BufferedReader reader = new BufferedReader(
+                         new InputStreamReader(is))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        String trimmed = line.trim();
+                        if (trimmed.isEmpty()) continue;
+                        if (trimmed.startsWith("#")) continue;
+                        // Strip inline comments: "com.example.app # note"
+                        int hash = trimmed.indexOf('#');
+                        if (hash > 0) trimmed = trimmed.substring(0, hash).trim();
+                        if (trimmed.isEmpty()) continue;
+                        // Skip obvious non-package lines (a stray
+                        // "package=" or "scope=" prefix that some
+                        // authors put in a plain list file).
+                        if (trimmed.contains("=")) {
+                            int eq = trimmed.indexOf('=');
+                            trimmed = trimmed.substring(eq + 1).trim();
+                        }
+                        if (!trimmed.isEmpty()) scope.add(trimmed);
                     }
+                }
+
+                if (logger != null) {
+                    logger.i("scope.list for " + apk.getName()
+                        + " via " + path + ": "
+                        + (scope.size() - before) + " package(s)");
+                }
+            }
+
+            // module.prop: look for scope= lines. Some modules
+            // list the scope there instead of a separate file.
+            ZipEntry prop = zip.getEntry(modulePropPath);
+            if (prop != null) {
+                int before = scope.size();
+                try (InputStream is = zip.getInputStream(prop);
+                     BufferedReader reader = new BufferedReader(
+                         new InputStreamReader(is))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        String trimmed = line.trim();
+                        if (trimmed.isEmpty()) continue;
+                        if (trimmed.startsWith("#")) continue;
+                        if (!trimmed.startsWith("scope=")) continue;
+
+                        String value = trimmed.substring("scope=".length()).trim();
+                        if (value.isEmpty()) continue;
+
+                        // scope= can be comma-separated or a single
+                        // package. Split on commas and whitespace.
+                        for (String pkg : value.split("[,\\s]+")) {
+                            String p = pkg.trim();
+                            if (!p.isEmpty()) scope.add(p);
+                        }
+                    }
+                }
+
+                if (logger != null) {
+                    logger.i("scope.prop for " + apk.getName()
+                        + " via " + modulePropPath + ": "
+                        + (scope.size() - before) + " package(s)");
                 }
             }
 
             if (logger != null) {
-                logger.i("scope.list for " + apk.getName()
-                    + ": " + scope.size() + " package(s)");
+                logger.i("readRecommendedScope(" + apk.getName()
+                    + "): total " + scope.size() + " package(s)");
             }
         } catch (Throwable t) {
             if (logger != null) {
-                logger.w("readRecommendedScope(" + apkPath + "): " + t.getMessage());
+                logger.w("readRecommendedScope(" + apkPath + "): "
+                    + t.getMessage());
             }
         }
         return scope;
