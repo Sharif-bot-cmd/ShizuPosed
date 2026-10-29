@@ -4,8 +4,10 @@
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:orientation="vertical"
-    android:padding="16dp"
-    android:minHeight="300dp">
+    android:padding="16dp">
+    <!-- ═══ CHANGED: removed android:minHeight="300dp" on root.
+         AlertDialog sizes to wrap_content; the RecyclerView
+         gets its own floor via the FrameLayout below. ═══ -->
 
     <!-- Title -->
     <TextView
@@ -17,60 +19,70 @@
         android:textColor="?attr/colorOnSurface"
         android:layout_marginBottom="12dp" />
 
-    <!-- Quick actions -->
-    <com.google.android.material.chip.ChipGroup
-        android:id="@+id/chipGroupFilters"
+    <!-- ═══ CHANGED: wrap the chip row in a HorizontalScrollView
+         so the last chip ("System") scrolls into view instead
+         of being clipped by the dialog edge. Removed
+         android:gravity="end" — with scrolling, start-alignment
+         is correct because content may exceed the viewport. ═══ -->
+    <HorizontalScrollView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginBottom="8dp"
-        app:singleLine="true"
-        app:singleSelection="false"
-        app:chipSpacingHorizontal="8dp"
-        app:chipSpacingVertical="4dp"
-        android:gravity="end">
+        android:scrollbars="none"
+        android:fillViewport="false">
 
-        <com.google.android.material.chip.Chip
-            android:id="@+id/chipRecommended"
-            style="@style/Widget.Material3.Chip.Assist"
+        <com.google.android.material.chip.ChipGroup
+            android:id="@+id/chipGroupFilters"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Recommended"
-            android:checkable="false"
-            android:clickable="true"
-            android:focusable="true"
-            android:visibility="gone" />
+            app:singleLine="true"
+            app:singleSelection="false"
+            app:chipSpacingHorizontal="8dp"
+            app:chipSpacingVertical="4dp">
 
-        <com.google.android.material.chip.Chip
-            android:id="@+id/chipSelectAll"
-            style="@style/Widget.Material3.Chip.Assist"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="All"
-            android:checkable="false"
-            android:clickable="true"
-            android:focusable="true" />
+            <com.google.android.material.chip.Chip
+                android:id="@+id/chipRecommended"
+                style="@style/Widget.Material3.Chip.Assist"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Recommended"
+                android:checkable="false"
+                android:clickable="true"
+                android:focusable="true"
+                android:visibility="gone" />
 
-        <com.google.android.material.chip.Chip
-            android:id="@+id/chipClearAll"
-            style="@style/Widget.Material3.Chip.Assist"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Clear"
-            android:checkable="false"
-            android:clickable="true"
-            android:focusable="true" />
+            <com.google.android.material.chip.Chip
+                android:id="@+id/chipSelectAll"
+                style="@style/Widget.Material3.Chip.Assist"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="All"
+                android:checkable="false"
+                android:clickable="true"
+                android:focusable="true" />
 
-        <com.google.android.material.chip.Chip
-            android:id="@+id/chipSelectSystem"
-            style="@style/Widget.Material3.Chip.Assist"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="System"
-            android:checkable="false"
-            android:clickable="true"
-            android:focusable="true" />
+            <com.google.android.material.chip.Chip
+                android:id="@+id/chipClearAll"
+                style="@style/Widget.Material3.Chip.Assist"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Clear"
+                android:checkable="false"
+                android:clickable="true"
+                android:focusable="true" />
 
-    </com.google.android.material.chip.ChipGroup>
+            <com.google.android.material.chip.Chip
+                android:id="@+id/chipSelectSystem"
+                style="@style/Widget.Material3.Chip.Assist"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="System"
+                android:checkable="false"
+                android:clickable="true"
+                android:focusable="true" />
+
+        </com.google.android.material.chip.ChipGroup>
+    </HorizontalScrollView>
 
     <!-- Search -->
     <com.google.android.material.textfield.TextInputLayout
@@ -106,12 +118,16 @@
         android:checked="true"
         android:layout_marginBottom="8dp" />
 
-    <!-- App List + Spinner container -->
+    <!-- App List + Spinner container.
+         ═══ CHANGED: minHeight 250dp → 200dp so short-content
+         dialogs don't push the chips row up under the title bar
+         on small screens. Also added an explicit vertical
+         scrollbar style so users know the list scrolls. ═══ -->
     <FrameLayout
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:minHeight="250dp"
+        android:minHeight="200dp"
         android:layout_marginBottom="12dp">
 
         <androidx.recyclerview.widget.RecyclerView
@@ -120,6 +136,8 @@
             android:layout_height="match_parent"
             android:clipToPadding="false"
             android:paddingBottom="8dp"
+            android:scrollbars="vertical"
+            android:scrollbarStyle="insideOverlay"
             android:visibility="gone" />
 
         <ProgressBar

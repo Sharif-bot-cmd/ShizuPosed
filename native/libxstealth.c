@@ -74,7 +74,7 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-#define XSTEALTH_VERSION "0.17.0"
+#define XSTEALTH_VERSION "0.18.0"
 
 #define STUB_TEMPLATE_MAX 64
 #define STUB_TEMPLATE_VERIFIED_MAX 32
@@ -1262,21 +1262,44 @@ static void scrub_buffer_maps(char *buf, ssize_t n) {
             const char *q = p;
             const char *line_end = p + linelen;
             int field = 0;
+            const char *inode_start = NULL;
             const char *path_start = NULL;
+
             while (q < line_end && field < 6) {
                 while (q < line_end && (*q == ' ' || *q == '\t')) q++;
                 if (q >= line_end) break;
-                if (field == 5) {
+
+                if (field == 4) {
+                    inode_start = q;
+                    while (q < line_end && *q != ' ' && *q != '\t' &&
+                           *q != '\n') q++;
+                } else if (field == 5) {
                     const char *r = q;
                     while (r < line_end && (*r == ' ' || *r == '\t')) r++;
                     if (r < line_end && *r == '/') path_start = r;
                     break;
+                } else {
+                    while (q < line_end && *q != ' ' && *q != '\t' &&
+                           *q != '\n') q++;
                 }
-                while (q < line_end && *q != ' ' && *q != '\t' &&
-                       *q != '\n') q++;
                 field++;
             }
 
+            /* Rewrite inode → "0" padded to original width. */
+            if (inode_start != NULL) {
+                const char *ie = inode_start;
+                while (ie < line_end && *ie != ' ' && *ie != '\t' &&
+                       *ie != '\n') ie++;
+                size_t inode_len = (size_t)(ie - inode_start);
+                if (inode_len > 0) {
+                    ((char *) inode_start)[0] = '0';
+                    for (size_t i = 1; i < inode_len; i++) {
+                        ((char *) inode_start)[i] = ' ';
+                    }
+                }
+            }
+
+            /* Rewrite path → "/dev/zero" padded to original width. */
             if (path_start != NULL) {
                 size_t path_len = nl ? (size_t)(nl - path_start)
                                      : (size_t)(line_end - path_start);
@@ -1498,6 +1521,42 @@ static void scrub_ppid_line(char *buf, ssize_t n) {
 
         if (!nl) break;
         p = nl + 1;
+    }
+}
+
+static void scrub_stat_ppid(char *buf, ssize_t n) {
+    if (n <= 0) return;
+
+    /* Find the closing paren of the comm field. */
+    char *close = memchr(buf, ')', (size_t) n);
+    if (close == NULL) return;
+
+    char *p = close + 1;
+    char *end = buf + n;
+
+    /* Fields after the paren: state, ppid, ... Skip "state". */
+    int fields_to_skip = 2;   /* state, then ppid is the next */
+    while (p < end && fields_to_skip > 0) {
+        while (p < end && *p == ' ') p++;
+        if (p >= end) return;
+        while (p < end && *p != ' ') p++;
+        fields_to_skip--;
+    }
+
+    /* p is now at the whitespace before the ppid field. */
+    if (p >= end) return;
+    p++;
+    if (p >= end) return;
+
+    char *ppid_start = p;
+    while (p < end && *p != ' ' && *p != '\n') p++;
+    size_t ppid_len = (size_t)(p - ppid_start);
+    if (ppid_len == 0) return;
+
+    /* Preserve the field's width by padding with spaces. */
+    ppid_start[0] = '1';
+    for (size_t i = 1; i < ppid_len; i++) {
+        ppid_start[i] = ' ';
     }
 }
 
@@ -2006,6 +2065,7 @@ ssize_t read(int fd, void *buf, size_t count) {
             break;
         case SCRUB_STAT:
             scrub_buffer_stat((char *)buf, n);
+            scrub_stat_ppid((char *)buf, n);
             break;
         case SCRUB_NET_UNIX:
             scrub_buffer_net_unix((char *)buf, n);
@@ -2050,6 +2110,39 @@ static bool fd_is_blocked_path(int fd) {
         if (strcmp(target, BLOCKED_PATHS[i]) == 0) return true;
     }
     return false;
+}
+
+/* ─────────────────────────────────────────────────────────────
+ * Cross-library exports
+ *
+ * libsysku.so resolves these to piggy-back on libxstealth's path
+ * classification and activation flag. They are the only public
+ * surface libxstealth exposes to a sibling library; everything
+ * else stays static.
+ *
+ * Added in libxstealth 0.18.0. libsysku.so refuses to activate
+ * its path-filtering arm if these are missing (fail-open).
+ * ───────────────────────────────────────────────────────────── */
+
+__attribute__((visibility("default")))
+int xstealth_path_is_blocked(const char *path) {
+    return is_blocked_path(path) ? 1 : 0;
+}
+
+__attribute__((visibility("default")))
+int xstealth_fd_resolves_to_hidden(int fd) {
+    return fd_is_blocked_path(fd) ? 1 : 0;
+}
+
+__attribute__((visibility("default")))
+int xstealth_is_active(void) {
+    return g_xstealth_active ? 1 : 0;
+}
+
+__attribute__((visibility("default")))
+void xstealth_set_active(int active) {
+    g_xstealth_active = active ? 1 : 0;
+    LOGI("XStealth native: active=%d (set externally)", g_xstealth_active);
 }
 
 __attribute__((overloadable))
@@ -2888,6 +2981,12 @@ Java_com_shizuposed_manager_stealth_XStealthNative_nativeInit(
     return (g_key_symbols_resolved == 5) ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT void JNICALL
+Java_com_shizuposed_manager_stealth_XStealthNative_nativeSetActive(
+        JNIEnv *env, jclass clazz, jboolean active) {
+    (void) env; (void) clazz;
+    xstealth_set_active(active ? 1 : 0);
+}
 
 JNIEXPORT void JNICALL
 Java_com_shizuposed_manager_stealth_XStealthNative_nativeSetTrustedPackage(

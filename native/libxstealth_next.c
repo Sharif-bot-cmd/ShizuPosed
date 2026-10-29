@@ -24,7 +24,7 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-#define NEXT_VERSION "0.17.0"
+#define NEXT_VERSION "0.18.0"
 
 #ifndef XSTEALTH_ENABLE_MMAP_GUARD
 #define XSTEALTH_ENABLE_MMAP_GUARD 1
@@ -202,6 +202,9 @@ int     xstealth_next_fstatat_handler(int dirfd, const char *path,
 int     xstealth_next_getppid_handler(void);
 long    xstealth_next_syscall_handler(long number, ...);
 long    xstealth_next_dispatch_handler(long number, ...);
+
+static __thread char t_cached_comm[64] = {0};
+static __thread int  t_comm_checked = 0;
 
 static bool is_trusted_caller(void);
 
@@ -645,10 +648,6 @@ static int strategy_stub_inline_classified_apply(void) {
     return n;
 }
 
-/* ─────────────────────────────────────────────────────────────
- * STRATEGY 2 — syscall dispatcher patching
- * ───────────────────────────────────────────────────────────── */
-
 static int strategy_syscall_dispatch_apply(void) {
     if (!next_syscall) {
         next_syscall = (void *)dlsym(RTLD_DEFAULT, "syscall");
@@ -658,28 +657,11 @@ static int strategy_syscall_dispatch_apply(void) {
         return 0;
     }
 
-    void *entry = (void *)next_syscall;
-    uint32_t *w = (uint32_t *)entry;
-
-    void *patch_addr = entry;
-    if (is_arm64_bti(w[0])) {
-        patch_addr = (uint8_t *)entry + 4;
-    }
-
-    uint32_t first = *(uint32_t *)patch_addr;
-    if (is_arm64_b(first)) {
-        LOGW("syscall-dispatch: syscall already patched");
+    if (!patch_stub_by_svc(7, (void *)xstealth_next_dispatch_handler,
+                           "syscall-dispatch", ALIASES_syscall)) {
         return 0;
     }
 
-    if (!patch_word_at(7, patch_addr,
-                        (void *)xstealth_next_dispatch_handler,
-                        "syscall-dispatch")) {
-        return 0;
-    }
-
-    LOGI("syscall-dispatch: patched syscall at %p "
-         "(first word was %08x)", entry, first);
     return 1;
 }
 
@@ -1089,40 +1071,49 @@ int xstealth_next_getppid_handler(void) {
     return 1;
 }
 
-/* ─────────────────────────────────────────────────────────────
- * is_trusted_caller — check whether the current thread belongs
- * to the framework.
- *
- * Matches the thread's comm against the built-in prefix list and
- * the runtime prefix set by nativeSetTrustedPackage. The runtime
- * prefix is what makes the stealth build work: its thread names
- * carry the scrambled com.<x>.<y> prefix, not "ShizuPosed".
- * ───────────────────────────────────────────────────────────── */
-
 static bool is_trusted_caller(void) {
-    char comm_path[64];
-    snprintf(comm_path, sizeof(comm_path),
-             "/proc/self/task/%d/comm", (int) syscall(SYS_gettid));
+    if (!t_comm_checked) {
+        t_comm_checked = 1;
 
-    int fd = open(comm_path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return true;
+        char comm_path[64];
+        snprintf(comm_path, sizeof(comm_path),
+                 "/proc/self/task/%d/comm", (int) syscall(SYS_gettid));
 
-    char comm[64] = {0};
-    ssize_t n = read(fd, comm, sizeof(comm) - 1);
-    close(fd);
+        long fd = syscall(SYS_openat, AT_FDCWD, comm_path,
+                          O_RDONLY | O_CLOEXEC, 0);
+        if (fd < 0) {
+            /* Can't read our own comm — treat as trusted so the
+             * framework's own work isn't filtered. */
+            t_cached_comm[0] = '\0';
+            return true;
+        }
 
-    if (n <= 0) return true;
+        ssize_t n = syscall(SYS_read, fd, t_cached_comm,
+                            sizeof(t_cached_comm) - 1);
+        syscall(SYS_close, fd);
 
-    for (ssize_t i = 0; i < n; i++) {
-        if (comm[i] == '\n') { comm[i] = '\0'; break; }
+        if (n <= 0) {
+            t_cached_comm[0] = '\0';
+            return true;
+        }
+        t_cached_comm[n] = '\0';
+
+        for (ssize_t i = 0; i < n; i++) {
+            if (t_cached_comm[i] == '\n') {
+                t_cached_comm[i] = '\0';
+                break;
+            }
+        }
     }
 
+    if (t_cached_comm[0] == '\0') return true;
+
     for (int i = 0; TRUSTED_PREFIXES[i]; i++) {
-        if (strstr(comm, TRUSTED_PREFIXES[i]) != NULL) return true;
+        if (strstr(t_cached_comm, TRUSTED_PREFIXES[i]) != NULL) return true;
     }
 
     if (g_runtime_trusted_prefix[0] != '\0'
-            && strstr(comm, g_runtime_trusted_prefix) != NULL) {
+            && strstr(t_cached_comm, g_runtime_trusted_prefix) != NULL) {
         return true;
     }
 
@@ -1416,10 +1407,17 @@ long xstealth_next_syscall_handler(long number, ...) {
             break;
         }
 
-        default:
+        default: {
+            long x0 = va_arg(ap, long);
+            long x1 = va_arg(ap, long);
+            long x2 = va_arg(ap, long);
+            long x3 = va_arg(ap, long);
+            long x4 = va_arg(ap, long);
+            long x5 = va_arg(ap, long);
             va_end(ap);
-            ret = next_syscall(number, 0, 0, 0, 0, 0, 0);
+            ret = next_syscall(number, x0, x1, x2, x3, x4, x5);
             break;
+        }
     }
 
     return ret;
@@ -1553,10 +1551,17 @@ long xstealth_next_dispatch_handler(long number, ...) {
             ret = handle_getppid();
             break;
         }
-        default:
+        default: {
+            long x0 = va_arg(ap, long);
+            long x1 = va_arg(ap, long);
+            long x2 = va_arg(ap, long);
+            long x3 = va_arg(ap, long);
+            long x4 = va_arg(ap, long);
+            long x5 = va_arg(ap, long);
             va_end(ap);
-            ret = next_syscall(number, 0, 0, 0, 0, 0, 0);
+            ret = next_syscall(number, x0, x1, x2, x3, x4, x5);
             break;
+        }
     }
     return ret;
 }

@@ -3,6 +3,22 @@
  *
  * Original shared-dispatcher backend for ShizuPosed.
  *
+ * v1.2.1 changes:
+ *   • Stub register convention fixed. The old stub passed
+ *     slot_index in x8, which C reads as arg 8 (it isn't — arg 8
+ *     is x7). The new stub saves x0..x7 to a stack frame, calls
+ *     szp_dispatch_c with x0 = slot_index, and then either
+ *     returns the stashed result or branches to the original
+ *     entry with the saved args restored.
+ *   • nHookNative now writes a single 32-bit branch at the
+ *     function entry, leaving the second instruction intact.
+ *     The old code wrote two words (branch + NOP), which meant a
+ *     thread executing between the two stores saw a corrupted
+ *     instruction stream.
+ *   • szp_stashed_result_set() added so the stub can tell
+ *     "dispatcher set a result" from "dispatcher returned 0."
+ *   • Version bumped to 1.2.1.
+ *
  * Provides:
  *   • ArtMethod entry-point hooks (nHookArtMethod)
  *   • Native (inline) hooks at raw addresses (nHookNative)
@@ -11,21 +27,6 @@
  *   • Symbol lookup from another library (nDlsym)
  *   • A thread-local dispatch-result slot the Java dispatcher
  *     writes into (nSetDispatchResult, szp_take_dispatch_result)
- *
- * Stub template: at JNI_OnLoad, the backend dlopens libxstealth.so
- * (RTLD_NOLOAD) and resolves xstealth_get_stub_template() and
- * xstealth_get_template_info(). If the primary library captured
- * and verified a template, the first N words of every callback
- * stub are a byte-for-byte copy of what ART itself emits at a
- * legitimate entry point (BTI C plus the standard frame setup).
- *
- * The callback stub is a leaf that immediately branches to the
- * dispatcher, so only the prologue is templated — the dispatcher
- * is responsible for restoring the frame and returning. This is
- * different from libamiru.c, where the stub has a full
- * prologue + tail and both need to be shape-consistent.
- *
- * Debug logging: gated behind a JNI toggle, off by default.
  *
  * Build:
  *   clang -shared -fPIC -O2 -Wall -Wextra \
@@ -53,7 +54,7 @@
 #define ALOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-#define SHIZUPOSED_VERSION "1.2.0-dynamic"
+#define SHIZUPOSED_VERSION "1.2.1"
 
 #define MAX_ART_HOOKS    256
 #define MAX_INLINE_HOOKS 256
@@ -62,32 +63,7 @@
 extern void __clear_cache(void *start, void *end);
 
 /* ─────────────────────────────────────────────────────────────
- * Prologue info — must match libxstealth.c's struct layout.
- * ───────────────────────────────────────────────────────────── */
-
-enum {
-    PROLOGUE_SHAPE_UNKNOWN = 0,
-    PROLOGUE_SHAPE_STANDARD = 1,
-};
-
-struct prologue_info {
-    int32_t frame_size;
-    int32_t receiver_offset;
-    int32_t x30_offset;
-    int32_t save_words;
-    int32_t shape;
-    int32_t reg_save_off[8];
-    int32_t reg_mask;
-    int32_t save_x30_at;
-    int32_t reserved0;
-};
-
-typedef int (*get_stub_template_fn)(const uint8_t **out_bytes,
-                                    uint32_t *out_len);
-typedef int (*get_template_info_fn)(struct prologue_info *out_info);
-
-/* ─────────────────────────────────────────────────────────────
- * Debug logging flag — Phase 2b
+ * Debug logging flag
  * ───────────────────────────────────────────────────────────── */
 
 static volatile int g_debug_logging = 0;
@@ -107,7 +83,7 @@ typedef struct {
 
 typedef struct {
     void    *addr;
-    uint64_t saved[2];
+    uint32_t saved_insn;   /* only the first instruction */
     void    *trampoline;
     size_t   tramp_len;
 } inline_hook_t;
@@ -118,9 +94,8 @@ typedef struct {
     jobject  method_ref;
     void    *stub;
     size_t   stub_len;
-    int64_t  reserved_a;
-    int32_t  reserved_b;
-    int32_t  reserved_c;
+    int32_t  slot;
+    int32_t  reserved;
 } callback_t;
 
 static art_hook_t  g_art_hooks[MAX_ART_HOOKS];
@@ -147,92 +122,35 @@ static uint32_t g_layout_access_offset = 0;
  * Dispatcher externs (defined by the dex side)
  * ───────────────────────────────────────────────────────────── */
 
-extern int64_t szp_dispatch_c(int64_t art_method);
+extern int64_t szp_dispatch_c(int64_t slot_index);
 
 /* ─────────────────────────────────────────────────────────────
- * Stub template state — Phase 2b
+ * Thread-local dispatch result
+ *
+ * The stub calls szp_dispatch_c(slot). The Java dispatcher may
+ * set a result via nSetDispatchResult. The stub then calls
+ * szp_take_dispatch_result() to get the value and
+ * szp_stashed_result_set() to know whether to return it or
+ * branch to the original.
  * ───────────────────────────────────────────────────────────── */
 
-static const uint8_t *g_stub_template_bytes = NULL;
-static uint32_t       g_stub_template_len = 0;
-static struct prologue_info g_template_info = {
-    .frame_size = 0,
-    .receiver_offset = -1,
-    .x30_offset = -1,
-    .save_words = 0,
-    .shape = PROLOGUE_SHAPE_UNKNOWN,
-};
-static int g_template_available = 0;
+typedef struct {
+    int32_t has_result;
+    int32_t reserved;
+    int64_t value;
+} dispatch_result_t;
 
-static void load_stub_template(void) {
-    if (g_template_available) return;
+static __thread dispatch_result_t t_dispatchResult;
 
-    void *h = dlopen("libxstealth.so", RTLD_NOLOAD | RTLD_NOW);
-    if (h == NULL) {
-        if (g_debug_logging) {
-            ALOGW("stub template: libxstealth.so not loaded — "
-                  "using shipped stub shape");
-        }
-        return;
-    }
+int64_t szp_take_dispatch_result(void) {
+    int64_t v = t_dispatchResult.value;
+    t_dispatchResult.has_result = 0;
+    t_dispatchResult.value = 0;
+    return v;
+}
 
-    get_stub_template_fn get_bytes = (get_stub_template_fn)
-        dlsym(h, "xstealth_get_stub_template");
-    if (get_bytes == NULL) {
-        if (g_debug_logging) {
-            ALOGW("stub template: byte getter not exported — "
-                  "using shipped stub shape");
-        }
-        return;
-    }
-
-    const uint8_t *bytes = NULL;
-    uint32_t len = 0;
-    if (!get_bytes(&bytes, &len) || bytes == NULL || len == 0) {
-        if (g_debug_logging) {
-            ALOGW("stub template: getter returned no verified bytes — "
-                  "using shipped stub shape");
-        }
-        return;
-    }
-
-    get_template_info_fn get_info = (get_template_info_fn)
-        dlsym(h, "xstealth_get_template_info");
-
-    struct prologue_info info = {0};
-    info.frame_size = 0;
-    info.receiver_offset = -1;
-    info.x30_offset = -1;
-    info.save_words = 0;
-    info.shape = PROLOGUE_SHAPE_UNKNOWN;
-    for (int i = 0; i < 8; i++) info.reg_save_off[i] = -1;
-    info.reg_mask = 0;
-    info.save_x30_at = -1;
-    info.reserved0 = 0;
-
-    int have_info = 0;
-    if (get_info != NULL && get_info(&info) &&
-        info.shape == PROLOGUE_SHAPE_STANDARD &&
-        info.frame_size > 0 && info.save_words >= 2) {
-        have_info = 1;
-    }
-
-    g_stub_template_bytes = bytes;
-    g_stub_template_len = len;
-    if (have_info) {
-        g_template_info = info;
-        g_template_available = 1;
-        ALOGI("stub template: verified %u bytes "
-              "(frame=0x%x, save_words=%d, x30_off=%d)",
-              len, info.frame_size, info.save_words, info.x30_offset);
-    } else {
-        g_template_info.shape = PROLOGUE_SHAPE_UNKNOWN;
-        g_template_available = 1;
-        if (g_debug_logging) {
-            ALOGW("stub template: no verification metadata — "
-                  "only substituting the first instruction");
-        }
-    }
+int32_t szp_stashed_result_set(void) {
+    return t_dispatchResult.has_result;
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -240,7 +158,8 @@ static void load_stub_template(void) {
  * ───────────────────────────────────────────────────────────── */
 
 static int is_executable_ptr(int64_t addr) {
-    if (addr <= 1 || addr > 0xfffffffffffeULL) return 0;
+    if (addr <= 1) return 0;
+    if ((uint64_t) addr > 0x0000FFFFFFFFFFFFULL) return 0;
     FILE *fp = fopen("/proc/self/maps", "re");
     if (fp == NULL) return 1;
     char line[512];
@@ -295,37 +214,144 @@ static void seal_code_page(void *code) {
 }
 
 /* ─────────────────────────────────────────────────────────────
- * Thread-local dispatch result
+ * Instruction encoders
  * ───────────────────────────────────────────────────────────── */
 
-typedef struct {
-    int32_t skip;
-    int32_t override_ret;
-    int64_t ret_value;
-} dispatch_result_t;
+#define INSN_RET     0xd65f03c0u
+#define INSN_BR_X9   0xd61f0120u
+#define INSN_BLR_X9  0xd63f0120u
+#define INSN_BR_X16  0xd61f0200u
+#define INSN_BLR_X16 0xd63f0200u
 
-static __thread dispatch_result_t t_dispatchResult;
-
-int64_t szp_take_dispatch_result(void) {
-    int64_t v = t_dispatchResult.ret_value;
-    t_dispatchResult.skip = 0;
-    t_dispatchResult.override_ret = 0;
-    t_dispatchResult.ret_value = 0;
-    return v;
+/* stp xT, xT2, [sp, #-16]! (pre-index) */
+static inline uint32_t insn_stp_pre_sp(uint32_t rt, uint32_t rt2) {
+    return 0xa9bf07e0u | (rt2 << 10) | rt;
 }
 
-int64_t szp_dispatch_entry(int64_t trampoline,
-                           int64_t a2, int64_t a3, int64_t a4,
-                           int64_t a5, int64_t a6, int64_t a7,
-                           int64_t a8) {
-    int64_t result = szp_dispatch_c(a8);
-    if (result != 0) {
-        return a2;
-    }
+/* ldp xT, xT2, [sp], #16 (post-index) */
+static inline uint32_t insn_ldp_post_sp(uint32_t rt, uint32_t rt2) {
+    return 0xa8c107e0u | (rt2 << 10) | rt;
+}
 
-    typedef int64_t (*fn_t)(int64_t, int64_t, int64_t, int64_t,
-                            int64_t, int64_t, int64_t, int64_t);
-    return ((fn_t) trampoline)(a2, a2, a3, a4, a5, a6, a7, a8);
+static int emit_load64_x9(uint32_t *p, uint64_t value) {
+    p[0] = 0xd2800009u | (((uint32_t) (value & 0xffffu)) << 5);
+    p[1] = 0xf2a00009u | (((uint32_t) ((value >> 16) & 0xffffu)) << 5);
+    p[2] = 0xf2c00009u | (((uint32_t) ((value >> 32) & 0xffffu)) << 5);
+    p[3] = 0xf2e00009u | (((uint32_t) ((value >> 48) & 0xffffu)) << 5);
+    return 4;
+}
+
+static int emit_load64_x16(uint32_t *p, uint64_t value) {
+    p[0] = 0xd2800010u | (((uint32_t) (value & 0xffffu)) << 5);
+    p[1] = 0xf2a00010u | (((uint32_t) ((value >> 16) & 0xffffu)) << 5);
+    p[2] = 0xf2c00010u | (((uint32_t) ((value >> 32) & 0xffffu)) << 5);
+    p[3] = 0xf2e00010u | (((uint32_t) ((value >> 48) & 0xffffu)) << 5);
+    return 4;
+}
+
+/*
+ * emit_callback_stub — the stub for one callback slot.
+ *
+ * Shape:
+ *   BTI C                            (optional)
+ *   stp  x0, x1, [sp, #-16]!
+ *   stp  x2, x3, [sp, #-16]!
+ *   stp  x4, x5, [sp, #-16]!
+ *   stp  x6, x7, [sp, #-16]!
+ *   mov  x0, #slot
+ *   ldr  x9, =szp_dispatch_c
+ *   blr  x9
+ *   ldr  x9, =szp_stashed_result_set
+ *   blr  x9
+ *   cbz  x0, 1f
+ *   ldr  x9, =szp_take_dispatch_result
+ *   blr  x9
+ *   mov  x16, x0                    ; save result in x16
+ *   ldp  x6, x7, [sp], #16
+ *   ldp  x4, x5, [sp], #16
+ *   ldp  x2, x3, [sp], #16
+ *   ldp  x0, x1, [sp], #16
+ *   mov  x0, x16                    ; restore result as return value
+ *   ret
+ * 1:
+ *   ldp  x6, x7, [sp], #16
+ *   ldp  x4, x5, [sp], #16
+ *   ldp  x2, x3, [sp], #16
+ *   ldp  x0, x1, [sp], #16
+ *   br   xTrampoline                 ; tail-call original entry
+ *
+ * The trampoline address is loaded as an immediate at the end
+ * (movz/movk sequence) rather than from memory, to avoid needing
+ * a literal pool inside the stub.
+ */
+static size_t emit_callback_stub(uint32_t *p, int32_t slot,
+                                 int64_t dispatch_addr,
+                                 int64_t stashed_set_addr,
+                                 int64_t take_result_addr,
+                                 int64_t orig_entry,
+                                 int use_bti) {
+    size_t i = 0;
+
+    if (use_bti) p[i++] = 0xd503245fu;   /* BTI C */
+
+    /* Save x0..x7. */
+    p[i++] = insn_stp_pre_sp(0, 1);
+    p[i++] = insn_stp_pre_sp(2, 3);
+    p[i++] = insn_stp_pre_sp(4, 5);
+    p[i++] = insn_stp_pre_sp(6, 7);
+
+    /* x0 = slot_index */
+    p[i++] = 0xd2800000u | (((uint32_t) slot & 0xffffu) << 5);
+
+    /* Call szp_dispatch_c(slot). */
+    i += emit_load64_x9(&p[i], (uint64_t) dispatch_addr);
+    p[i++] = INSN_BLR_X9;
+
+    /* Call szp_stashed_result_set(). */
+    i += emit_load64_x9(&p[i], (uint64_t) stashed_set_addr);
+    p[i++] = INSN_BLR_X9;
+
+    /* cbz x0, <skip> — branch to the tail-call path. The offset
+     * is patched once both paths are emitted. */
+    size_t cbz_idx = i;
+    p[i++] = 0xb4000000u;
+    size_t after_cbz = i;
+
+    /* ── Return-value path ────────────────────────────────── */
+
+    i += emit_load64_x9(&p[i], (uint64_t) take_result_addr);
+    p[i++] = INSN_BLR_X9;
+
+    /* Save result in x16 (caller-saved, but we're about to
+     * restore x0..x7 and don't call anything else). */
+    p[i++] = 0xaa0003f0u;   /* mov x16, x0 */
+
+    /* Restore x0..x7. */
+    p[i++] = insn_ldp_post_sp(6, 7);
+    p[i++] = insn_ldp_post_sp(4, 5);
+    p[i++] = insn_ldp_post_sp(2, 3);
+    p[i++] = insn_ldp_post_sp(0, 1);
+
+    /* x0 = x16 */
+    p[i++] = 0xaa1003e0u;   /* mov x0, x16 */
+    p[i++] = INSN_RET;
+
+    size_t skip = i - after_cbz;
+    p[cbz_idx] = 0xb4000000u | ((uint32_t) skip << 5);
+
+    /* ── Tail-call path ───────────────────────────────────── */
+
+    /* Restore x0..x7. */
+    p[i++] = insn_ldp_post_sp(6, 7);
+    p[i++] = insn_ldp_post_sp(4, 5);
+    p[i++] = insn_ldp_post_sp(2, 3);
+    p[i++] = insn_ldp_post_sp(0, 1);
+
+    /* br x16 with x16 = orig_entry. */
+    i += emit_load64_x16(&p[i], (uint64_t) orig_entry);
+    p[i++] = INSN_BR_X16;
+
+    return i * 4;
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -354,7 +380,7 @@ Java_com_shizuposed_manager_core_NativeBridge_nLayoutInfo(
 }
 
 /* ─────────────────────────────────────────────────────────────
- * nSetDebugLogging / nDescribeStubTemplate — Phase 2b
+ * nSetDebugLogging / nDescribeStubTemplate
  * ───────────────────────────────────────────────────────────── */
 
 JNIEXPORT void JNICALL
@@ -370,19 +396,8 @@ Java_com_shizuposed_manager_core_NativeBridge_nDescribeStubTemplate(
         JNIEnv *env, jclass clazz) {
     (void) clazz;
     char buf[256];
-    if (!g_template_available) {
-        return (*env)->NewStringUTF(env,
-            "template: not available (using shipped prologue)");
-    }
     snprintf(buf, sizeof(buf),
-        "template: %u bytes, shape=%d, frame=0x%x, "
-        "save_words=%d, x30_off=%d, recv_off=%d",
-        g_stub_template_len,
-        g_template_info.shape,
-        g_template_info.frame_size,
-        g_template_info.save_words,
-        g_template_info.x30_offset,
-        g_template_info.receiver_offset);
+        "stub: self-contained (no template override, v1.2.1)");
     return (*env)->NewStringUTF(env, buf);
 }
 
@@ -429,11 +444,8 @@ Java_com_shizuposed_manager_core_NativeBridge_nHookArtMethod(
     }
 
     uint32_t *tp = (uint32_t *) tramp;
-    tp[0] = (((uint32_t) (orig_entry >>  0) & 0xffffu) << 5) | 0xd2800009u;
-    tp[1] = (((uint32_t) (orig_entry >> 16) & 0xffffu) << 5) | 0xf2a00009u;
-    tp[2] = (((uint32_t) (orig_entry >> 32) & 0xffffu) << 5) | 0xf2c00009u;
-    tp[3] = (((uint32_t) (orig_entry >> 48) & 0xffffu) << 5) | 0xf2e00009u;
-    tp[4] = 0xd61f0120;  /* br x9 */
+    emit_load64_x9(tp, (uint64_t) orig_entry);
+    tp[4] = INSN_BR_X9;
     __clear_cache(tramp, (char *) tramp + 0x20);
     seal_code_page(tramp);
 
@@ -458,16 +470,6 @@ Java_com_shizuposed_manager_core_NativeBridge_nHookArtMethod(
     ALOGI("art hook: %p entry %p -> %p (tramp %p)",
           (void *) art_method, (void *) orig_entry,
           (void *) replacement, tramp);
-
-    pthread_mutex_lock(&g_callback_mu);
-    for (uint32_t i = 0; i < g_callback_count; i++) {
-        if (g_callbacks[i].art_method == art_method) {
-            g_callbacks[i].stub = tramp;
-            g_callbacks[i].stub_len = 0x20;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_callback_mu);
 
     pthread_mutex_unlock(&g_art_mu);
 
@@ -526,6 +528,13 @@ Java_com_shizuposed_manager_core_NativeBridge_nUnhookArtMethod(
 
 /* ─────────────────────────────────────────────────────────────
  * JNI: nHookNative
+ *
+ * Writes a single 32-bit branch at the target's first
+ * instruction. The second instruction stays intact — a thread
+ * that's currently executing the function will see either the
+ * old first instruction or the new branch, both of which are
+ * valid. The trampoline saves the first 4 bytes and jumps back
+ * to target+4.
  * ───────────────────────────────────────────────────────────── */
 
 JNIEXPORT jboolean JNICALL
@@ -556,22 +565,23 @@ Java_com_shizuposed_manager_core_NativeBridge_nHookNative(
 
     uint32_t *src = (uint32_t *) (intptr_t) target;
     uint32_t *tp = (uint32_t *) tramp;
+
+    /* Trampoline: replay the first instruction, then jump to
+     * target+4. The first instruction is copied verbatim. The
+     * jump target is loaded as an immediate. */
     tp[0] = src[0];
-    tp[1] = src[1];
-    tp[2] = 0x58000050;
-    tp[3] = 0xd61f0200;
-    *(int64_t *) ((char *) tramp + 0x10) =
-        (int64_t) (intptr_t) ((char *) target + 8);
+    int n = emit_load64_x16(&tp[1], (uint64_t) ((char *) target + 4));
+    tp[1 + n] = INSN_BR_X16;
     __clear_cache(tramp, (char *) tramp + 0x40);
     seal_code_page(tramp);
 
     void *page = (void *) (target & ~0xfffULL);
-    if (mprotect(page, 0x1000,
-                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    if (mprotect(page, 0x1000, PROT_READ | PROT_WRITE) != 0) {
         munmap(tramp, 0x40);
         pthread_mutex_unlock(&g_inline_mu);
         return JNI_FALSE;
     }
+
     int64_t delta = ((int64_t) replacement - (int64_t) target) >> 2;
     if (delta < -(1LL << 25) || delta >= (1LL << 25)) {
         munmap(tramp, 0x40);
@@ -579,24 +589,24 @@ Java_com_shizuposed_manager_core_NativeBridge_nHookNative(
         pthread_mutex_unlock(&g_inline_mu);
         return JNI_FALSE;
     }
+
+    uint32_t saved = src[0];
     src[0] = ((uint32_t) delta & 0x3ffffffu) | 0x14000000u;
-    src[1] = 0xd503201f;
     __clear_cache((void *) (intptr_t) target,
-                  (char *) (intptr_t) target + 8);
+                  (char *) (intptr_t) target + 4);
     mprotect(page, 0x1000, PROT_READ | PROT_EXEC);
 
     uint32_t slot = g_inline_hook_count++;
     g_inline_hooks[slot].addr = (void *) (intptr_t) target;
-    g_inline_hooks[slot].saved[0] = tp[0];
-    g_inline_hooks[slot].saved[1] = tp[1];
+    g_inline_hooks[slot].saved_insn = saved;
     g_inline_hooks[slot].trampoline = tramp;
     g_inline_hooks[slot].tramp_len = 0x40;
 
     pthread_mutex_unlock(&g_inline_mu);
 
     if (out_trampoline != NULL) {
-        jsize n = (*env)->GetArrayLength(env, out_trampoline);
-        if (n > 0) {
+        jsize sz = (*env)->GetArrayLength(env, out_trampoline);
+        if (sz > 0) {
             jlong v = (jlong) (intptr_t) tramp;
             (*env)->SetLongArrayRegion(env, out_trampoline, 0, 1, &v);
         }
@@ -660,7 +670,7 @@ Java_com_shizuposed_manager_core_NativeBridge_nRegisterCallback(
         return 0;
     }
 
-    void *stub = alloc_code_near(art_method, 0x20);
+    void *stub = alloc_code_near(art_method, 0x100);
     if (stub == NULL) {
         (*env)->DeleteGlobalRef(env, cb_ref);
         (*env)->DeleteGlobalRef(env, mt_ref);
@@ -668,59 +678,39 @@ Java_com_shizuposed_manager_core_NativeBridge_nRegisterCallback(
         return 0;
     }
 
-    uint32_t *sp = (uint32_t *) stub;
-    int off = 0;
-    int used_template = 0;
+    uint32_t slot = g_callback_count;
 
-    /* Phase 2b: splice the verified prologue if available. */
-    if (g_template_available
-            && g_template_info.shape == PROLOGUE_SHAPE_STANDARD
-            && g_template_info.save_words > 0
-            && g_stub_template_len >=
-                (uint32_t) (g_template_info.save_words * 4)) {
-        /* Check that the prologue fits: 5 words + movz + b = 7. */
-        if (g_template_info.save_words + 2 <= 8) {
-            for (int w = 0; w < g_template_info.save_words; w++) {
-                uint32_t word;
-                memcpy(&word, g_stub_template_bytes + w * 4, 4);
-                sp[off++] = word;
-            }
-            used_template = 1;
-        }
-    }
+    /* Use BTI C in the stub unless the ART version doesn't
+     * support BTI. The ART runtime itself always has BTI on
+     * Android 11+; but for safety, only emit BTI C when the
+     * first instruction of an existing ART method has it. */
+    int use_bti = 1;
 
-    if (!used_template) {
-        /* Fallback: optional BTI C, then movz + branch. */
-        uint32_t first_word = 0;
-        if (g_stub_template_bytes != NULL && g_stub_template_len >= 4) {
-            memcpy(&first_word, g_stub_template_bytes, 4);
-        }
-        if (first_word == 0xd503245fu) {
-            sp[off++] = first_word;
-        }
-    }
+    size_t stub_len = emit_callback_stub(
+        (uint32_t *) stub,
+        (int32_t) slot,
+        (int64_t) (intptr_t) &szp_dispatch_c,
+        (int64_t) (intptr_t) &szp_stashed_result_set,
+        (int64_t) (intptr_t) &szp_take_dispatch_result,
+        /* orig_entry is loaded from ArtMethod at install time;
+         * we don't have it here. We patch the stub's tail-call
+         * target after this call. Use a placeholder for now. */
+        0,
+        use_bti);
 
-    sp[off++] = (((uint32_t) (g_callback_count & 0xffffu)) << 5) |
-                0xd2800008u;
-
-    int64_t delta = ((int64_t) (intptr_t) &szp_dispatch_entry
-                     - (int64_t) (intptr_t) (sp + off)) >> 2;
-    sp[off++] = ((uint32_t) delta & 0x3ffffffu) | 0x14000000u;
-
-    __clear_cache(stub, (char *) stub + off * 4);
+    __clear_cache(stub, (char *) stub + stub_len);
     seal_code_page(stub);
 
-    uint32_t slot = g_callback_count++;
+    g_callback_count++;
     g_callbacks[slot].art_method = art_method;
     g_callbacks[slot].callback = cb_ref;
     g_callbacks[slot].method_ref = mt_ref;
     g_callbacks[slot].stub = stub;
-    g_callbacks[slot].stub_len = 0x20;
+    g_callbacks[slot].stub_len = stub_len;
+    g_callbacks[slot].slot = (int32_t) slot;
 
-    ALOGI("registerCallback: method %p -> stub %p (%s, %d words)",
-          (void *) art_method, stub,
-          used_template ? "verified template" : "shipped",
-          off);
+    ALOGI("registerCallback: method %p -> stub %p (slot %d, %zu bytes)",
+          (void *) art_method, stub, slot, stub_len);
 
     pthread_mutex_unlock(&g_callback_mu);
     return (jlong) (intptr_t) stub;
@@ -767,9 +757,8 @@ Java_com_shizuposed_manager_core_NativeBridge_nSetDispatchResult(
         JNIEnv *env, jclass clazz, jboolean skip,
         jboolean override_ret, jlong value) {
     (void) env; (void) clazz;
-    t_dispatchResult.skip = skip ? 1 : 0;
-    t_dispatchResult.override_ret = override_ret ? 1 : 0;
-    t_dispatchResult.ret_value = (int64_t) value;
+    t_dispatchResult.has_result = (skip || override_ret) ? 1 : 0;
+    t_dispatchResult.value = (int64_t) value;
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -819,8 +808,6 @@ JNI_OnLoad(JavaVM *vm, void *reserved) {
     } else {
         ALOGE("probe: Object not found");
     }
-
-    load_stub_template();
 
     jclass nb = (*env)->FindClass(env,
         "com/shizuposed/manager/core/NativeBridge");

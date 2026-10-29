@@ -9,8 +9,8 @@
 
   "developer_message": "Built for people who can't root or won't. If a module doesn't work, check the compatibility notes on XDA before reporting it as broken — many modules need system_server or zygote coverage, and that's a structural limit, not a bug.",
 
-  "version_name": "1.2.6",
-  "version_code": 5430,
+  "version_name": "1.2.9",
+  "version_code": 5520,
   "min_sdk": 29,
   "target_sdk": 37,
   "license": "Apache-2.0",
