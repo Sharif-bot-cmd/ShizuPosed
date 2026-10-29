@@ -71,8 +71,8 @@ public final class XposedBridge {
     // HOOK INSTALLATION
     // ═════════════════════════════════════════════════════════════
 
-    public static IXUnhook<XC_MethodHook> hookMethod(Method method,
-                                                     XC_MethodHook callback) {
+    public static XC_MethodHook.Unhook hookMethod(Method method,
+                                                   XC_MethodHook callback) {
         if (method == null || callback == null) return null;
 
         try {
@@ -101,8 +101,8 @@ public final class XposedBridge {
             backendName, reverse);
     }
 
-    public static IXUnhook<XC_MethodHook> hookConstructor(Constructor<?> ctor,
-                                                         XC_MethodHook callback) {
+    public static XC_MethodHook.Unhook hookConstructor(Constructor<?> ctor,
+                                                       XC_MethodHook callback) {
         if (ctor == null || callback == null) return null;
 
         try {

@@ -43,6 +43,18 @@ public final class PineBackend implements HookDispatcher.Backend {
             try {
                 CompatLog.d(TAG, "Detected " + AndroidCompat.describe()
                         + ", preRelease=" + AndroidCompat.IS_PRE_RELEASE);
+                top.canyie.pine.PineConfig.libLoader = new top.canyie.pine.Pine.LibLoader() {
+                    @Override
+                    public void loadLib() {
+                        String libDir = System.getProperty("shizuposed.shell.libs", "/data/user/0/com.android.shell/files/.syscall_cache/libs");
+                        java.io.File so = new java.io.File(libDir, "libpine.so");
+                        if (so.exists()) {
+                            System.load(so.getAbsolutePath());
+                        } else {
+                            System.loadLibrary("pine");
+                        }
+                    }
+                };
                 Pine.ensureInitialized();
                 available = Pine.isInitialized();
                 CompatLog.d(TAG, "Pine availability: " + available);

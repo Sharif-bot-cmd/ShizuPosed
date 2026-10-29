@@ -2434,14 +2434,13 @@ private boolean isSyskuGateLive(String base) {
             String spawnPrefix = buildSpawnPrefix();
 
             String inner =
-                "unset CLASSPATH; "
+                "export CLASSPATH=" + dexPath + "; "
                 + "( "
                 +   (spawnPrefix.isEmpty() ? "" : spawnPrefix + " ")
                 +   binary + " "
                 +   "-Xverify:none "
                 +   "-Xhidden-api-policy:enabled "
                 +   "-Xcore-platform-api-policy:enabled "
-                +   "-Djava.class.path=" + dexPath + " "
                 +   "-Dshizuposed.shell.base=" + base + " "
                 +   "-Dshizuposed.shell.libs=" + libsDir + " "
                 +   "-Dshizuposed.hook.delay=" + hookDelayMs + " "

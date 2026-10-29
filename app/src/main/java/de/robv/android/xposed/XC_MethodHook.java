@@ -21,17 +21,30 @@ public abstract class XC_MethodHook {
     // UNHOOK HANDLE (API 94+)
     // ═════════════════════════════════════════════════════════════
 
-    public static class Unhook {
+    public static class Unhook implements IXUnhook<XC_MethodHook> {
         private final Member hookedMember;
+        private final XC_MethodHook callback;
 
         public Unhook(Member hookedMember) {
-            this.hookedMember = hookedMember;
+            this(hookedMember, null);
         }
 
+        public Unhook(Member hookedMember, XC_MethodHook callback) {
+            this.hookedMember = hookedMember;
+            this.callback = callback;
+        }
+
+        @Override
         public Member getHookedMethod() {
             return hookedMember;
         }
 
+        @Override
+        public XC_MethodHook getCallback() {
+            return callback;
+        }
+
+        @Override
         public void unhook() {
             if (hookedMember == null) return;
             try {

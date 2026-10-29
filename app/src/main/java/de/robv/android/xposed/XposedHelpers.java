@@ -154,7 +154,7 @@ public final class XposedHelpers {
     // HOOK INSTALLATION
     // ═════════════════════════════════════════════════════════════
 
-    public static IXUnhook<XC_MethodHook> findAndHookMethod(
+    public static XC_MethodHook.Unhook findAndHookMethod(
             Class<?> clazz, String methodName,
             Object... parameterTypesAndCallback) {
         try {
@@ -172,7 +172,7 @@ public final class XposedHelpers {
         }
     }
 
-    public static IXUnhook<XC_MethodHook> findAndHookMethod(
+    public static XC_MethodHook.Unhook findAndHookMethod(
             String className, ClassLoader cl, String methodName,
             Object... parameterTypesAndCallback) {
         try {
@@ -184,17 +184,29 @@ public final class XposedHelpers {
         }
     }
 
-    public static IXUnhook<XC_MethodHook> findAndHookConstructor(
+    public static XC_MethodHook.Unhook findAndHookConstructor(
             Class<?> clazz, Object... parameterTypesAndCallback) {
-        return com.shizuposed.manager.core.XposedHelpersImpl
+        IXUnhook<XC_MethodHook> h = com.shizuposed.manager.core.XposedHelpersImpl
             .findAndHookConstructor(clazz, null, parameterTypesAndCallback);
+        if (h instanceof XC_MethodHook.Unhook) {
+            return (XC_MethodHook.Unhook) h;
+        } else if (h != null) {
+            return new XC_MethodHook.Unhook(h.getHookedMethod(), h.getCallback());
+        }
+        return null;
     }
 
-    public static IXUnhook<XC_MethodHook> findAndHookConstructor(
+    public static XC_MethodHook.Unhook findAndHookConstructor(
             String className, ClassLoader cl,
             Object... parameterTypesAndCallback) {
-        return com.shizuposed.manager.core.XposedHelpersImpl
+        IXUnhook<XC_MethodHook> h = com.shizuposed.manager.core.XposedHelpersImpl
             .findAndHookConstructor(className, cl, parameterTypesAndCallback);
+        if (h instanceof XC_MethodHook.Unhook) {
+            return (XC_MethodHook.Unhook) h;
+        } else if (h != null) {
+            return new XC_MethodHook.Unhook(h.getHookedMethod(), h.getCallback());
+        }
+        return null;
     }
 
     public static Set<XC_MethodHook.Unhook> hookAllMethods(

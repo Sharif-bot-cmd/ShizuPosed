@@ -14,7 +14,7 @@ import java.lang.reflect.Member;
  * unconditionally.
  */
 public final class XposedBridgeUnhook<T extends XC_MethodHook>
-        implements IXUnhook<T> {
+        extends XC_MethodHook.Unhook {
 
     private static final String TAG = "Xposed";
 
@@ -36,6 +36,7 @@ public final class XposedBridgeUnhook<T extends XC_MethodHook>
                               Member hookedMember,
                               String backendName,
                               Runnable reverseAction) {
+        super(hookedMember, callback);
         this.callback = callback;
         this.hookedMember = hookedMember;
         this.backendName = backendName != null ? backendName : "unknown";
