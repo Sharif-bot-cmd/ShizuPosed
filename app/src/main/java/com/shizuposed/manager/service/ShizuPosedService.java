@@ -2434,7 +2434,7 @@ private boolean isSyskuGateLive(String base) {
             String spawnPrefix = buildSpawnPrefix();
 
             String inner =
-                "unset CLASSPATH; unset BOOTCLASSPATH; "
+                "unset CLASSPATH; "
                 + "( "
                 +   (spawnPrefix.isEmpty() ? "" : spawnPrefix + " ")
                 +   binary + " "
@@ -2449,6 +2449,7 @@ private boolean isSyskuGateLive(String base) {
                 +       getStatusAuthority() + " "
                 +   "-Dshizuposed.manager.package="
                 +       getPackageName() + " "
+                +   "/system/bin "
                 +   "com.shizuposed.manager.core.XposedHook "
                 +   packageName + " 0 " + targetUid
                 +   " </dev/null >>" + logPath + " 2>&1 "

@@ -97,6 +97,7 @@ public class XposedHook {
         String name;
         String xposedInit;
         String cachedDexPath;
+        String apkPath;
         boolean enabled;
         Set<String> hookedApps = new HashSet<>();
         boolean hookAllApps;
@@ -238,16 +239,20 @@ public class XposedHook {
         String libDir = System.getProperty("shizuposed.shell.libs", LIBS_DIR);
         log("Preloading XStealth native engines from: " + libDir);
 
-        try {
-            boolean ok = com.shizuposed.manager.stealth.XStealthNative.load(libDir);
-            if (ok) {
-                com.shizuposed.manager.stealth.XStealthNative.setActive(true);
-                log("Preloaded libxstealth.so");
-            } else {
-                log("libxstealth.so preload returned false");
+        if (Build.VERSION.SDK_INT >= 35) {
+            log("Skipping libxstealth.so preload on Android 15+ to prevent dlsym linker recursion");
+        } else {
+            try {
+                boolean ok = com.shizuposed.manager.stealth.XStealthNative.load(libDir);
+                if (ok) {
+                    com.shizuposed.manager.stealth.XStealthNative.setActive(true);
+                    log("Preloaded libxstealth.so");
+                } else {
+                    log("libxstealth.so preload returned false");
+                }
+            } catch (Throwable t) {
+                log("libxstealth.so preload failed: " + t.getMessage());
             }
-        } catch (Throwable t) {
-            log("libxstealth.so preload failed: " + t.getMessage());
         }
 
         try {
@@ -597,6 +602,60 @@ public class XposedHook {
 
     private static Object obtainActivityThread(Class<?> at) {
         try {
+            Class<?> looperClass = Class.forName("android.os.Looper");
+            if (looperClass.getMethod("myLooper").invoke(null) == null) {
+                try {
+                    Method prep = looperClass.getDeclaredMethod("prepareMainLooper");
+                    HiddenApiBypass.forceAccessible(prep);
+                    prep.invoke(null);
+                } catch (Throwable ignored) {
+                    try {
+                        Method prep = looperClass.getDeclaredMethod("prepare");
+                        HiddenApiBypass.forceAccessible(prep);
+                        prep.invoke(null);
+                    } catch (Throwable ignored2) {}
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        try {
+            Constructor<?> ctor = at.getDeclaredConstructor();
+            HiddenApiBypass.forceAccessible(ctor);
+            Object t = ctor.newInstance();
+            log("ActivityThread via constructor");
+
+            try {
+                Class<?> ccClass = Class.forName("android.app.ConfigurationController");
+                Constructor<?> ccCtor = null;
+                for (Constructor<?> c : ccClass.getDeclaredConstructors()) {
+                    if (c.getParameterCount() == 1) {
+                        ccCtor = c;
+                        break;
+                    }
+                }
+                if (ccCtor != null) {
+                    HiddenApiBypass.forceAccessible(ccCtor);
+                    Object cc = ccCtor.newInstance(t);
+                    setFieldByShape(t, cc, "mConfigurationController", "configurationController");
+                    log("Attached ConfigurationController to ActivityThread");
+                }
+            } catch (Throwable t2) {
+                log("ConfigurationController setup failed: " + t2);
+            }
+
+            try {
+                setFieldByShape(t, new android.os.Bundle(), "mCoreSettings", "coreSettings");
+                log("Initialized ActivityThread.mCoreSettings");
+            } catch (Throwable t2) {
+                log("mCoreSettings setup failed: " + t2);
+            }
+
+            return t;
+        } catch (Throwable t) {
+            log("ActivityThread constructor threw: " + t + (t.getCause() != null ? " cause=" + t.getCause() : ""));
+        }
+
+        try {
             Method systemMain = findMethodByShape(at, "systemMain");
             if (systemMain != null) {
                 Object t = systemMain.invoke(null);
@@ -606,7 +665,7 @@ public class XposedHook {
                 }
             }
         } catch (Throwable t) {
-            log("systemMain threw: " + t.getMessage());
+            log("systemMain threw: " + t + (t.getCause() != null ? " cause=" + t.getCause() : ""));
         }
 
         try {
@@ -619,17 +678,7 @@ public class XposedHook {
                 }
             }
         } catch (Throwable t) {
-            log("currentActivityThread threw: " + t.getMessage());
-        }
-
-        try {
-            Constructor<?> ctor = at.getDeclaredConstructor();
-            HiddenApiBypass.forceAccessible(ctor);
-            Object t = ctor.newInstance();
-            log("ActivityThread via constructor");
-            return t;
-        } catch (Throwable t) {
-            log("ActivityThread constructor threw: " + t.getMessage());
+            log("currentActivityThread threw: " + t + (t.getCause() != null ? " cause=" + t.getCause() : ""));
         }
 
         return null;
@@ -854,13 +903,94 @@ public class XposedHook {
     private static Object buildAppBindData(Class<?> dataClass,
                                             ApplicationInfo appInfo,
                                             String pkg) throws Throwable {
-        Object data = dataClass.getDeclaredConstructor().newInstance();
+        Constructor<?> ctor = dataClass.getDeclaredConstructor();
+        HiddenApiBypass.forceAccessible(ctor);
+        Object data = ctor.newInstance();
 
         setFieldByShape(data, appInfo, "appInfo", "info");
         setFieldByShape(data, pkg, "processName", "procName", "process");
         setFieldByShape(data, null, "providers");
         setFieldByShape(data, 0, "debugMode", "debug");
         setFieldByShape(data, 0, "mDebugMode");
+
+        try {
+            long[] emptyChanges = new long[0];
+            setFieldByShape(data, emptyChanges, "disabledCompatChanges", "mDisabledCompatChanges");
+            setFieldByShape(data, emptyChanges, "loggableCompatChanges", "mLoggableCompatChanges");
+        } catch (Throwable ignored) {}
+
+        try {
+            setFieldByShape(data, new android.os.Bundle(), "instrumentationArgs", "mInstrumentationArgs");
+        } catch (Throwable ignored) {}
+
+        try {
+            android.content.res.Configuration config = new android.content.res.Configuration();
+            config.setToDefaults();
+            java.util.Locale defaultLocale = java.util.Locale.getDefault();
+            if (defaultLocale == null) defaultLocale = java.util.Locale.US;
+            config.setLocales(new android.os.LocaleList(defaultLocale));
+            setFieldByShape(data, config, "config", "mConfig");
+        } catch (Throwable ignored) {}
+
+        try {
+            Class<?> tf = Class.forName("android.graphics.Typeface");
+            Class<?> sf = Class.forName("android.graphics.fonts.SystemFonts");
+
+            Object fontConfig = null;
+            try {
+                Method getLegacyConfig = findMethodByShape(sf, "getSystemPreinstalledFontConfigFromLegacyXml");
+                if (getLegacyConfig != null) {
+                    HiddenApiBypass.forceAccessible(getLegacyConfig);
+                    fontConfig = getLegacyConfig.invoke(null);
+                }
+            } catch (Throwable t) {
+                log("getSystemPreinstalledFontConfigFromLegacyXml failed: " + t.getMessage());
+            }
+
+            if (fontConfig == null) {
+                try {
+                    Method getPreConfig = findMethodByShape(sf, "getSystemPreinstalledFontConfig");
+                    if (getPreConfig != null) {
+                        HiddenApiBypass.forceAccessible(getPreConfig);
+                        fontConfig = getPreConfig.invoke(null);
+                    }
+                } catch (Throwable t) {
+                    log("getSystemPreinstalledFontConfig failed: " + t.getMessage());
+                }
+            }
+
+            if (fontConfig != null) {
+                Method buildFallback = findMethodByShape(sf, "buildSystemFallback", fontConfig);
+                if (buildFallback != null) {
+                    HiddenApiBypass.forceAccessible(buildFallback);
+                    Object fallbackMap = buildFallback.invoke(null, fontConfig);
+                    Method buildTypefaces = findMethodByShape(sf, "buildSystemTypefaces", fontConfig, fallbackMap);
+                    if (buildTypefaces != null) {
+                        HiddenApiBypass.forceAccessible(buildTypefaces);
+                        Object typefaceMap = buildTypefaces.invoke(null, fontConfig, fallbackMap);
+                        if (typefaceMap instanceof java.util.Map) {
+                            Method setMap = findMethodByShape(tf, "setSystemFontMap", typefaceMap);
+                            if (setMap != null) {
+                                HiddenApiBypass.forceAccessible(setMap);
+                                setMap.invoke(null, typefaceMap);
+                                log("Initialized Typeface.sSystemFontMap from system fonts");
+                            }
+                            Method serializeMap = findMethodByShape(tf, "serializeFontMap", typefaceMap);
+                            if (serializeMap != null) {
+                                HiddenApiBypass.forceAccessible(serializeMap);
+                                Object shm = serializeMap.invoke(null, typefaceMap);
+                                if (shm != null) {
+                                    setFieldByShape(data, shm, "mSerializedSystemFontMap", "serializedSystemFontMap");
+                                    log("Populated AppBindData.mSerializedSystemFontMap");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            log("Font map pre-initialization failed: " + t.getMessage());
+        }
 
         try {
             Class<?> compatInfoClass = Class.forName(
@@ -968,14 +1098,67 @@ public class XposedHook {
             Method getPM = at.getMethod("getPackageManager");
             Object pm = getPM.invoke(null);
 
-            Method getApplicationInfo = pm.getClass().getMethod(
-                "getApplicationInfo", String.class, int.class);
-            Object info = getApplicationInfo.invoke(pm, pkg, 0);
-            return (ApplicationInfo) info;
+            // 1. Android 13+ (API 33-35): getApplicationInfo(String, long, int)
+            try {
+                Method getAppInfoModern = pm.getClass().getMethod(
+                    "getApplicationInfo", String.class, long.class, int.class);
+                int userId = (targetUid > 0) ? (targetUid / 100000) : 0;
+                Object info = getAppInfoModern.invoke(pm, pkg, 0L, userId);
+                if (info instanceof ApplicationInfo) {
+                    return (ApplicationInfo) info;
+                }
+            } catch (NoSuchMethodException ignored) {}
+
+            // 2. Legacy: getApplicationInfo(String, int)
+            try {
+                Method getApplicationInfo = pm.getClass().getMethod(
+                    "getApplicationInfo", String.class, int.class);
+                Object info = getApplicationInfo.invoke(pm, pkg, 0);
+                if (info instanceof ApplicationInfo) {
+                    return (ApplicationInfo) info;
+                }
+            } catch (NoSuchMethodException ignored) {}
+
+            // 3. Fallback: reflectively find any getApplicationInfo method
+            for (Method m : pm.getClass().getMethods()) {
+                if ("getApplicationInfo".equals(m.getName())) {
+                    Class<?>[] pTypes = m.getParameterTypes();
+                    if (pTypes.length == 3 && pTypes[0] == String.class) {
+                        int userId = (targetUid > 0) ? (targetUid / 100000) : 0;
+                        Object res = m.invoke(pm, pkg, 0L, userId);
+                        if (res instanceof ApplicationInfo) return (ApplicationInfo) res;
+                    } else if (pTypes.length == 2 && pTypes[0] == String.class) {
+                        Object res = m.invoke(pm, pkg, 0);
+                        if (res instanceof ApplicationInfo) return (ApplicationInfo) res;
+                    }
+                }
+            }
         } catch (Throwable t) {
-            log("resolveApplicationInfo failed: " + t.getMessage());
-            return null;
+            log("resolveApplicationInfo IPC failed: " + t.getMessage());
         }
+
+        // 4. Fallback: construct ApplicationInfo from package path if IPC fails
+        try {
+            java.lang.Process proc = Runtime.getRuntime().exec(new String[]{"pm", "path", pkg});
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
+                String line = reader.readLine();
+                if (line != null && line.startsWith("package:")) {
+                    String baseApk = line.substring("package:".length()).trim();
+                    ApplicationInfo ai = new ApplicationInfo();
+                    ai.packageName = pkg;
+                    ai.sourceDir = baseApk;
+                    ai.publicSourceDir = baseApk;
+                    ai.dataDir = "/data/user/0/" + pkg;
+                    ai.uid = (targetUid > 0) ? targetUid : 10000;
+                    log("resolveApplicationInfo synthesized from pm path: " + baseApk);
+                    return ai;
+                }
+            }
+        } catch (Throwable t) {
+            log("resolveApplicationInfo pm path fallback failed: " + t.getMessage());
+        }
+
+        return null;
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -1387,11 +1570,33 @@ public class XposedHook {
                     new File(optDir).mkdirs();
                 }
 
+                ClassLoader hookLoader = XposedHook.class.getClassLoader();
+                ClassLoader combinedParent = new ClassLoader(appLoader) {
+                    @Override
+                    public Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+                        if (name.startsWith("de.robv.android.xposed.") || name.startsWith("com.shizuposed.")) {
+                            try {
+                                if (hookLoader != null) {
+                                    return hookLoader.loadClass(name);
+                                }
+                            } catch (ClassNotFoundException ignored) {}
+                        }
+                        try {
+                            return super.loadClass(name, resolve);
+                        } catch (ClassNotFoundException e) {
+                            if (hookLoader != null) {
+                                return hookLoader.loadClass(name);
+                            }
+                            throw e;
+                        }
+                    }
+                };
+
                 DexClassLoader loader = new DexClassLoader(
                     info.cachedDexPath,
                     optDir,
                     null,
-                    appLoader);
+                    combinedParent);
 
                 if (entry == null || entry.isEmpty()) {
                     entry = readXposedInitFromZip(info.cachedDexPath);
@@ -1430,6 +1635,19 @@ public class XposedHook {
 
             boolean handled = false;
 
+            if (instance instanceof de.robv.android.xposed.IXposedHookZygoteInit) {
+                try {
+                    log("Calling initZygote on " + instance.getClass().getName());
+                    de.robv.android.xposed.IXposedHookZygoteInit.StartupParam sp =
+                        new de.robv.android.xposed.IXposedHookZygoteInit.StartupParam();
+                    sp.modulePath = info.apkPath;
+                    sp.startsSystemServer = false;
+                    ((de.robv.android.xposed.IXposedHookZygoteInit) instance).initZygote(sp);
+                } catch (Throwable t) {
+                    log("initZygote failed for " + info.packageName + ": " + t);
+                }
+            }
+
             if (com.shizuposed.manager.core.libxposed.LibXposedDriver
                     .isLibXposedModule(moduleClass)) {
                 log("Module " + info.packageName + " is a libxposed module "
@@ -1454,6 +1672,10 @@ public class XposedHook {
                     handled = true;
                     break;
                 }
+            }
+
+            if (param != null) {
+                param.classLoader = appLoader;
             }
 
             if (handled) {
@@ -1825,6 +2047,7 @@ public class XposedHook {
             i.name           = o.optString("name", null);
             i.xposedInit     = o.optString("xposedInit", null);
             i.cachedDexPath  = o.optString("cachedDexPath", null);
+            i.apkPath        = o.optString("apkPath", null);
             i.enabled        = o.optBoolean("enabled", false);
             i.hookAllApps    = o.optBoolean("hookAllApps", false);
             i.hookSystemApps = o.optBoolean("hookSystemApps", false);
