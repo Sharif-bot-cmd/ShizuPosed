@@ -30,7 +30,7 @@ import java.util.Set;
  */
 public final class XposedBridge {
 
-    public static final int XPOSED_BRIDGE_VERSION = 100;
+    public static final int XPOSED_BRIDGE_VERSION = 101;
 
     private static final String LOG_TAG = "Xposed";
     private static final String FRAMEWORK_TAG = "ShizuPosed";
