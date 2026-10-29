@@ -46,8 +46,8 @@ android {
         applicationId "com.shizuposed.manager"
         minSdk 29
         targetSdk 37
-        versionCode 5430
-        versionName "1.2.6"
+        versionCode 5500
+        versionName "1.2.8"
 
         ndk {
             abiFilters 'arm64-v8a'
@@ -159,7 +159,8 @@ android {
                 '**/libcallsite.so',
                 '**/libxstealth.so',
                 '**/libxstealth_next.so',
-                '**/libxstealth_bridge.so'
+                '**/libxstealth_bridge.so',
+                '**/libsysku.so'
             ]
         }
     }
@@ -288,8 +289,9 @@ def extractZipEntries = { File archive, File destDir, Closure<Boolean> selector 
 // libxstealth.so          optional — XStealthNative reports unavailable.
 // libxstealth_next.so     optional — XStealthNativeNext reports unavailable.
 // libxstealth_bridge.so   optional — XStealthBridge reports unavailable.
+// libsysku.so             optional — SyskuNative reports unavailable.
 //
-// Skip all six with: -PskipNativeCheck=true
+// Skip all seven with: -PskipNativeCheck=true
 // ═══════════════════════════════════════════════════════════════════════════
 
 def skipNativeCheck = project.hasProperty('skipNativeCheck')
@@ -497,6 +499,67 @@ tasks.register('checkXStealthBridge') {
     }
 }
 
+// ─── Sysku ────────────────────────────────────────────────────────────────
+//
+// libsysku.so is optional. It complements libxstealth.so by
+// interposing syscall() and getdents64(), the two paths the named
+// libc interposers can't reach. Without it, the framework still runs
+// — SyskuController.getState() reports "Not installed" and the
+// Settings tab's Sysku row is informational only.
+//
+// It requires libxstealth.so (v0.18.0+) at runtime because it reads
+// the xstealth_path_is_blocked / xstealth_fd_resolves_to_hidden /
+// xstealth_is_active exports. If libxstealth.so is missing, libsysku
+// loads but stays inert, and nativeInit() returns 0 — fail-open.
+
+tasks.register('checkSysku') {
+    description = 'Verify libsysku.so is present for arm64-v8a (optional)'
+    group = 'verification'
+
+    def so = new File(jniLibsDir, 'libsysku.so')
+
+    doLast {
+        if (skipNativeCheck) {
+            println "checkSysku: skipped via -PskipNativeCheck=true"
+            return
+        }
+        if (!so.exists()) {
+            logger.warn(
+                "libsysku.so not found at ${so.absolutePath}\n" +
+                "  Sysku will be unavailable. The Settings tab's Sysku row\n" +
+                "  will report 'Not installed'. All other backends are\n" +
+                "  unaffected. To build it:\n" +
+                "    clang -shared -fPIC -O2 -Wall -Wextra \\\n" +
+                "        --target=aarch64-linux-android29 \\\n" +
+                "        -o app/src/main/jniLibs/arm64-v8a/libsysku.so \\\n" +
+                "        native/libsysku.c -llog -ldl\n" +
+                "  This is a warning, not an error — the build will proceed.")
+            return
+        }
+        def len = so.length()
+        if (len < 1024) {
+            logger.warn(
+                "libsysku.so at ${so.absolutePath} is only ${len} bytes — " +
+                "probably a failed or empty build. Sysku will be unavailable.")
+            return
+        }
+        // Sysku depends on libxstealth.so's exports. Warn if
+        // libxstealth isn't present, because libsysku will load
+        // but stay inert without it — a confusing state to debug.
+        def xstealth = new File(jniLibsDir, 'libxstealth.so')
+        if (!xstealth.exists()) {
+            logger.warn(
+                "libsysku.so is present but libxstealth.so is not. " +
+                "libsysku will load but stay inert — it depends on " +
+                "xstealth_path_is_blocked / xstealth_fd_resolves_to_hidden / " +
+                "xstealth_is_active from libxstealth.so (v0.18.0+). " +
+                "Build libxstealth.so or accept that Sysku's interposers " +
+                "will pass everything through.")
+        }
+        println "checkSysku: OK — ${len} bytes at ${so.absolutePath}"
+    }
+}
+
 tasks.matching { it.name == 'mergeDebugJniLibFolders' ||
                  it.name == 'mergeReleaseJniLibFolders' ||
                  it.name.startsWith('mergeStealth') ||
@@ -507,6 +570,7 @@ tasks.matching { it.name == 'mergeDebugJniLibFolders' ||
     dependsOn 'checkXStealth'
     dependsOn 'checkXStealthNext'
     dependsOn 'checkXStealthBridge'
+    dependsOn 'checkSysku'
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -558,7 +622,6 @@ def makeDexCandidatePlatformDirs = [
     makeDexCompileSdkMinor > 0
         ? "android-${makeDexCompileSdkVersion}.${makeDexCompileSdkMinor}" : null,
     "android-${makeDexCompileSdkVersion}",
-    "android-37.0.1",
     "android-37.0",
     "android-36",
     "android-35",
@@ -684,6 +747,7 @@ tasks.register('makeDex') {
             def p = f.absolutePath
             if (p.contains('/core/')
                     || p.contains('/de/robv/android/xposed/')
+                    || p.contains('/io/github/libxposed/')
                     || p.contains('/stealth/')) {
                 wanted << p
             }
