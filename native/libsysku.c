@@ -1,25 +1,26 @@
 /*
  * libsysku.c — Syscall-level interposer for ShizuPosed's XStealth.
  *
- * v1.2.0 changes:
+ * v1.3.0 changes:
+ *   • SYS_getppid, SYS_prctl, SYS_mincore added to the filter.
+ *   • Thread-local t_internal_call bypass lets libsysku read
+ *     /proc/self/maps for its own hidden-region cache without
+ *     being refused by either its own syscall() interposer or
+ *     libxstealth.so's open() interposer.
+ *   • Hidden-region cache (parsed from /proc/self/maps, refreshed
+ *     on mtime change) backs the mincore() refusal.
+ *
+ * v1.2.0 changes (carried forward):
+ *   • SYS_ptrace, SYS_process_vm_readv, SYS_perf_event_open,
+ *     SYS_kcmp, SYS_pidfd_open added to the filter.
  *   • C11 atomics (<stdatomic.h>) replace __sync_fetch_and_add.
- *   • New filtered syscalls:
- *       SYS_ptrace            — closes the "call ptrace() via raw
- *                               syscall to bypass libxstealth.so's
- *                               symbol interposer" gap.
- *       SYS_process_vm_readv  — refuse reads of our own pid from
- *                               another process.
- *       SYS_perf_event_open   — refuse counter attaches to our pid.
- *       SYS_kcmp              — refuse comparisons against our pid.
- *       SYS_pidfd_open        — refuse pidfds for our pid.
  *   • Per-syscall counters visible via nativeDescribe().
- *   • Comments tightened; no functional regression vs 1.1.0.
  *
  * WHAT THIS IS
  * ------------
- * A companion to libxstealth.so that closes two classes of detection
- * path the named libc interposers can't reach: direct syscall()
- * calls, and directory enumeration via getdents64().
+ * A companion to libxstealth.so that closes two classes of
+ * detection path the named libc interposers can't reach: direct
+ * syscall() calls, and directory enumeration via getdents64().
  *
  * MODES
  * -----
@@ -28,17 +29,9 @@
  *   FALLBACK  — module not running. syscall() only. getdents64
  *               passes through unchanged.
  *
- * FALLBACK RATIONALE
- * ------------------
- * Hiding a directory entry is a more visible tell than returning
- * ENOENT for a path that shouldn't exist. Without the ADB module
- * coordinating the hidden-path list and version, libsysku filters
- * the safe half and leaves the risky half alone.
- *
  * NO ROOT NEEDED
  * --------------
- * All userspace PLT interposition. No seccomp, no ptrace, no bpf,
- * no kernel module.
+ * All userspace PLT interposition.
  *
  * BUILD (Termux, single command):
  *
@@ -59,13 +52,16 @@
 #include <jni.h>
 #include <stdatomic.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #define LOG_TAG "libsysku"
@@ -73,14 +69,10 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-#define LIBSYSKU_VERSION "1.2.0"
+#define LIBSYSKU_VERSION "1.3.0"
 
 /* ────────────────────────────────────────────────────────────────
  * STATE
- *
- * C11 atomics. The ints are relaxed ordering because the counters
- * are purely diagnostic — no happens-before relationship between
- * them and any other state.
  * ──────────────────────────────────────────────────────────────── */
 
 static atomic_int g_installed        = 0;
@@ -89,13 +81,10 @@ static atomic_int g_calls_blocked    = 0;
 static atomic_int g_dents_seen       = 0;
 static atomic_int g_dents_dropped    = 0;
 
-/* Set by nativeInit based on moduleRunning. See MODES above. */
+/* Set by nativeInit based on moduleRunning. */
 static atomic_int g_fallback_mode    = 0;
 
-/* Per-syscall counters. Indexed by a small enum below. Reset
- * implicitly (static storage zeros). Used only by nativeDescribe().
- * The mapping is stable — a new entry requires bumping the enum
- * size. */
+/* Per-syscall counters. */
 enum {
     SYSK_OPENAT = 0,
     SYSK_OPENAT2,
@@ -109,6 +98,9 @@ enum {
     SYSK_PERF_EVENT_OPEN,
     SYSK_KCMP,
     SYSK_PIDFD_OPEN,
+    SYSK_GETPPID,
+    SYSK_PRCTL,
+    SYSK_MINCORE,
     SYSK_LAST
 };
 
@@ -119,8 +111,22 @@ static const char *kSyscallNames[SYSK_LAST] = {
     "openat", "openat2", "newfstatat", "statx",
     "faccessat", "faccessat2", "readlinkat",
     "ptrace", "process_vm_readv", "perf_event_open",
-    "kcmp", "pidfd_open"
+    "kcmp", "pidfd_open",
+    "getppid", "prctl", "mincore"
 };
+
+/*
+ * Thread-local "this is libsysku's own internal call" flag.
+ *
+ * When set, the syscall() interposer passes through without
+ * filtering. Used by libsysku's own reads of /proc/self/maps
+ * (which would otherwise be refused by the /proc/self/maps path
+ * filter, since it's a hidden path).
+ *
+ * Thread-local because other threads in the target process must
+ * not inherit the bypass.
+ */
+static __thread int t_internal_call = 0;
 
 /* ────────────────────────────────────────────────────────────────
  * RESOLVED SYMBOLS
@@ -201,15 +207,145 @@ static int xstealth_active(void) {
 }
 
 /* ────────────────────────────────────────────────────────────────
- * syscall() INTERPOSER
+ * HIDDEN-REGION CACHE
  *
- * Two filter classes:
- *   • path-takers  — resolve path, call xstealth_path_is_blocked()
- *   • pid-takers   — compare pid arg against our own pid
+ * Parsed lazily from /proc/self/maps. Used by the mincore()
+ * filter to refuse residency probes on regions that contain the
+ * framework's own .so files.
  *
- * The pid-takers are new in 1.2.0. They close the "call the raw
- * syscall to bypass the symbol interposer" paths that
- * libxstealth.so's ptrace interposer doesn't reach.
+ * Reads go through raw syscalls (SYS_openat / SYS_read / SYS_close)
+ * with t_internal_call set, so neither libsysku's own syscall()
+ * interposer nor libxstealth.so's open() interposer refuses them.
+ *
+ * Refreshed when /proc/self/maps's mtime changes. mmap and munmap
+ * bump that mtime, so a new .so load triggers a refresh on the
+ * next mincore() call.
+ * ──────────────────────────────────────────────────────────────── */
+
+#define MAX_HIDDEN_REGIONS 32
+
+struct hidden_region {
+    uintptr_t start;
+    uintptr_t end;
+};
+
+static struct hidden_region g_hidden_regions[MAX_HIDDEN_REGIONS];
+static int g_hidden_region_count = 0;
+static time_t g_hidden_maps_mtime = 0;
+
+/*
+ * Read /proc/self/maps into buf via raw syscalls, bypassing
+ * both interposers. Returns the byte count, or -1.
+ *
+ * The buffer must be large enough for the whole file. 64 KiB is
+ * enough for typical Android processes (a few hundred mappings
+ * at ~120 bytes each). A process with thousands of mappings
+ * would truncate; the cache would then miss some regions, which
+ * only means a mincore() on a missed region passes through.
+ */
+static ssize_t read_maps_internal(char *buf, size_t cap) {
+    t_internal_call = 1;
+
+    long fd = real_syscall(SYS_openat, AT_FDCWD, "/proc/self/maps",
+                           O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0) { t_internal_call = 0; return -1; }
+
+    size_t off = 0;
+    while (off + 1 < cap) {
+        long r = real_syscall(SYS_read, fd, buf + off, cap - 1 - off);
+        if (r <= 0) break;
+        off += (size_t) r;
+    }
+    real_syscall(SYS_close, fd);
+    buf[off] = '\0';
+
+    t_internal_call = 0;
+    return (ssize_t) off;
+}
+
+static int fstat_maps_internal(struct stat *out) {
+    t_internal_call = 1;
+#ifdef SYS_newfstatat
+    long r = real_syscall(SYS_newfstatat, AT_FDCWD, "/proc/self/maps",
+                          out, 0);
+#elif defined(SYS_fstatat)
+    long r = real_syscall(SYS_fstatat, AT_FDCWD, "/proc/self/maps",
+                          out, 0);
+#else
+    long r = -1;
+#endif
+    t_internal_call = 0;
+    return r == 0 ? 0 : -1;
+}
+
+static void refresh_hidden_regions(void) {
+    struct stat st;
+    if (fstat_maps_internal(&st) != 0) return;
+
+    if (st.st_mtime == g_hidden_maps_mtime && g_hidden_region_count > 0) {
+        return;
+    }
+
+    static char maps_buf[65536];
+    ssize_t n = read_maps_internal(maps_buf, sizeof(maps_buf));
+    if (n <= 0) return;
+
+    g_hidden_region_count = 0;
+
+    static const char *patterns[] = {
+        "libshizuposed", "libxstealth", "libsysku",
+        "libamiru", "libcallsite", "libxstealth_next",
+        "libxstealth_bridge", "syscall_cache", "shizuposed",
+        NULL
+    };
+
+    char *p = maps_buf;
+    char *end = maps_buf + n;
+    while (p < end && g_hidden_region_count < MAX_HIDDEN_REGIONS) {
+        char *nl = memchr(p, '\n', end - p);
+        size_t linelen = nl ? (size_t)(nl - p) + 1 : (size_t)(end - p);
+
+        unsigned long lo = 0, hi = 0;
+        char perms[8] = {0};
+        if (sscanf(p, "%lx-%lx %7s", &lo, &hi, perms) == 3) {
+            bool hidden = false;
+            for (int i = 0; patterns[i]; i++) {
+                if (memmem(p, linelen, patterns[i], strlen(patterns[i]))) {
+                    hidden = true;
+                    break;
+                }
+            }
+            if (hidden) {
+                g_hidden_regions[g_hidden_region_count].start = (uintptr_t) lo;
+                g_hidden_regions[g_hidden_region_count].end   = (uintptr_t) hi;
+                g_hidden_region_count++;
+            }
+        }
+
+        if (!nl) break;
+        p = nl + 1;
+    }
+
+    g_hidden_maps_mtime = st.st_mtime;
+}
+
+static int is_range_in_hidden_region(void *addr, size_t length) {
+    if (addr == NULL || length == 0) return 0;
+    refresh_hidden_regions();
+    if (g_hidden_region_count == 0) return 0;
+
+    uintptr_t lo = (uintptr_t) addr;
+    uintptr_t hi = lo + length;
+    for (int i = 0; i < g_hidden_region_count; i++) {
+        if (lo < g_hidden_regions[i].end && hi > g_hidden_regions[i].start) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * COUNTER HELPERS
  * ──────────────────────────────────────────────────────────────── */
 
 static void bump_filtered(int idx) {
@@ -223,6 +359,15 @@ static void bump_blocked(int idx) {
         atomic_fetch_add_explicit(&g_blocked[idx], 1, memory_order_relaxed);
     }
 }
+
+/* ────────────────────────────────────────────────────────────────
+ * syscall() INTERPOSER
+ *
+ * Two filter classes:
+ *   • path-takers — resolve path, call xstealth_path_is_blocked()
+ *   • pid-takers  — compare pid arg against our own pid
+ *   • flag-takers — getppid / prctl / mincore
+ * ──────────────────────────────────────────────────────────────── */
 
 long syscall(long number, ...) {
     if (!real_syscall) resolve_once();
@@ -238,6 +383,11 @@ long syscall(long number, ...) {
     va_end(ap);
 
     if (!real_syscall) { errno = ENOSYS; return -1; }
+
+    /* Internal libsysku call — pass through. */
+    if (t_internal_call) {
+        return real_syscall(number, a1, a2, a3, a4, a5, a6);
+    }
 
     /* Fast path when Sysku is off. */
     if (!p_is_active || !xstealth_active()) {
@@ -330,14 +480,11 @@ long syscall(long number, ...) {
 
 #ifdef SYS_ptrace
         case SYS_ptrace:
-            /* PTRACE_TRACEME is the only ptrace request a
-             * detection probe uses to bypass libxstealth.so's
-             * symbol interposer. Refuse it outright from
-             * untrusted callers (that's everyone in this
-             * process that isn't the framework). */
             if (a1 == 0 /* PTRACE_TRACEME */) {
                 bump_filtered(SYSK_PTRACE);
                 bump_blocked(SYSK_PTRACE);
+                atomic_fetch_add_explicit(&g_calls_seen, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_calls_blocked, 1, memory_order_relaxed);
                 LOGI("syscall blocked: ptrace(PTRACE_TRACEME) via raw syscall");
                 errno = EPERM;
                 return -1;
@@ -355,9 +502,6 @@ long syscall(long number, ...) {
 
 #ifdef SYS_perf_event_open
         case SYS_perf_event_open:
-            /* perf_event_open's struct has a `pid` field at
-             * offset 0 (int). Read it with memcpy so we don't
-             * trip on alignment. */
             if (a1 != 0) {
                 int pe_pid = 0;
                 memcpy(&pe_pid, (const void *) a1, sizeof(int));
@@ -370,10 +514,11 @@ long syscall(long number, ...) {
 
 #ifdef SYS_kcmp
         case SYS_kcmp:
-            /* kcmp(pid1, pid2, ...). Refuse if either is us. */
             if ((int) a1 == getpid() || (int) a2 == getpid()) {
                 bump_filtered(SYSK_KCMP);
                 bump_blocked(SYSK_KCMP);
+                atomic_fetch_add_explicit(&g_calls_seen, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_calls_blocked, 1, memory_order_relaxed);
                 LOGI("syscall blocked: kcmp involving our pid");
                 errno = EPERM;
                 return -1;
@@ -389,11 +534,56 @@ long syscall(long number, ...) {
             break;
 #endif
 
+        /* ── flag-takers ───────────────────────────────── */
+
+#ifdef SYS_getppid
+        case SYS_getppid:
+            bump_filtered(SYSK_GETPPID);
+            bump_blocked(SYSK_GETPPID);
+            atomic_fetch_add_explicit(&g_calls_seen, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_calls_blocked, 1, memory_order_relaxed);
+            return 1;
+#endif
+
+#ifdef SYS_prctl
+        case SYS_prctl: {
+            int option = (int) a1;
+            if (option == 3 /* PR_GET_DUMPABLE */) {
+                bump_filtered(SYSK_PRCTL);
+                bump_blocked(SYSK_PRCTL);
+                return 1;
+            }
+            if (option == 4 /* PR_SET_DUMPABLE */ && (int) a2 == 0) {
+                bump_filtered(SYSK_PRCTL);
+                bump_blocked(SYSK_PRCTL);
+                LOGI("syscall blocked: prctl(PR_SET_DUMPABLE, 0) via raw syscall");
+                errno = EPERM;
+                return -1;
+            }
+            break;
+        }
+#endif
+
+#ifdef SYS_mincore
+        case SYS_mincore: {
+            void *addr = (void *) a1;
+            size_t length = (size_t) a2;
+            if (is_range_in_hidden_region(addr, length)) {
+                bump_filtered(SYSK_MINCORE);
+                bump_blocked(SYSK_MINCORE);
+                LOGI("syscall blocked: mincore on hidden region");
+                errno = ENOMEM;
+                return -1;
+            }
+            break;
+        }
+#endif
+
         default:
             return real_syscall(number, a1, a2, a3, a4, a5, a6);
     }
 
-    /* ── path check ─────────────────────────────────────── */
+    /* Path check */
     if (path != NULL) {
         bump_filtered(filter_idx);
         if (p_path_is_blocked && p_path_is_blocked(path)) {
@@ -407,7 +597,7 @@ long syscall(long number, ...) {
         return real_syscall(number, a1, a2, a3, a4, a5, a6);
     }
 
-    /* ── pid check ──────────────────────────────────────── */
+    /* Pid check */
     if (is_self_pid_check) {
         bump_filtered(filter_idx);
         if (pid_arg == getpid()) {
@@ -426,15 +616,6 @@ long syscall(long number, ...) {
 
 /* ────────────────────────────────────────────────────────────────
  * getdents64 INTERPOSER
- *
- * Fallback mode: pass through unchanged.
- *
- * struct linux_dirent64 layout (ABI-frozen at 2.6.24):
- *   offset 0  : uint64 d_ino
- *   offset 8  : int64  d_off
- *   offset 16 : uint16 d_reclen
- *   offset 18 : uint8  d_type
- *   offset 19 : char   d_name[] (NUL-terminated)
  * ──────────────────────────────────────────────────────────────── */
 
 #define LINUX_DIRENT64_HEADER_SIZE 19
@@ -639,7 +820,8 @@ Java_com_shizuposed_manager_stealth_SyskuNative_nativeDescribe(
     off += snprintf(buf + off, sizeof(buf) - off,
         "libsysku %s ready=%d active=%d fallback=%d "
         "calls_seen=%d calls_blocked=%d "
-        "dents_seen=%d dents_dropped=%d\n"
+        "dents_seen=%d dents_dropped=%d "
+        "hidden_regions=%d\n"
         "filtered/blocked:",
         LIBSYSKU_VERSION,
         atomic_load_explicit(&g_installed, memory_order_relaxed),
@@ -648,7 +830,8 @@ Java_com_shizuposed_manager_stealth_SyskuNative_nativeDescribe(
         atomic_load_explicit(&g_calls_seen, memory_order_relaxed),
         atomic_load_explicit(&g_calls_blocked, memory_order_relaxed),
         atomic_load_explicit(&g_dents_seen, memory_order_relaxed),
-        atomic_load_explicit(&g_dents_dropped, memory_order_relaxed));
+        atomic_load_explicit(&g_dents_dropped, memory_order_relaxed),
+        g_hidden_region_count);
 
     for (int i = 0; i < SYSK_LAST && off < (int)sizeof(buf) - 32; i++) {
         int f = atomic_load_explicit(&g_filtered[i], memory_order_relaxed);
@@ -665,7 +848,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void) vm; (void) reserved;
     LOGI("JNI_OnLoad: libsysku %s "
          "(scope: syscall + getdents64; fallback disables getdents64; "
-         "v1.2.0 adds ptrace/process_vm_readv/perf_event_open/kcmp/pidfd_open)",
+         "v1.3.0 adds getppid/prctl/mincore + hidden-region cache)",
          LIBSYSKU_VERSION);
     return JNI_VERSION_1_6;
 }

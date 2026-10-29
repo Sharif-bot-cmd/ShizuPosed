@@ -105,6 +105,7 @@ public class ShizuPosedService extends Service {
     private static final String LIB_SYSKU        = "libsysku.so";
     private static final String LIB_CALLSITE    = "libcallsite.so";
     private static final String LIB_XSTEALTH_BRIDGE = "libxstealth_bridge.so";
+    private static final String LIB_PINE        = "libpine.so";
 
     private static final boolean REQUIRE_AUTHORIZATION = true;
 
@@ -1557,6 +1558,8 @@ public void undeploySyskuLibIfGateAbsent() {
             libsDir + "/" + LIB_CALLSITE);
         boolean bridgeOk = pushOneLib(LIB_XSTEALTH_BRIDGE,
             libsDir + "/" + LIB_XSTEALTH_BRIDGE);
+        boolean pineOk   = pushOneLib(LIB_PINE,
+            libsDir + "/" + LIB_PINE);
 
         boolean syskuOk = false;
         boolean syskuAttempted = false;
@@ -1825,6 +1828,7 @@ private boolean isSyskuGateLive(String base) {
             LIB_SHIZUPOSED,
             LIB_AMIRU,
             LIB_CALLSITE,
+            LIB_PINE,
             LIB_SYSKU,
         };
 
@@ -2434,13 +2438,14 @@ private boolean isSyskuGateLive(String base) {
             String spawnPrefix = buildSpawnPrefix();
 
             String inner =
-                "export CLASSPATH=" + dexPath + "; "
+                "unset CLASSPATH; "
                 + "( "
                 +   (spawnPrefix.isEmpty() ? "" : spawnPrefix + " ")
                 +   binary + " "
                 +   "-Xverify:none "
                 +   "-Xhidden-api-policy:enabled "
                 +   "-Xcore-platform-api-policy:enabled "
+                +   "-Djava.class.path=" + dexPath + " "
                 +   "-Dshizuposed.shell.base=" + base + " "
                 +   "-Dshizuposed.shell.libs=" + libsDir + " "
                 +   "-Dshizuposed.hook.delay=" + hookDelayMs + " "

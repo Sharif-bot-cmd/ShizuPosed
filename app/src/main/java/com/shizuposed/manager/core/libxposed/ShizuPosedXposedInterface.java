@@ -72,7 +72,7 @@ public final class ShizuPosedXposedInterface implements XposedInterface {
     @NonNull
     @Override
     public String getFrameworkVersion() {
-        return "1.2.7";
+        return "1.2.9";
     }
 
     @Override

@@ -70,6 +70,7 @@ public class XposedHook {
     private static final String LIB_SHIZUPOSED  = "libshizuposed.so";
     private static final String LIB_CALLSITE    = "libcallsite.so";
     private static final String LIB_SYSKU       = "libsysku.so";
+    private static final String LIB_PINE        = "libpine.so";
 
     /**
      * Heartbeat freshness threshold. The Sysku ADB module's
@@ -366,6 +367,14 @@ public class XposedHook {
         } else {
             log(LIB_CALLSITE + " not present — CallSite backend "
                 + "will report unavailable");
+        }
+
+        String pinePath = libDir + "/" + LIB_PINE;
+        if (new File(pinePath).exists()) {
+            log(LIB_PINE + " present at " + pinePath
+                + " (load configured for PineBackend)");
+        } else {
+            log(LIB_PINE + " not present at " + pinePath);
         }
 
         log("Native engines: shizuposed=" + shizuposedLoaded
@@ -853,6 +862,7 @@ public class XposedHook {
                 return false;
             }
 
+            installActivityManagerShim();
             bind.invoke(activityThread, invokeArgs);
 
             boolean bound = verifyApplicationBound(activityThread);
@@ -868,6 +878,61 @@ public class XposedHook {
             log("bindApplication failed: " + t);
             t.printStackTrace();
             return false;
+        }
+    }
+
+    private static void installActivityManagerShim() {
+        try {
+            Class<?> amClass = Class.forName("android.app.ActivityManager");
+            Method getService = findMethodByShape(amClass, "getService");
+            if (getService == null) return;
+            HiddenApiBypass.forceAccessible(getService);
+            final Object realService = getService.invoke(null);
+            if (realService == null) return;
+
+            Field singletonField = null;
+            try {
+                singletonField = amClass.getDeclaredField("IActivityManagerSingleton");
+            } catch (Throwable ignored) {
+                try {
+                    Class<?> amn = Class.forName("android.app.ActivityManagerNative");
+                    singletonField = amn.getDeclaredField("gDefault");
+                } catch (Throwable ignored2) {}
+            }
+            if (singletonField == null) return;
+            HiddenApiBypass.forceAccessible(singletonField);
+            Object singleton = singletonField.get(null);
+            if (singleton == null) return;
+
+            Class<?> sClass = Class.forName("android.util.Singleton");
+            Field mInstanceField = sClass.getDeclaredField("mInstance");
+            HiddenApiBypass.forceAccessible(mInstanceField);
+
+            Class<?> iamInterface = Class.forName("android.app.IActivityManager");
+            Object proxy = java.lang.reflect.Proxy.newProxyInstance(
+                iamInterface.getClassLoader(),
+                new Class<?>[]{ iamInterface },
+                new java.lang.reflect.InvocationHandler() {
+                    @Override
+                    public Object invoke(Object p, Method m, Object[] a) throws Throwable {
+                        String name = m.getName();
+                        if ("finishAttachApplication".equals(name) || "attachApplication".equals(name)) {
+                            log("installActivityManagerShim: intercepted " + name + " (suppressing AMS call)");
+                            return null;
+                        }
+                        try {
+                            return m.invoke(realService, a);
+                        } catch (java.lang.reflect.InvocationTargetException ite) {
+                            throw ite.getCause() != null ? ite.getCause() : ite;
+                        }
+                    }
+                }
+            );
+
+            mInstanceField.set(singleton, proxy);
+            log("installActivityManagerShim: IActivityManager proxy installed");
+        } catch (Throwable t) {
+            log("installActivityManagerShim failed: " + t);
         }
     }
 
