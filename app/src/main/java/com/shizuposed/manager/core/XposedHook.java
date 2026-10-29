@@ -69,6 +69,15 @@ public class XposedHook {
     private static final String LIB_AMIRU       = "libamiru.so";
     private static final String LIB_SHIZUPOSED  = "libshizuposed.so";
     private static final String LIB_CALLSITE    = "libcallsite.so";
+    private static final String LIB_SYSKU       = "libsysku.so";
+
+    /**
+     * Heartbeat freshness threshold. The Sysku ADB module's
+     * service.sh writes <shell-base>/sysku/heartbeat.json every
+     * 60 seconds. A heartbeat older than this is treated as
+     * "module not running".
+     */
+    private static final long SYSKU_HEARTBEAT_FRESH_MS = 5 * 60 * 1000L;
 
     private static int myPid = 0;
     private static int myUid = 0;
@@ -80,6 +89,8 @@ public class XposedHook {
 
     private static volatile boolean amiruLoaded = false;
     private static volatile boolean shizuposedLoaded = false;
+    private static volatile boolean syskuLoadOk = false;
+    private static volatile boolean syskuFallback = false;
 
     private static final class ModuleInfo {
         String packageName;
@@ -136,7 +147,6 @@ public class XposedHook {
 
             initDirectories();
 
-            // Load XStealth native engines before anything else.
             preloadXStealthNative();
 
             try {
@@ -289,6 +299,61 @@ public class XposedHook {
             log(LIB_AMIRU + " not loaded (optional): " + t.getMessage());
         }
 
+        // ── Sysku: tiered load ────────────────────────────────
+        // Two conditions must both hold before System.load:
+        //   • state.json says enabled: true (user's choice)
+        //   • libsysku.so is present in <shell-base>/libs/
+        //
+        // The "is the module running" question is NOT a gate for
+        // loading. It's passed as the second argument to
+        // nativeInit. If the module isn't running, libsysku
+        // loads in FALLBACK MODE — syscall() filtering only,
+        // no getdents64 interposer. See libsysku.c's nativeInit
+        // for what the flag does.
+        String syskuPath = libDir + "/" + LIB_SYSKU;
+        if (new File(syskuPath).exists()) {
+            boolean userEnabled = isSyskuUserEnabled();
+            boolean moduleRunning = isSyskuModuleRunning();
+
+            if (!userEnabled) {
+                syskuLoadOk = false;
+                syskuFallback = false;
+                log(LIB_SYSKU + " present but state.json says disabled — "
+                    + "Sysku is off; skipping load");
+            } else {
+                try {
+                    boolean loaded = com.shizuposed.manager.stealth.SyskuNative
+                        .load(libDir);
+                    if (loaded) {
+                        String base = System.getProperty("shizuposed.shell.base",
+                            "/data/user/0/com.android.shell/files/.syscall_cache");
+                        int ready = com.shizuposed.manager.stealth.SyskuNative
+                            .nativeInit(base, moduleRunning);
+                        syskuFallback = !moduleRunning;
+                        log("Loaded " + LIB_SYSKU + " from " + syskuPath
+                            + " (nativeInit returned " + ready
+                            + ", moduleRunning=" + moduleRunning
+                            + (moduleRunning ? "" : ", FALLBACK MODE") + ")");
+                        syskuLoadOk = (ready == 1);
+                    } else {
+                        syskuLoadOk = false;
+                        syskuFallback = false;
+                        log(LIB_SYSKU + " present but load() refused — check "
+                            + "that libxstealth.so loaded first");
+                    }
+                } catch (Throwable t) {
+                    syskuLoadOk = false;
+                    syskuFallback = false;
+                    log(LIB_SYSKU + " failed to load: " + t.getMessage());
+                }
+            }
+        } else {
+            syskuLoadOk = false;
+            syskuFallback = false;
+            log(LIB_SYSKU + " not present at " + syskuPath
+                + " — syscall interposer unavailable");
+        }
+
         String callsitePath = libDir + "/" + LIB_CALLSITE;
         if (new File(callsitePath).exists()) {
             log(LIB_CALLSITE + " present at " + callsitePath
@@ -299,7 +364,93 @@ public class XposedHook {
         }
 
         log("Native engines: shizuposed=" + shizuposedLoaded
-            + " amiru=" + amiruLoaded);
+            + " amiru=" + amiruLoaded
+            + " sysku=" + syskuLoadOk
+            + (syskuLoadOk && syskuFallback ? " (fallback)" : ""));
+    }
+
+    /**
+     * Does state.json say the user wants Sysku on?
+     *
+     * This is the user's choice, written by ShizuPosed →
+     * Settings (via SyskuController.setEnabled()). It is NOT the
+     * runtime signal — that's heartbeat freshness, checked by
+     * isSyskuModuleRunning().
+     *
+     * Fails closed: any error returns false.
+     */
+    private static boolean isSyskuUserEnabled() {
+        try {
+            String base = System.getProperty("shizuposed.shell.base");
+            if (base == null || base.isEmpty()) base = BASE_DIR;
+
+            java.io.File state = new java.io.File(base, "sysku/state.json");
+            if (!state.exists() || state.length() == 0) return false;
+
+            byte[] buf = new byte[(int) state.length()];
+            int n;
+            try (java.io.FileInputStream fis = new java.io.FileInputStream(state)) {
+                n = fis.read(buf);
+            }
+            if (n <= 0) return false;
+
+            String json = new String(buf, 0, n,
+                java.nio.charset.StandardCharsets.UTF_8);
+            if (!json.contains("\"schema\":1")) return false;
+            return json.contains("\"enabled\":true");
+        } catch (Throwable t) {
+            log("isSyskuUserEnabled threw: " + t.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Is the Sysku ADB module running?
+     *
+     * Signal: <shell-base>/sysku/heartbeat.json, written by the
+     * module's service.sh every 60 seconds. Absent, empty, or
+     * older than SYSKU_HEARTBEAT_FRESH_MS means the module isn't
+     * running.
+     *
+     * This is a load-mode hint, not a load gate. When false,
+     * libsysku loads in fallback mode.
+     *
+     * Fails closed.
+     */
+    private static boolean isSyskuModuleRunning() {
+        try {
+            String base = System.getProperty("shizuposed.shell.base");
+            if (base == null || base.isEmpty()) base = BASE_DIR;
+
+            java.io.File hb = new java.io.File(base, "sysku/heartbeat.json");
+            if (!hb.exists()) {
+                log("isSyskuModuleRunning: heartbeat.json absent — "
+                    + "module not running");
+                return false;
+            }
+            if (hb.length() == 0) {
+                log("isSyskuModuleRunning: heartbeat.json empty — "
+                    + "module not running");
+                return false;
+            }
+
+            long ageMs = System.currentTimeMillis() - hb.lastModified();
+            if (ageMs < 0) {
+                log("isSyskuModuleRunning: heartbeat mtime is in the future "
+                    + "(ageMs=" + ageMs + ") — assuming running");
+                return true;
+            }
+            if (ageMs > SYSKU_HEARTBEAT_FRESH_MS) {
+                log("isSyskuModuleRunning: heartbeat stale (ageMs=" + ageMs
+                    + ", threshold=" + SYSKU_HEARTBEAT_FRESH_MS + ") — "
+                    + "module not running");
+                return false;
+            }
+            return true;
+        } catch (Throwable t) {
+            log("isSyskuModuleRunning threw: " + t.getMessage());
+            return false;
+        }
     }
 
     // ═════════════════════════════════════════════════════════════════
@@ -394,6 +545,30 @@ public class XposedHook {
             }
 
             log("Application bound; hooks live for everything after this point");
+
+            try {
+                Application boundApp = currentApplication();
+                if (boundApp != null) {
+                    com.shizuposed.manager.core.libxposed.LibXposedContext
+                        .set(boundApp);
+
+                    for (Map.Entry<String, Object> entry
+                            : moduleInstances.entrySet()) {
+                        Object inst = entry.getValue();
+                        if (inst == null) continue;
+                        if (!com.shizuposed.manager.core.libxposed.LibXposedDriver
+                                .isLibXposedModule(inst.getClass())) {
+                            continue;
+                        }
+                        com.shizuposed.manager.core.libxposed.LibXposedDriver
+                            .firePackageReady(inst, inst.getClass(), appLoader,
+                                              pkg, appInfo, true, boundApp, appLoader);
+                    }
+                }
+            } catch (Throwable t) {
+                log("libxposed onPackageReady pass failed: " + t.getMessage());
+            }
+
             writeStatus("HOOKED",
                 pkg + "|pid=" + myPid + "|modules=" + hooksFrom + "|bootstrap=true");
 
@@ -421,7 +596,6 @@ public class XposedHook {
     }
 
     private static Object obtainActivityThread(Class<?> at) {
-        // 1. systemMain() — public entry point used by the runtime.
         try {
             Method systemMain = findMethodByShape(at, "systemMain");
             if (systemMain != null) {
@@ -435,7 +609,6 @@ public class XposedHook {
             log("systemMain threw: " + t.getMessage());
         }
 
-        // 2. currentActivityThread() — returns the existing thread.
         try {
             Method current = findMethodByShape(at, "currentActivityThread");
             if (current != null) {
@@ -449,7 +622,6 @@ public class XposedHook {
             log("currentActivityThread threw: " + t.getMessage());
         }
 
-        // 3. Constructor.
         try {
             Constructor<?> ctor = at.getDeclaredConstructor();
             HiddenApiBypass.forceAccessible(ctor);
@@ -470,9 +642,6 @@ public class XposedHook {
             Class<?> compatInfoClass =
                 Class.forName("android.content.res.CompatibilityInfo");
 
-            // Find getPackageInfoNoCheck by shape. The method takes
-            // (ApplicationInfo) or (ApplicationInfo, CompatibilityInfo).
-            // We try both by passing the right number of args.
             Object loadedApk = null;
             try {
                 Method m1 = findMethodByShape(at, "getPackageInfoNoCheck",
@@ -558,7 +727,6 @@ public class XposedHook {
             }
             if (loadedApk == null) return null;
 
-            // getResources takes no args or a CompatibilityInfo.
             Object res = null;
             try {
                 Method m = findMethodByShape(loadedApk.getClass(), "getResources");
@@ -596,8 +764,6 @@ public class XposedHook {
 
             Object data = buildAppBindData(dataClass, appInfo, pkg);
 
-            // Try all the known forms of handleBindApplication. The
-            // shape search handles whichever signature the ROM has.
             Method bind = null;
             try {
                 bind = findMethodByShape(at, "handleBindApplication", data);
@@ -622,7 +788,6 @@ public class XposedHook {
                 return false;
             }
 
-            // Invoke with the arguments the found method expects.
             Object[] invokeArgs;
             Class<?>[] params = bind.getParameterTypes();
             if (params.length == 1) {
@@ -658,7 +823,6 @@ public class XposedHook {
     }
 
     private static boolean verifyApplicationBound(Object activityThread) {
-        // Path 1: read mInitialApplication directly.
         try {
             Class<?> c = activityThread.getClass();
             while (c != null) {
@@ -676,7 +840,6 @@ public class XposedHook {
             log("verifyApplicationBound: field read failed: " + t.getMessage());
         }
 
-        // Path 2: currentApplication() accessor.
         try {
             Application app = currentApplication();
             if (app != null) return true;
@@ -693,9 +856,6 @@ public class XposedHook {
                                             String pkg) throws Throwable {
         Object data = dataClass.getDeclaredConstructor().newInstance();
 
-        // Fields are set by shape, not by hardcoded name. The name
-        // hints are tried in order; if none matches, a unique
-        // field of the right type is used.
         setFieldByShape(data, appInfo, "appInfo", "info");
         setFieldByShape(data, pkg, "processName", "procName", "process");
         setFieldByShape(data, null, "providers");
@@ -752,8 +912,6 @@ public class XposedHook {
                 }
             }
 
-            // Try the two-arg form with the system context, then
-            // the one-arg form.
             Method install = null;
             if (sysCtx != null) {
                 install = findMethodByShape(at, "installContentProviders",
@@ -871,14 +1029,6 @@ public class XposedHook {
 
             int loaded = 0;
             for (ModuleInfo m : modules) {
-                // Each module gets its OWN LoadPackageParam whose
-                // classLoader is the module's own DexClassLoader.
-                // That is the loader the module was compiled against,
-                // and the one its own classes (MainActivity, etc.)
-                // are visible through. Handing it the target's
-                // appLoader instead would make findAndHookMethod on
-                // the module's own classes fail with
-                // ClassNotFoundError, which is the self-hook bug.
                 XC_LoadPackage.LoadPackageParam param =
                     buildLoadPackageParam(pkg, appLoader, appInfo);
                 if (loadModule(m, null, appLoader, param)) loaded++;
@@ -924,6 +1074,11 @@ public class XposedHook {
         for (Map.Entry<String, Object> entry : moduleInstances.entrySet()) {
             Object instance = entry.getValue();
             if (instance == null) continue;
+
+            if (com.shizuposed.manager.core.libxposed.LibXposedDriver
+                    .isLibXposedModule(instance.getClass())) {
+                continue;
+            }
 
             try {
                 Class<?> moduleClass = instance.getClass();
@@ -999,6 +1154,26 @@ public class XposedHook {
             }
 
             try {
+                com.shizuposed.manager.core.libxposed.LibXposedContext.set(app);
+
+                ApplicationInfo postAppInfo = app.getApplicationInfo();
+                for (Map.Entry<String, Object> entry : moduleInstances.entrySet()) {
+                    Object inst = entry.getValue();
+                    if (inst == null) continue;
+                    if (!com.shizuposed.manager.core.libxposed.LibXposedDriver
+                            .isLibXposedModule(inst.getClass())) {
+                        continue;
+                    }
+                    com.shizuposed.manager.core.libxposed.LibXposedDriver
+                        .firePackageReady(inst, inst.getClass(), appLoader,
+                                          pkg, postAppInfo, true, app, appLoader);
+                }
+            } catch (Throwable t) {
+                log("libxposed onPackageReady pass failed (post-app): "
+                    + t.getMessage());
+            }
+
+            try {
                 ClassLoadingBridge.install(appLoader);
                 if (appInfo != null) {
                     ClassLoadingBridge.preloadComponentClasses(
@@ -1063,6 +1238,8 @@ public class XposedHook {
             JSONObject engines = new JSONObject();
             engines.put("shizuposed", shizuposedLoaded);
             engines.put("amiru", amiruLoaded);
+            engines.put("sysku", syskuLoadOk);
+            engines.put("sysku_fallback", syskuFallback);
 
             JSONObject obj = new JSONObject();
             obj.put("pkg", pkg);
@@ -1096,6 +1273,8 @@ public class XposedHook {
                 + " (" + modulesLoaded + " modules, mode=" + mode
                 + ", shizuposed=" + shizuposedLoaded
                 + ", amiru=" + amiruLoaded
+                + ", sysku=" + syskuLoadOk
+                + (syskuFallback ? " (fallback)" : "")
                 + ", list=" + list + ")");
         } catch (Throwable t) {
             log("writeHookedMarker failed: " + t.getMessage());
@@ -1179,18 +1358,6 @@ public class XposedHook {
     // MODULE LOADING
     // ═════════════════════════════════════════════════════════════════
 
-    /**
-     * Load a module's dex and invoke its entry point.
-     *
-     * IMPORTANT: the module's LoadPackageParam.classLoader is
-     * rewritten to the module's own DexClassLoader before
-     * handleLoadPackage is called. That is what lets a module's own
-     * classes (MainActivity, its hook classes, etc.) resolve
-     * through lpparam.classLoader, which is how LSPosed modules are
-     * written. Without this rewrite, the self-hook pattern — a
-     * module hooking one of its own methods to detect activation —
-     * fails with ClassNotFoundError.
-     */
     private static boolean loadModule(ModuleInfo info,
                                       Application app,
                                       ClassLoader appLoader,
@@ -1241,14 +1408,6 @@ public class XposedHook {
                 moduleLoader = loader;
             }
 
-            // ── Give the module its own classloader ────────────
-            //
-            // The module was compiled against its own classes. Its
-            // handleLoadPackage will look up its own classes
-            // through lpparam.classLoader (e.g.
-            // MainActivity.class.getName() + lpparam.classLoader).
-            // For that to resolve, classLoader must be the loader
-            // that actually contains the module's classes.
             if (param != null && moduleLoader != null) {
                 ClassLoader prev = param.classLoader;
                 param.classLoader = moduleLoader;
@@ -1271,7 +1430,14 @@ public class XposedHook {
 
             boolean handled = false;
 
-            if (instance instanceof IXposedHookLoadPackage) {
+            if (com.shizuposed.manager.core.libxposed.LibXposedDriver
+                    .isLibXposedModule(moduleClass)) {
+                log("Module " + info.packageName + " is a libxposed module "
+                    + "(API 101); driving through libxposed lifecycle");
+                handled = com.shizuposed.manager.core.libxposed.LibXposedDriver
+                    .driveModule(instance, moduleClass, moduleLoader,
+                                 appLoader, param, info);
+            } else if (instance instanceof IXposedHookLoadPackage) {
                 log("Calling handleLoadPackage on "
                     + instance.getClass().getName()
                     + " for pkg=" + param.packageName);
@@ -1301,9 +1467,10 @@ public class XposedHook {
 
                 log("Module loaded: " + info.packageName
                     + " via " + entry
-                    + " (handleLoadPackage returned normally)");
+                    + " (entry returned normally)");
             } else {
-                log("Module has no handleLoadPackage: " + info.packageName);
+                log("Module has no recognized entry point: "
+                    + info.packageName);
             }
             return handled;
 
@@ -1403,52 +1570,7 @@ public class XposedHook {
     // ═════════════════════════════════════════════════════════════════
     // REFLECTION HELPERS
     // ═════════════════════════════════════════════════════════════════
-    // ═════════════════════════════════════════════════════════════════
-    // DYNAMIC REFLECTION
-    //
-    // The previous helpers tried a fixed list of signatures and
-    // field names. That works for the changes that have already
-    // happened, but every new Android version that changes
-    // ActivityThread's internals needs another entry in the list.
-    //
-    // These helpers search by shape instead:
-    //
-    //   • findMethodByShape — finds any method with the given name
-    //     whose parameter types are assignable from the given
-    //     argument types, in any order that matches.
-    //
-    //   • setFieldByShape — finds a field whose type is assignable
-    //     from the value, preferring names that match one of the
-    //     supplied hints.
-    //
-    //   • findFieldByType — finds a field of a given type on the
-    //     class or its ancestors.
-    //
-    // The effect is that a change like "handleBindApplication now
-    // takes (Context, AppBindData, boolean)" is handled without
-    // adding a signature — the search finds it because the args
-    // match assignability.
-    //
-    // Every "no match" case still logs what exists, so a failure
-    // on a future Android version is diagnosable from launch.log
-    // alone.
-    // ═════════════════════════════════════════════════════════════════
 
-    /**
-     * Find a method by name and shape. The method must:
-     *
-     *   • have exactly the given name
-     *   • accept exactly `args.length` parameters
-     *   • have each parameter type assignable from the corresponding
-     *     arg's runtime class
-     *
-     * If multiple methods match, the first with the fewest
-     * ancestors between parameter type and arg class wins. That
-     * picks the most specific overload.
-     *
-     * Returns null if no method matches. Logs every method with
-     * the given name so the failure is diagnosable.
-     */
     private static Method findMethodByShape(Class<?> clazz,
                                             String name,
                                             Object... args) {
@@ -1468,8 +1590,6 @@ public class XposedHook {
                 Object arg = args[i];
                 Class<?> param = params[i];
 
-                // Null arguments match any non-primitive parameter.
-                // For primitives, we can't tell from a null — skip.
                 if (arg == null) {
                     if (param.isPrimitive()) { ok = false; break; }
                     score += 1000;
@@ -1479,14 +1599,10 @@ public class XposedHook {
                 Class<?> argClass = arg.getClass();
 
                 if (param.isAssignableFrom(argClass)) {
-                    // Prefer the most specific parameter type. A
-                    // direct class match scores 0; each superclass
-                    // hop adds 1.
                     score += distance(argClass, param);
                     continue;
                 }
 
-                // Primitive boxing: allow int -> Integer and back.
                 if (isBoxedMatch(param, argClass)) {
                     score += 5;
                     continue;
@@ -1521,15 +1637,6 @@ public class XposedHook {
         return null;
     }
 
-    /**
-     * Find a field by shape. Prefers a field whose type is
-     * assignable from the value's class and whose name matches one
-     * of the given hints (in order). If no hint matches but a
-     * single field of the right type exists, uses that.
-     *
-     * Returns null if no field matches. Logs all fields of the
-     * class so the failure is diagnosable.
-     */
     private static boolean setFieldByShape(Object target,
                                            Object value,
                                            String... nameHints) {
@@ -1538,8 +1645,6 @@ public class XposedHook {
         Class<?> clazz = target.getClass();
         Class<?> valueClass = value == null ? null : value.getClass();
 
-        // Walk up the class hierarchy so a field declared on a
-        // superclass is still found.
         List<Field> candidates = new ArrayList<>();
         Class<?> c = clazz;
         while (c != null && c != Object.class) {
@@ -1552,8 +1657,6 @@ public class XposedHook {
             c = c.getSuperclass();
         }
 
-        // Pass 1: hint matches. Walk the hints in order; for each,
-        // find a field with that exact name and an assignable type.
         for (String hint : nameHints) {
             if (hint == null) continue;
             for (Field f : candidates) {
@@ -1568,13 +1671,10 @@ public class XposedHook {
             }
         }
 
-        // Pass 2: type match, no name. Only accept if there is
-        // exactly one field of the matching type — otherwise we
-        // could pick the wrong one.
         if (valueClass != null) {
             List<Field> typeMatches = new ArrayList<>();
             for (Field f : candidates) {
-                if (f.getName().startsWith("$")) continue; // synthetic
+                if (f.getName().startsWith("$")) continue;
                 if (f.isSynthetic()) continue;
                 if (isAssignable(valueClass, f.getType())) {
                     typeMatches.add(f);
@@ -1610,16 +1710,6 @@ public class XposedHook {
         }
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // SHAPE HELPERS
-    // ═════════════════════════════════════════════════════════════════
-
-    /**
-     * Distance from `from` to `to` in the class hierarchy, where
-     * `to` is an ancestor of `from`. 0 if they are the same class,
-     * 1 for a direct superclass, etc. Used to prefer the most
-     * specific overload.
-     */
     private static int distance(Class<?> from, Class<?> to) {
         if (from == to) return 0;
         int d = 1;
@@ -1629,7 +1719,6 @@ public class XposedHook {
             d++;
             c = c.getSuperclass();
         }
-        // Interfaces: count them as farther than any superclass.
         for (Class<?> i : from.getInterfaces()) {
             if (i == to) return 100;
         }
@@ -1639,17 +1728,12 @@ public class XposedHook {
     private static boolean isAssignable(Class<?> valueClass, Class<?> param) {
         if (param == null) return false;
         if (valueClass == null) {
-            // Null value: only matches non-primitives.
             return !param.isPrimitive();
         }
         if (param.isAssignableFrom(valueClass)) return true;
         return isBoxedMatch(param, valueClass);
     }
 
-    /**
-     * True if `param` is a primitive and `valueClass` is its boxed
-     * equivalent, or vice versa.
-     */
     private static boolean isBoxedMatch(Class<?> param, Class<?> valueClass) {
         return (param == int.class && valueClass == Integer.class)
             || (param == Integer.class && valueClass == int.class)

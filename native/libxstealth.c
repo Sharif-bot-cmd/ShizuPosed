@@ -2052,6 +2052,39 @@ static bool fd_is_blocked_path(int fd) {
     return false;
 }
 
+/* ─────────────────────────────────────────────────────────────
+ * Cross-library exports
+ *
+ * libsysku.so resolves these to piggy-back on libxstealth's path
+ * classification and activation flag. They are the only public
+ * surface libxstealth exposes to a sibling library; everything
+ * else stays static.
+ *
+ * Added in libxstealth 0.18.0. libsysku.so refuses to activate
+ * its path-filtering arm if these are missing (fail-open).
+ * ───────────────────────────────────────────────────────────── */
+
+__attribute__((visibility("default")))
+int xstealth_path_is_blocked(const char *path) {
+    return is_blocked_path(path) ? 1 : 0;
+}
+
+__attribute__((visibility("default")))
+int xstealth_fd_resolves_to_hidden(int fd) {
+    return fd_is_blocked_path(fd) ? 1 : 0;
+}
+
+__attribute__((visibility("default")))
+int xstealth_is_active(void) {
+    return g_xstealth_active ? 1 : 0;
+}
+
+__attribute__((visibility("default")))
+void xstealth_set_active(int active) {
+    g_xstealth_active = active ? 1 : 0;
+    LOGI("XStealth native: active=%d (set externally)", g_xstealth_active);
+}
+
 __attribute__((overloadable))
 int ioctl(int fd, unsigned long request, ...) {
     if (real_ioctl == NULL) {
@@ -2888,6 +2921,12 @@ Java_com_shizuposed_manager_stealth_XStealthNative_nativeInit(
     return (g_key_symbols_resolved == 5) ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT void JNICALL
+Java_com_shizuposed_manager_stealth_XStealthNative_nativeSetActive(
+        JNIEnv *env, jclass clazz, jboolean active) {
+    (void) env; (void) clazz;
+    xstealth_set_active(active ? 1 : 0);
+}
 
 JNIEXPORT void JNICALL
 Java_com_shizuposed_manager_stealth_XStealthNative_nativeSetTrustedPackage(
