@@ -102,6 +102,7 @@ public class ShizuPosedService extends Service {
     private static final String LIB_SHIZUPOSED  = "libshizuposed.so";
     private static final String LIB_XSTEALTH    = "libxstealth.so";
     private static final String LIB_XSTEALTH_NEXT = "libxstealth_next.so";
+    private static final String LIB_SYSKU        = "libsysku.so";
     private static final String LIB_CALLSITE    = "libcallsite.so";
     private static final String LIB_XSTEALTH_BRIDGE = "libxstealth_bridge.so";
 
@@ -1501,60 +1502,201 @@ public class ShizuPosedService extends Service {
     // ═════════════════════════════════════════════════════════════
     // NATIVE LIBRARY DEPLOYMENT
     // ═════════════════════════════════════════════════════════════
+public void undeploySyskuLibIfGateAbsent() {
+    if (!shizukuHelper.isAuthorized()) return;
+
+    String base = resolveShellBaseDir();
+    if (base == null) return;
+
+    if (isSyskuGateLive(base)) {
+        logger.d("undeploySyskuLibIfGateAbsent: gate live — keeping .so");
+        return;
+    }
+
+    try {
+        String libsDir = shellPath(base, SUB_DIR_LIBS);
+        ShellUtils.CommandResult r = shizukuHelper.executeCommand(
+            "rm -f " + libsDir + "/" + LIB_SYSKU);
+        if (r != null && r.isSuccess()) {
+            logger.i("libsysku.so removed from shell side — gate absent");
+        }
+    } catch (Throwable t) {
+        logger.w("undeploySyskuLibIfGateAbsent failed: " + t.getMessage());
+    }
+}
 
     private boolean deployNativeLibsToShellDir() {
         if (!shizukuHelper.isAuthorized()) {
             logger.w("Cannot deploy native libs: Shizuku not authorized");
-            return false;
-        }
-
-        String base = resolveShellBaseDir();
-        String libsDir = shellPath(base, SUB_DIR_LIBS);
-
-        try {
-            logger.i("Deploying native libs to " + libsDir);
-
-            ShellUtils.CommandResult mkdir =
-                shizukuHelper.executeCommand("mkdir -p " + libsDir);
-            if (!mkdir.isSuccess()) {
-                logger.e("Failed to create shell lib dir: "
-                    + mkdir.getStderrString());
-                return false;
-            }
-
-            boolean amiruOk  = pushOneLib(LIB_AMIRU,
-                libsDir + "/" + LIB_AMIRU);
-            boolean szpOk    = pushOneLib(LIB_SHIZUPOSED,
-                libsDir + "/" + LIB_SHIZUPOSED);
-            boolean xsOk     = pushOneLib(LIB_XSTEALTH,
-                libsDir + "/" + LIB_XSTEALTH);
-            boolean xsNextOk = pushOneLib(LIB_XSTEALTH_NEXT,
-                libsDir + "/" + LIB_XSTEALTH_NEXT);
-            boolean csOk     = pushOneLib(LIB_CALLSITE,
-                libsDir + "/" + LIB_CALLSITE);
-            boolean bridgeOk = pushOneLib(LIB_XSTEALTH_BRIDGE,
-                libsDir + "/" + LIB_XSTEALTH_BRIDGE);
-
-            if (!amiruOk && !szpOk && !xsOk && !xsNextOk && !csOk) {
-                logger.e("No native libs deployed");
-                return false;
-            }
-            if (!amiruOk)  logger.w("libamiru.so not deployed");
-            if (!szpOk)    logger.w("libshizuposed.so not deployed");
-            if (!xsOk)     logger.w("libxstealth.so not deployed");
-            if (!xsNextOk) logger.w("libxstealth_next.so not deployed");
-            if (!csOk)     logger.w("libcallsite.so not deployed");
-            if (!bridgeOk) logger.w("libxstealth_bridge.so not deployed");
-
-            logger.i("Native libs deployed to: " + libsDir);
-            libsDeployed.set(true);
-            return true;
-
-        } catch (Exception e) {
-            logger.e("deployNativeLibsToShellDir error: " + e.getMessage());
-            return false;
-        }
+        return false;
     }
+
+    String base = resolveShellBaseDir();
+    String libsDir = shellPath(base, SUB_DIR_LIBS);
+
+    try {
+        logger.i("Deploying native libs to " + libsDir);
+
+        ShellUtils.CommandResult mkdir =
+            shizukuHelper.executeCommand("mkdir -p " + libsDir);
+        if (!mkdir.isSuccess()) {
+            logger.e("Failed to create shell lib dir: "
+                + mkdir.getStderrString());
+            return false;
+        }
+
+        boolean amiruOk  = pushOneLib(LIB_AMIRU,
+            libsDir + "/" + LIB_AMIRU);
+        boolean szpOk    = pushOneLib(LIB_SHIZUPOSED,
+            libsDir + "/" + LIB_SHIZUPOSED);
+        boolean xsOk     = pushOneLib(LIB_XSTEALTH,
+            libsDir + "/" + LIB_XSTEALTH);
+        boolean xsNextOk = pushOneLib(LIB_XSTEALTH_NEXT,
+            libsDir + "/" + LIB_XSTEALTH_NEXT);
+        boolean csOk     = pushOneLib(LIB_CALLSITE,
+            libsDir + "/" + LIB_CALLSITE);
+        boolean bridgeOk = pushOneLib(LIB_XSTEALTH_BRIDGE,
+            libsDir + "/" + LIB_XSTEALTH_BRIDGE);
+
+        boolean syskuOk = false;
+        boolean syskuAttempted = false;
+        try {
+            if (isSyskuGateLive(base)) {
+                syskuAttempted = true;
+                syskuOk = pushOneLib(LIB_SYSKU,
+                    libsDir + "/" + LIB_SYSKU);
+                if (!syskuOk) {
+                    logger.w("libsysku.so push failed even though "
+                        + "gate.live is live — syscall interposer "
+                        + "will be unavailable for this deploy");
+                }
+            } else {
+                // Gate is absent. Remove any stale libsysku.so
+                // from a previous deploy so nothing can load it.
+                ShellUtils.CommandResult rm =
+                    shizukuHelper.executeCommand(
+                        "rm -f " + libsDir + "/" + LIB_SYSKU);
+                if (rm != null && rm.isSuccess()) {
+                    logger.d("libsysku.so removed — gate.live absent "
+                        + "(Sysku disabled or module not running)");
+                } else {
+                    logger.d("libsysku.so not present and gate absent "
+                        + "— nothing to remove");
+                }
+            }
+        } catch (Throwable t) {
+            logger.w("libsysku.so deploy check threw: " + t.getMessage());
+        }
+
+        if (!amiruOk && !szpOk && !xsOk && !xsNextOk && !csOk) {
+            logger.e("No native libs deployed");
+            return false;
+        }
+        if (!amiruOk)  logger.w("libamiru.so not deployed");
+        if (!szpOk)    logger.w("libshizuposed.so not deployed");
+        if (!xsOk)     logger.w("libxstealth.so not deployed");
+        if (!xsNextOk) logger.w("libxstealth_next.so not deployed");
+        if (!csOk)     logger.w("libcallsite.so not deployed");
+        if (!bridgeOk) logger.w("libxstealth_bridge.so not deployed");
+        if (syskuAttempted && !syskuOk) {
+            logger.w("libsysku.so not deployed (gate live but push failed)");
+        } else if (!syskuAttempted) {
+            logger.i("libsysku.so skipped — gate.live absent "
+                + "(Sysku disabled or module not running)");
+        }
+
+        logger.i("Native libs deployed to: " + libsDir);
+        libsDeployed.set(true);
+        return true;
+
+    } catch (Exception e) {
+        logger.e("deployNativeLibsToShellDir error: " + e.getMessage());
+        return false;
+    }
+}
+
+/**
+ * Is the Sysku ADB module's gate.live present and fresh?
+ *
+ * The gate is <shell-base>/sysku/gate.live, written by the
+ * Sysku ADB module's service.sh on every 60-second tick while
+ * Sysku is enabled. Its absence means the module is not
+ * running (or the user disabled Sysku, which makes service.sh
+ * remove the gate and exit).
+ *
+ * Freshness threshold: 5 minutes. The module writes it every
+ * 60 s, so anything older than 5 minutes means the module's
+ * shell loop stopped — the same signal SyskuController uses
+ * for its STALE state.
+ *
+ * Fails closed: any error (file missing, shell down, unparseable)
+ * returns false. That's deliberate — a false negative means
+ * libsysku.so is not deployed, which only disables the syscall
+ * interposer, not any other backend.
+ */
+private boolean isSyskuGateLive(String base) {
+    if (base == null || base.isEmpty()) return false;
+
+    String gatePath = base + "/sysku/gate.live";
+    try {
+        String script = "if [ -f \"" + gatePath + "\" ]; then "
+            + "  echo TS=$(stat -c %Y \"" + gatePath + "\" 2>/dev/null"
+            + "        || echo 0); "
+            + "  echo SIZE=$(stat -c %s \"" + gatePath + "\" 2>/dev/null"
+            + "        || echo 0); "
+            + "else "
+            + "  echo TS=0; echo SIZE=0; "
+            + "fi";
+
+        ShellUtils.CommandResult r = shizukuHelper.executeCommand(
+            ABS_SH + " -c '" + script.replace("'", "'\\''") + "'");
+
+        if (r == null || !r.isSuccess() || r.getStdoutString() == null) {
+            logger.d("isSyskuGateLive: stat failed — treating gate as absent");
+            return false;
+        }
+
+        long tsSec = 0;
+        long size = 0;
+        for (String line : r.getStdoutString().split("\n")) {
+            String t = line.trim();
+            if (t.startsWith("TS=")) {
+                try { tsSec = Long.parseLong(t.substring(3)); }
+                catch (NumberFormatException ignored) {}
+            } else if (t.startsWith("SIZE=")) {
+                try { size = Long.parseLong(t.substring(5)); }
+                catch (NumberFormatException ignored) {}
+            }
+        }
+
+        if (tsSec <= 0 || size <= 0) {
+            logger.d("isSyskuGateLive: gate.live missing or empty");
+            return false;
+        }
+
+        long ageMs = System.currentTimeMillis() - (tsSec * 1000L);
+        if (ageMs < 0) {
+            // Clock skew between shell and manager. Treat as live
+            // rather than fail closed — a skewed clock is not a
+            // disabled gate.
+            logger.d("isSyskuGateLive: gate mtime is in the future "
+                + "(ageMs=" + ageMs + ") — assuming live");
+            return true;
+        }
+        if (ageMs > 5 * 60 * 1000L) {
+            logger.d("isSyskuGateLive: gate.live stale (ageMs="
+                + ageMs + ") — treating as absent");
+            return false;
+        }
+
+        logger.d("isSyskuGateLive: gate.live live (ageMs=" + ageMs + ")");
+        return true;
+
+    } catch (Throwable t) {
+        logger.d("isSyskuGateLive threw: " + t.getMessage());
+        return false;
+    }
+}
 
     private boolean pushOneLib(String libName, String dstPath) {
         File staged = stageNativeLib(libName);
@@ -1683,6 +1825,7 @@ public class ShizuPosedService extends Service {
             LIB_SHIZUPOSED,
             LIB_AMIRU,
             LIB_CALLSITE,
+            LIB_SYSKU,
         };
 
         try {

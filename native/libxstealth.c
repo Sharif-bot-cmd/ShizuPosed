@@ -1,44 +1,3 @@
-/*
- * libxstealth.c — v0.17.0
- *
- * Primary XStealth library. Provides:
- *   • File path blocking (settings XML, sysfs USB state, persistent props)
- *   • /proc path scrubbing (maps, smaps, status, cmdline, /proc/net)
- *   • Netlink enumeration filtering (hides tunnel interfaces)
- *   • ioctl interposition on blocked FDs
- *   • dlsym / ptrace / pread / sysprop / getppid interposition
- *   • Unsafe gate (neutralizes sun.misc.Unsafe)
- *   • libart backup (in-memory copy for pread redirection)
- *   • Stub template capture and verification (Phase 2b hardened)
- *
- * v0.17.0 changes (Phase 2b hardening):
- *   • verify_prologue now extracts every save offset into
- *     reg_save_off[8] (indexed by saved register number), not just
- *     the receiver's. The backends use these to regenerate the
- *     restore sequence at the same offsets the prologue wrote.
- *   • The verified window is now up to 6 words (24 bytes) when
- *     word 5 is a continuation of the save sequence. This covers
- *     prologues that spill x30 as the 6th instruction rather than
- *     the 3rd or 4th.
- *   • prologue_info grew reg_save_off[8] and save_x30_at. Layout
- *     change: backends must be recompiled against this version.
- *   • New xstealth_get_template_info_full returns both the
- *     extracted offsets and a per-register bitmask of which
- *     registers were seen, so the backend can refuse a template
- *     that doesn't cover every register the stub needs to restore.
- *
- * v0.16.0 changes (carried forward):
- *   • capture_stub_template runs the prologue verifier on the
- *     captured bytes. Only verified templates are exposed.
- *   • New xstealth_get_template_info getter.
- *   • StubProbe probe0/probe1 for the interpreter shape.
- *
- * Build:
- *   clang -shared -fPIC -O2 -Wall -Wextra \
- *       -o libxstealth.so libxstealth.c \
- *       -llog -ldl -lpthread
- */
-
 #define _GNU_SOURCE
 
 #include <jni.h>
@@ -74,7 +33,7 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-#define XSTEALTH_VERSION "0.17.0"
+#define XSTEALTH_VERSION "0.18.1"
 
 #define STUB_TEMPLATE_MAX 64
 #define STUB_TEMPLATE_VERIFIED_MAX 32
@@ -592,6 +551,9 @@ static const char *TRUSTED_PREFIXES[] = {
 
 static char g_runtime_trusted_prefix[128] = {0};
 
+static __thread char t_cached_comm[64];
+static __thread int  t_comm_checked = 0;
+
 static volatile int g_xstealth_active = 0;
 static volatile int g_resolved = 0;
 static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -667,32 +629,44 @@ static bool is_trusted_caller(void) {
     jint rc = (*g_vm)->GetEnv(g_vm, (void **) &env, JNI_VERSION_1_6);
     if (rc != JNI_OK || env == NULL) return true;
 
-    char comm_path[64];
-    snprintf(comm_path, sizeof(comm_path),
-             "/proc/self/task/%d/comm", (int) gettid());
+    if (!t_comm_checked) {
+        t_comm_checked = 1;
+        t_cached_comm[0] = '\0';
 
-    int fd = open(comm_path, O_RDONLY);
-    if (fd < 0) return true;
+        char comm_path[64];
+        snprintf(comm_path, sizeof(comm_path),
+                 "/proc/self/task/%d/comm",
+                 (int) syscall(SYS_gettid));
 
-    char comm[64] = {0};
-    ssize_t n = read(fd, comm, sizeof(comm) - 1);
-    close(fd);
-
-    if (n <= 0) return true;
-
-    for (ssize_t i = 0; i < n; i++) {
-        if (comm[i] == '\n') { comm[i] = '\0'; break; }
+        long fd = syscall(SYS_openat, AT_FDCWD, comm_path,
+                          O_RDONLY | O_CLOEXEC, 0);
+        if (fd >= 0) {
+            ssize_t n = (ssize_t) syscall(SYS_read, fd, t_cached_comm,
+                                          sizeof(t_cached_comm) - 1);
+            syscall(SYS_close, fd);
+            if (n > 0) {
+                t_cached_comm[n] = '\0';
+                for (ssize_t i = 0; i < n; i++) {
+                    if (t_cached_comm[i] == '\n') {
+                        t_cached_comm[i] = '\0';
+                        break;
+                    }
+                }
+            }
+        }
     }
+
+    if (t_cached_comm[0] == '\0') return true;
 
     for (int i = 0; TRUSTED_PREFIXES[i]; i++) {
-        if (strstr(comm, TRUSTED_PREFIXES[i]) != NULL) return true;
+        if (strstr(t_cached_comm, TRUSTED_PREFIXES[i]) != NULL) return true;
     }
     if (g_runtime_trusted_prefix[0] != '\0'
-            && strstr(comm, g_runtime_trusted_prefix) != NULL) {
+            && strstr(t_cached_comm, g_runtime_trusted_prefix) != NULL) {
         return true;
     }
-    if (strstr(comm, "ShizuPosed") != NULL) return true;
-    if (strstr(comm, "Xposed") != NULL) return true;
+    if (strstr(t_cached_comm, "ShizuPosed") != NULL) return true;
+    if (strstr(t_cached_comm, "Xposed") != NULL) return true;
 
     return false;
 }
@@ -728,16 +702,31 @@ static void capture_libart_backup(void) {
     strncpy(g_libart_path, path, sizeof(g_libart_path) - 1);
     g_libart_path[sizeof(g_libart_path) - 1] = '\0';
 
-    int src_fd = open(path, O_RDONLY | O_CLOEXEC);
+    int src_fd = (int) syscall(SYS_openat, AT_FDCWD, path,
+                               O_RDONLY | O_CLOEXEC, 0);
     if (src_fd < 0) {
         LOGW("libart backup: open(%s) failed: %s", path, strerror(errno));
         return;
     }
 
+    /* fstat via raw syscall. AT_EMPTY_PATH lets us stat an fd
+     * without going back through path resolution. Fall back to
+     * a plain fd-based syscall where AT_EMPTY_PATH isn't exposed. */
     struct stat st;
-    if (fstat(src_fd, &st) != 0 || st.st_size <= 0) {
-        LOGW("libart backup: fstat failed");
-        close(src_fd);
+    memset(&st, 0, sizeof(st));
+#ifdef SYS_newfstatat
+    long frc = syscall(SYS_newfstatat, src_fd, "", &st, AT_EMPTY_PATH);
+#elif defined(SYS_fstatat)
+    long frc = syscall(SYS_fstatat, src_fd, "", &st, AT_EMPTY_PATH);
+#elif defined(SYS_fstat)
+    long frc = syscall(SYS_fstat, src_fd, &st);
+#else
+    long frc = -1;
+    errno = ENOSYS;
+#endif
+    if (frc != 0 || st.st_size <= 0) {
+        LOGW("libart backup: fstat failed: %s", strerror(errno));
+        syscall(SYS_close, src_fd);
         return;
     }
 
@@ -748,29 +737,31 @@ static void capture_libart_backup(void) {
     if (memfd < 0) {
         char tmp_path[128];
         snprintf(tmp_path, sizeof(tmp_path),
-                 "/data/local/tmp/.xstealth_libart_%d", getpid());
-        memfd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                 "/data/local/tmp/.xstealth_libart_%d", (int) syscall(SYS_getpid));
+        memfd = (int) syscall(SYS_openat, AT_FDCWD, tmp_path,
+                              O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
         if (memfd >= 0) {
-            unlink(tmp_path);
+            syscall(SYS_unlinkat, AT_FDCWD, tmp_path, 0);
         }
     }
     if (memfd < 0) {
         LOGW("libart backup: could not create backup fd");
-        close(src_fd);
+        syscall(SYS_close, src_fd);
         return;
     }
 
     char buf[65536];
     ssize_t n;
     off_t total = 0;
-    while ((n = read(src_fd, buf, sizeof(buf))) > 0) {
+    while ((n = (ssize_t) syscall(SYS_read, src_fd, buf, sizeof(buf))) > 0) {
         ssize_t written = 0;
         while (written < n) {
-            ssize_t w = write(memfd, buf + written, n - written);
+            ssize_t w = (ssize_t) syscall(SYS_write, memfd,
+                                          buf + written, n - written);
             if (w <= 0) {
-                LOGW("libart backup: write failed");
-                close(memfd);
-                close(src_fd);
+                LOGW("libart backup: write failed: %s", strerror(errno));
+                syscall(SYS_close, memfd);
+                syscall(SYS_close, src_fd);
                 return;
             }
             written += w;
@@ -778,11 +769,11 @@ static void capture_libart_backup(void) {
         total += n;
     }
 
-    close(src_fd);
+    syscall(SYS_close, src_fd);
 
     if (n < 0 || total <= 0) {
         LOGW("libart backup: copy failed");
-        close(memfd);
+        syscall(SYS_close, memfd);
         return;
     }
 
@@ -1262,21 +1253,44 @@ static void scrub_buffer_maps(char *buf, ssize_t n) {
             const char *q = p;
             const char *line_end = p + linelen;
             int field = 0;
+            const char *inode_start = NULL;
             const char *path_start = NULL;
+
             while (q < line_end && field < 6) {
                 while (q < line_end && (*q == ' ' || *q == '\t')) q++;
                 if (q >= line_end) break;
-                if (field == 5) {
+
+                if (field == 4) {
+                    inode_start = q;
+                    while (q < line_end && *q != ' ' && *q != '\t' &&
+                           *q != '\n') q++;
+                } else if (field == 5) {
                     const char *r = q;
                     while (r < line_end && (*r == ' ' || *r == '\t')) r++;
                     if (r < line_end && *r == '/') path_start = r;
                     break;
+                } else {
+                    while (q < line_end && *q != ' ' && *q != '\t' &&
+                           *q != '\n') q++;
                 }
-                while (q < line_end && *q != ' ' && *q != '\t' &&
-                       *q != '\n') q++;
                 field++;
             }
 
+            /* Rewrite inode → "0" padded to original width. */
+            if (inode_start != NULL) {
+                const char *ie = inode_start;
+                while (ie < line_end && *ie != ' ' && *ie != '\t' &&
+                       *ie != '\n') ie++;
+                size_t inode_len = (size_t)(ie - inode_start);
+                if (inode_len > 0) {
+                    ((char *) inode_start)[0] = '0';
+                    for (size_t i = 1; i < inode_len; i++) {
+                        ((char *) inode_start)[i] = ' ';
+                    }
+                }
+            }
+
+            /* Rewrite path → "/dev/zero" padded to original width. */
             if (path_start != NULL) {
                 size_t path_len = nl ? (size_t)(nl - path_start)
                                      : (size_t)(line_end - path_start);
@@ -1498,6 +1512,42 @@ static void scrub_ppid_line(char *buf, ssize_t n) {
 
         if (!nl) break;
         p = nl + 1;
+    }
+}
+
+static void scrub_stat_ppid(char *buf, ssize_t n) {
+    if (n <= 0) return;
+
+    /* Find the closing paren of the comm field. */
+    char *close = memchr(buf, ')', (size_t) n);
+    if (close == NULL) return;
+
+    char *p = close + 1;
+    char *end = buf + n;
+
+    /* Fields after the paren: state, ppid, ... Skip "state". */
+    int fields_to_skip = 2;   /* state, then ppid is the next */
+    while (p < end && fields_to_skip > 0) {
+        while (p < end && *p == ' ') p++;
+        if (p >= end) return;
+        while (p < end && *p != ' ') p++;
+        fields_to_skip--;
+    }
+
+    /* p is now at the whitespace before the ppid field. */
+    if (p >= end) return;
+    p++;
+    if (p >= end) return;
+
+    char *ppid_start = p;
+    while (p < end && *p != ' ' && *p != '\n') p++;
+    size_t ppid_len = (size_t)(p - ppid_start);
+    if (ppid_len == 0) return;
+
+    /* Preserve the field's width by padding with spaces. */
+    ppid_start[0] = '1';
+    for (size_t i = 1; i < ppid_len; i++) {
+        ppid_start[i] = ' ';
     }
 }
 
@@ -2006,6 +2056,7 @@ ssize_t read(int fd, void *buf, size_t count) {
             break;
         case SCRUB_STAT:
             scrub_buffer_stat((char *)buf, n);
+            scrub_stat_ppid((char *)buf, n);
             break;
         case SCRUB_NET_UNIX:
             scrub_buffer_net_unix((char *)buf, n);
@@ -2050,6 +2101,39 @@ static bool fd_is_blocked_path(int fd) {
         if (strcmp(target, BLOCKED_PATHS[i]) == 0) return true;
     }
     return false;
+}
+
+/* ─────────────────────────────────────────────────────────────
+ * Cross-library exports
+ *
+ * libsysku.so resolves these to piggy-back on libxstealth's path
+ * classification and activation flag. They are the only public
+ * surface libxstealth exposes to a sibling library; everything
+ * else stays static.
+ *
+ * Added in libxstealth 0.18.0. libsysku.so refuses to activate
+ * its path-filtering arm if these are missing (fail-open).
+ * ───────────────────────────────────────────────────────────── */
+
+__attribute__((visibility("default")))
+int xstealth_path_is_blocked(const char *path) {
+    return is_blocked_path(path) ? 1 : 0;
+}
+
+__attribute__((visibility("default")))
+int xstealth_fd_resolves_to_hidden(int fd) {
+    return fd_is_blocked_path(fd) ? 1 : 0;
+}
+
+__attribute__((visibility("default")))
+int xstealth_is_active(void) {
+    return g_xstealth_active ? 1 : 0;
+}
+
+__attribute__((visibility("default")))
+void xstealth_set_active(int active) {
+    g_xstealth_active = active ? 1 : 0;
+    LOGI("XStealth native: active=%d (set externally)", g_xstealth_active);
 }
 
 __attribute__((overloadable))
@@ -2888,6 +2972,12 @@ Java_com_shizuposed_manager_stealth_XStealthNative_nativeInit(
     return (g_key_symbols_resolved == 5) ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT void JNICALL
+Java_com_shizuposed_manager_stealth_XStealthNative_nativeSetActive(
+        JNIEnv *env, jclass clazz, jboolean active) {
+    (void) env; (void) clazz;
+    xstealth_set_active(active ? 1 : 0);
+}
 
 JNIEXPORT void JNICALL
 Java_com_shizuposed_manager_stealth_XStealthNative_nativeSetTrustedPackage(
