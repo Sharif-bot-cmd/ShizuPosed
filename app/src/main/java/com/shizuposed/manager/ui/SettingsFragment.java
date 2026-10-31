@@ -29,6 +29,7 @@ import com.shizuposed.manager.ShizukuHelper;
 import com.shizuposed.manager.ShizuPosedManagerApp;
 import com.shizuposed.manager.receiver.BootReceiver;
 import com.shizuposed.manager.runtime.RuntimePrefs;
+import com.shizuposed.manager.runtime.SyskuController;
 import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.updates.UpdateChecker;
 import com.shizuposed.manager.utils.Logger;
@@ -51,52 +52,27 @@ import java.util.concurrent.Executors;
  * The XStealth master toggle lives in the XStealth detail sheet,
  * not here.
  *
- * SCAN INTERVAL / HOOK DELAY
- * --------------------------
- * Both are stored in RuntimePrefs and read at their point of use:
- *   • Scan interval: ProcessMonitor.startMonitoring()
- *   • Hook delay: XposedHook via -Dshizuposed.hook.delay
+ * SYSKU
+ * -----
+ * The Sysku row is a two-part UI:
  *
- * The scan interval takes effect on the next service start (it's
- * read when the scheduler is created). The hook delay takes effect
- * on the next app launch, because it's passed as a -D property to
- * app_process.
+ *   • A status line ("Sysku: Enabled / Disabled / Not installed /
+ *     Stale / Load failed") updated from SyskuController.getState().
+ *   • A toggle switch that drives SyskuController.setEnabled().
  *
- * MAINTENANCE ACTIONS
- * -------------------
- * Two actions are dispatched to ShizuPosedService via startForegroundService:
- *
- *   • ACTION_CLEAR_LOGS — removes launch.log and other shell-side
- *     logs. Manager's own log is cleared separately from the Logs
- *     tab.
- *
- *   • ACTION_CLEAN_ALL — removes the deployed dex, native libs,
- *     module files, markers, and logs. Resets the service's deploy
- *     flags, so the next routed launch redeploys everything from
- *     scratch. This is the "nuclear option" for stale caches.
- *
- * Both actions report their outcome via ACTION_LAUNCH_RESULT with
- * the sentinel package name MAINTENANCE_RESULT_PKG ("__logs__").
- * The receiver in this fragment filters on that sentinel so
- * maintenance results don't collide with launch results.
- *
- * CHECK FOR UPDATES
- * -----------------
- * The button calls UpdateChecker.checkNowAsync(), which bypasses
- * the 12-hour throttle and posts a notification if a newer release
- * exists. The result is delivered via the same notification path
- * as the automatic check, so the user sees the same UI whether the
- * check was triggered manually or automatically.
- *
- * If the current version is already latest, the notification is
- * suppressed (UpdateChecker only notifies for a newer tag) and the
- * button shows a "you're up to date" toast instead.
+ * Both the status and the toggle read from the same source of truth
+ * (SharedPreferences "sysku_enabled"), so a toggle from here is
+ * immediately reflected in the next status refresh. The heartbeat
+ * (which is a shell-side file) is read asynchronously and does not
+ * gate the toggle — a user can turn Sysku on before the ADB module
+ * has ever run; the state line will read "Stale" until it does.
  */
 public class SettingsFragment extends Fragment {
 
-    private MaterialSwitch swAutoStart, swDebugMode, swLogToFile;
+    private MaterialSwitch swAutoStart, swDebugMode, swLogToFile, swSyskuEnabled;
     private Slider sliderScanInterval, sliderHookDelay;
     private TextView tvScanIntervalValue, tvHookDelayValue;
+    private TextView tvSyskuStatus, tvSyskuHint;
     private Button btnClearLogs, btnCleanAll, btnExportConfig, btnCheckUpdates;
     private TextView tvVersion, tvShizukuStatus, tvServiceStatus;
 
@@ -145,6 +121,22 @@ public class SettingsFragment extends Fragment {
                 Toast.LENGTH_SHORT).show();
         };
 
+    private final CompoundButton.OnCheckedChangeListener syskuToggleListener =
+        (buttonView, isChecked) -> {
+            if (!isAdded()) return;
+            SyskuController.setEnabled(requireContext(), isChecked);
+            if (logger != null) {
+                logger.i("Sysku " + (isChecked ? "enabled" : "disabled")
+                    + " by user");
+            }
+            Toast.makeText(requireContext(),
+                isChecked
+                    ? "Sysku enabled — takes effect on next launch"
+                    : "Sysku disabled",
+                Toast.LENGTH_SHORT).show();
+            refreshSyskuStatus();
+        };
+
     @Override
     public void onAttach(@NonNull Context context) {
         super.onAttach(context);
@@ -172,6 +164,7 @@ public class SettingsFragment extends Fragment {
         setupListeners();
         loadSettings();
         updateRealStatus();
+        refreshSyskuStatus();
         registerMaintenanceReceiver();
     }
 
@@ -181,6 +174,7 @@ public class SettingsFragment extends Fragment {
         if (logger == null) return;
         loadSettings();
         updateRealStatus();
+        refreshSyskuStatus();
     }
 
     @Override
@@ -191,10 +185,13 @@ public class SettingsFragment extends Fragment {
         swAutoStart = null;
         swDebugMode = null;
         swLogToFile = null;
+        swSyskuEnabled = null;
         sliderScanInterval = null;
         sliderHookDelay = null;
         tvScanIntervalValue = null;
         tvHookDelayValue = null;
+        tvSyskuStatus = null;
+        tvSyskuHint = null;
         btnClearLogs = null;
         btnCleanAll = null;
         btnExportConfig = null;
@@ -212,10 +209,13 @@ public class SettingsFragment extends Fragment {
         swAutoStart = view.findViewById(R.id.swAutoStart);
         swDebugMode = view.findViewById(R.id.swDebugMode);
         swLogToFile = view.findViewById(R.id.swLogToFile);
+        swSyskuEnabled = view.findViewById(R.id.swSyskuEnabled);
         sliderScanInterval = view.findViewById(R.id.sliderScanInterval);
         sliderHookDelay = view.findViewById(R.id.sliderHookDelay);
         tvScanIntervalValue = view.findViewById(R.id.tvScanIntervalValue);
         tvHookDelayValue = view.findViewById(R.id.tvHookDelayValue);
+        tvSyskuStatus = view.findViewById(R.id.tvSyskuStatus);
+        tvSyskuHint = view.findViewById(R.id.tvSyskuHint);
         btnClearLogs = view.findViewById(R.id.btnClearLogs);
         btnCleanAll = view.findViewById(R.id.btnCleanAll);
         btnExportConfig = view.findViewById(R.id.btnExportConfig);
@@ -262,6 +262,9 @@ public class SettingsFragment extends Fragment {
         if (swLogToFile != null) {
             swLogToFile.setOnCheckedChangeListener(logToFileListener);
         }
+        if (swSyskuEnabled != null) {
+            swSyskuEnabled.setOnCheckedChangeListener(syskuToggleListener);
+        }
 
         // ── Scan interval slider ──────────────────────────────────
         if (sliderScanInterval != null) {
@@ -288,6 +291,54 @@ public class SettingsFragment extends Fragment {
                 }
             });
         }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // SYSKU
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Refresh the Sysku status line + toggle from the controller.
+     *
+     * The toggle reads from SharedPreferences, which is synchronous.
+     * The status line reads a heartbeat file via Shizuku, so it runs
+     * on the executor and posts back.
+     */
+    private void refreshSyskuStatus() {
+        if (!isAdded() || !viewReady) return;
+
+        final Context appCtx = requireContext().getApplicationContext();
+
+        // Synchronous part — the switch reflects the local choice.
+        final boolean enabled = SyskuController.isEnabled(appCtx);
+        if (swSyskuEnabled != null) {
+            swSyskuEnabled.setOnCheckedChangeListener(null);
+            swSyskuEnabled.setChecked(enabled);
+            swSyskuEnabled.setOnCheckedChangeListener(syskuToggleListener);
+        }
+
+        // Hint text under the row reflects the current choice
+        // immediately, before the async status arrives.
+        if (tvSyskuHint != null) {
+            tvSyskuHint.setText(enabled
+                ? "Syscall-based hook backend. Takes effect on next launch."
+                : "Syscall-based hook backend. Off by default.");
+        }
+
+        // Async part — heartbeat read + lib probe.
+        executor.execute(() -> {
+            if (executor.isShutdown()) return;
+            final SyskuController.State st = SyskuController.getState(appCtx);
+            final String label = SyskuController.describe(st);
+            final int color = SyskuController.colorFor(st);
+
+            if (!isAdded() || !viewReady || tvSyskuStatus == null) return;
+            requireActivity().runOnUiThread(() -> {
+                if (tvSyskuStatus == null) return;
+                tvSyskuStatus.setText(label);
+                tvSyskuStatus.setTextColor(color);
+            });
+        });
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -361,6 +412,9 @@ public class SettingsFragment extends Fragment {
         if (swLogToFile != null) {
             swLogToFile.setChecked(prefs.getBoolean("log_to_file", true));
         }
+
+        // Sysku switch is driven by SyskuController, not by the
+        // generic prefs object. It's refreshed separately.
 
         // ── Sliders ───────────────────────────────────────────────
         if (sliderScanInterval != null) {
@@ -681,6 +735,16 @@ public class SettingsFragment extends Fragment {
                   .append("\n");
             config.append("boot_receiver_enabled=")
                   .append(prefs.getBoolean("boot_receiver_enabled", false))
+                  .append("\n");
+
+            config.append("\n## Sysku\n");
+            config.append("sysku_enabled=")
+                  .append(SyskuController.isEnabled(requireContext()))
+                  .append("\n");
+            SyskuController.State st =
+                SyskuController.getState(requireContext());
+            config.append("sysku_state=")
+                  .append(SyskuController.describe(st))
                   .append("\n");
 
             config.append("\n## XStealth\n");

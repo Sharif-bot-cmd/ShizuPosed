@@ -73,9 +73,10 @@ public final class ApiProtectionCheck {
 
     private static final String TAG = "XStealth";
 
-    /** Package prefixes that identify the shim classes. */
     private static final String[] PROTECTED_PREFIXES = {
         "de.robv.android.xposed.",
+        "io.github.libxposed.api.",
+        "io.github.libxposed.annotation.",
         "com.shizuposed.manager.stealth.",
         "com.shizuposed.manager.core.",
     };
@@ -87,6 +88,8 @@ public final class ApiProtectionCheck {
 
     static {
         TRUSTED_PACKAGES.add("de.robv.android.xposed");
+        TRUSTED_PACKAGES.add("io.github.libxposed.api");
+        TRUSTED_PACKAGES.add("io.github.libxposed.annotation");
         TRUSTED_PACKAGES.add("com.shizuposed.manager.stealth");
         TRUSTED_PACKAGES.add("com.shizuposed.manager.core");
         TRUSTED_PACKAGES.add("com.shizuposed.manager");
@@ -641,6 +644,8 @@ public final class ApiProtectionCheck {
                 if (cn == null) continue;
 
                 if (cn.startsWith("de.robv.android.xposed.")) return true;
+                if (cn.startsWith("io.github.libxposed.api.")) return true;
+                if (cn.startsWith("io.github.libxposed.annotation.")) return true;
                 if (cn.startsWith("com.shizuposed.manager.stealth.")) return true;
                 if (cn.startsWith("com.shizuposed.manager.core.")) return true;
 

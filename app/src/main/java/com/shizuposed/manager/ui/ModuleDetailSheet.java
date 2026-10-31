@@ -56,6 +56,12 @@ import java.util.List;
  *
  * The search recurses into child FragmentManagers so it also works
  * if ModulesFragment is nested inside a tab host or ViewPager2.
+ *
+ * API VERSION
+ * -----------
+ * bindHeader() renders the module's declared Xposed API version
+ * (LSPosed-style "Xposed API 93 · target 100" line) below the
+ * package name. Hidden when the module declares nothing.
  */
 public class ModuleDetailSheet extends BottomSheetDialogFragment {
 
@@ -158,12 +164,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
      * which puts it in the ACTIVITY's FragmentManager as a sibling
      * of ModulesFragment. So getParentFragment() returns null. We
      * have to search the activity's fragment tree instead.
-     *
-     * Order of preference:
-     *   1. getParentFragment() — works if someone nested us via
-     *      childFragmentManager.
-     *   2. Any ModulesFragment in the activity's FragmentManager,
-     *      recursing into child FragmentManagers up to depth 3.
      */
     @Nullable
     private ModulesFragment findHostModulesFragment() {
@@ -205,10 +205,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
         return null;
     }
 
-    /**
-     * Recursively search a fragment list and its children for a
-     * ModulesFragment. Depth-bounded to avoid pathological cases.
-     */
     @Nullable
     private ModulesFragment searchFragmentsForModules(List<Fragment> fragments,
                                                      int depth) {
@@ -217,7 +213,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             if (f == null) continue;
             if (f instanceof ModulesFragment) return (ModulesFragment) f;
 
-            // Recurse into child fragments
             try {
                 FragmentManager childFm = f.getChildFragmentManager();
                 ModulesFragment nested = searchFragmentsForModules(
@@ -240,6 +235,7 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
         TextView name = v.findViewById(R.id.tvModuleName);
         TextView pkgv = v.findViewById(R.id.tvModulePackage);
         TextView status = v.findViewById(R.id.tvModuleStatus);
+        TextView apiVersion = v.findViewById(R.id.tvApiVersion);
 
         if (icon != null) {
             Drawable d = IconResolver.resolve(requireContext(),
@@ -255,6 +251,23 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             pkgv.setText(module.packageName
                 + (module.version != null ? " • v" + module.version : ""));
         }
+
+        if (apiVersion != null) {
+            int primary = module.getDisplayApiVersion();
+            if (primary > 0) {
+                StringBuilder sb = new StringBuilder("Xposed API ")
+                    .append(primary);
+                if (module.targetApiVersion > 0
+                        && module.targetApiVersion != primary) {
+                    sb.append(" · target ").append(module.targetApiVersion);
+                }
+                apiVersion.setText(sb.toString());
+                apiVersion.setVisibility(View.VISIBLE);
+            } else {
+                apiVersion.setVisibility(View.GONE);
+            }
+        }
+
         if (status != null) {
             status.setText(module.enabled ? "✅ Enabled" : "❌ Disabled");
         }
@@ -361,16 +374,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
         }
     }
 
-    /**
-     * Try to launch the module's own UI through ShizuPosed.
-     *
-     * Returns true if the launch was dispatched. When true, the
-     * caller MUST NOT launch the UI by any other path.
-     *
-     * Uses findHostModulesFragment() rather than getParentFragment()
-     * because the sheet is added to the activity's FragmentManager,
-     * not nested inside ModulesFragment.
-     */
     private boolean tryLaunchThroughShizuPosed() {
         try {
             if (module == null) {
@@ -380,9 +383,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                 return false;
             }
 
-            // Repair cachedDexPath from disk if the in-memory record
-            // is stale. Without this, a valid module can silently
-            // fall through to the direct-launch path.
             boolean dexOk = module.cachedDexPath != null
                 && !module.cachedDexPath.isEmpty()
                 && new java.io.File(module.cachedDexPath).exists();
@@ -400,8 +400,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
                 return false;
             }
 
-            // Locate the host fragment. This is the fix — the old code
-            // used getParentFragment(), which returned null.
             ModulesFragment host = findHostModulesFragment();
             if (host == null) {
                 if (logger != null) {
@@ -437,10 +435,6 @@ public class ModuleDetailSheet extends BottomSheetDialogFragment {
             return false;
         }
     }
-
-    // ═════════════════════════════════════════════════════════════
-    // SCOPE
-    // ═════════════════════════════════════════════════════════════
 
     // ═════════════════════════════════════════════════════════════
     // SCOPE (read-only summary)

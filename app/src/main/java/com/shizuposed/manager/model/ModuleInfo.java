@@ -29,51 +29,40 @@ public class ModuleInfo implements Serializable {
 
     // ============================================================
     // RECOMMENDED SCOPE
-    //
-    // Package names the module declares as its recommended scope,
-    // read from assets/scope.list in the module APK. This is the
-    // LSPosed convention: the module author lists the packages the
-    // module is designed for, and the scope editor surfaces them
-    // with a badge and a "Recommended" quick-select chip.
-    //
-    // Distinct from hookedApps, which is the user's actual
-    // selection. A package can be recommended without being
-    // selected, and selected without being recommended.
-    //
-    // Empty when the module declares no scope.list. Never null.
     // ============================================================
     public Set<String> recommendedApps;
 
     public boolean hasXposedInit;
     public boolean hasNativeInit;
 
-    /**
-     * True if the module APK declares a launcher activity.
-     *
-     * Used only by the scope editor: a module with a UI can select
-     * its own package in its own scope, so it can be launched under
-     * ShizuPosed and hook itself. Headless modules do not see their
-     * own package.
-     */
     public boolean hasUi = false;
 
     // ============================================================
     // MANUAL ADD PROTECTION (R-6.5+)
-    //
-    // True if the user added this module manually via the Add
-    // Module dialog. The scanner's automatic purge pass skips any
-    // module with this flag set — the user's explicit intent takes
-    // precedence over the apkExists / packageInstalled checks.
-    //
-    // This matters because a manually-added module often has a
-    // package name that doesn't resolve through PackageManager:
-    // modules that hook by targeting another app's package rather
-    // than shipping their own.
-    //
-    // Auto-detected modules leave this false and are still subject
-    // to the purge pass if their APK disappears.
     // ============================================================
     public boolean manuallyAdded = false;
+
+    // ============================================================
+    // XPOSED API VERSION (LSPosed-style)
+    //
+    // apiVersion       — the module's declared xposedminversion
+    //                    (from AndroidManifest meta-data, or
+    //                    minApiVersion in META-INF/xposed/module.prop).
+    // targetApiVersion — the module's declared target API, if any.
+    //
+    // -1 means "not declared / unknown." The row and detail sheet
+    // hide the badge when -1.
+    //
+    // Values above 100 (ShizuPosed's supported ceiling) render as
+    // "API N (unsupported)" so the user can see at a glance why a
+    // module refuses to activate.
+    // ============================================================
+    public int apiVersion = -1;
+    public int targetApiVersion = -1;
+    public int xposedMinVersion = -1;
+
+    /** Ceiling of what ShizuPosed's Xposed API shim advertises. */
+    public static final int SHIZUPOSED_API_MAX = 100;
 
     public ModuleInfo() {
         this.enabled = true;
@@ -88,6 +77,9 @@ public class ModuleInfo implements Serializable {
         this.hasUi = false;
         this.recommendedApps = new HashSet<>();
         this.manuallyAdded = false;
+        this.apiVersion = -1;
+        this.targetApiVersion = -1;
+        this.xposedMinVersion = -1;
     }
 
     public ModuleInfo(String packageName, String name) {
@@ -161,6 +153,30 @@ public class ModuleInfo implements Serializable {
         return recommendedApps != null && !recommendedApps.isEmpty();
     }
 
+    // ============================================================
+    // API VERSION HELPERS
+    // ============================================================
+
+    /**
+     * The most specific declared API version, in priority order:
+     *   1. apiVersion (manifest meta-data: xposedminversion)
+     *   2. xposedMinVersion (module.prop: minApiVersion)
+     *   3. targetApiVersion (manifest meta-data: xposedtargetversion)
+     *
+     * Returns -1 if nothing was declared.
+     */
+    public int getDisplayApiVersion() {
+        if (apiVersion > 0) return apiVersion;
+        if (xposedMinVersion > 0) return xposedMinVersion;
+        if (targetApiVersion > 0) return targetApiVersion;
+        return -1;
+    }
+
+    /** True if we have any API version to show. */
+    public boolean hasApiVersion() {
+        return getDisplayApiVersion() > 0;
+    }
+
     @Override
     public String toString() {
         return "ModuleInfo{" +
@@ -175,6 +191,8 @@ public class ModuleInfo implements Serializable {
                 ", hasXposedInit=" + hasXposedInit +
                 ", hasUi=" + hasUi +
                 ", manuallyAdded=" + manuallyAdded +
+                ", apiVersion=" + apiVersion +
+                ", targetApiVersion=" + targetApiVersion +
                 '}';
     }
 }
