@@ -10,13 +10,18 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 
 #define LOG_TAG "XStealthBridge"
 #define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define ALOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+
+#define BRIDGE_VERSION "0.5.0"
 
 /* ─────────────────────────────────────────────────────────────
  * Globals
@@ -33,6 +38,11 @@ static char *(*real_getenv)(const char *)                        = NULL;
 static int  (*real_closedir)(DIR *)                              = NULL;
 static ssize_t (*real_read)(int, void *, size_t)                 = NULL;
 
+/* Optional export from libxstealth.so — if available, use its
+ * path classifier instead of the local is_hidden_string. */
+typedef int (*xstealth_path_is_blocked_fn)(const char *);
+static xstealth_path_is_blocked_fn p_xstealth_path_is_blocked = NULL;
+
 static pthread_mutex_t g_bridge_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define MAX_TRACKED 32
@@ -42,7 +52,7 @@ enum {
     TRACKED_KIND_NONE = 0,
     TRACKED_KIND_FD   = 1,
     TRACKED_KIND_TASK = 2,
-    TRACKED_KIND_PROC = 3,
+    /* TRACKED_KIND_PROC removed — see comment below. */
 };
 
 typedef struct {
@@ -56,28 +66,20 @@ static int32_t g_tracked_count = 0;
 
 static volatile int g_proc_pid_reads_blocked = 0;
 static volatile int g_proc_entries_skipped = 0;
+static volatile int g_getppid_intercepted = 0;
 
-/* Forward declaration: used in read() below, defined after. */
 static int fd_is_proc_pid_file(int fd, char *pidbuf, size_t pidbufsize);
 
 static ssize_t raw_read(int fd, void *buf, size_t count) {
-    if (real_read == NULL) {
-        real_read = (ssize_t (*)(int, void *, size_t))
-            dlsym(RTLD_NEXT, "read");
-    }
-    if (real_read != NULL) {
-        return real_read(fd, buf, count);
-    }
     return (ssize_t) syscall(SYS_read, fd, buf, count);
 }
 
+static ssize_t raw_readlinkat(int dirfd, const char *path,
+                              char *buf, size_t len) {
+    return (ssize_t) syscall(SYS_readlinkat, dirfd, path, buf, len);
+}
+
 static int raw_open(const char *path, int flags) {
-    if (real_opendir == NULL) {
-        real_opendir = (DIR *(*)(const char *)) dlsym(RTLD_NEXT, "opendir");
-    }
-    /* Use the raw syscall — the libc open() may be interposed by
-     * libxstealth.so, which is fine, but we want a deterministic
-     * path here. */
     return (int) syscall(SYS_openat, AT_FDCWD, path, flags, 0);
 }
 
@@ -90,11 +92,20 @@ static char g_hidden_package[128] = {0};
 static int is_hidden_string(const char *s) {
     if (s == NULL) return 0;
 
+    /* Prefer libxstealth.so's classifier if it's loaded — one
+     * source of truth for what counts as hidden. */
+    if (p_xstealth_path_is_blocked != NULL) {
+        return p_xstealth_path_is_blocked(s);
+    }
+
+    /* Fallback: local list, kept in sync with libxstealth.so's
+     * HIDDEN_STRINGS. */
     if (strstr(s, "syscall_cache")       != NULL) return 1;
     if (strstr(s, "shizuposed")          != NULL) return 1;
     if (strstr(s, "libshizuposed")       != NULL) return 1;
     if (strstr(s, "libamiru")            != NULL) return 1;
     if (strstr(s, "libxstealth")         != NULL) return 1;
+    if (strstr(s, "libsysku")            != NULL) return 1;
     if (strstr(s, "ShizuPosedXStealth")  != NULL) return 1;
     if (strstr(s, "XStealthNative")      != NULL) return 1;
     if (strstr(s, "XStealthNativeNext")  != NULL) return 1;
@@ -127,11 +138,7 @@ static int dl_iterate_wrapper(struct dl_phdr_info *info,
     if (cb == NULL) return 0;
 
     const char *name = info->dlpi_name;
-    if (name == NULL) {
-        return cb(info, size, st->user_data);
-    }
-
-    if (is_hidden_string(name)) {
+    if (name != NULL && is_hidden_string(name)) {
         ALOGI("dl_iterate_phdr: filtered %s", name);
         return 0;
     }
@@ -164,6 +171,20 @@ int dl_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *),
 
 /* ─────────────────────────────────────────────────────────────
  * opendir / readdir / closedir
+ *
+ * TRACKED_KIND_PROC removed.
+ *
+ * The bridge used to iterate /proc and read each pid's comm to
+ * hide processes whose comm matched a hidden pattern. That's
+ * both expensive (N readlink+open+read per directory scan) and
+ * wrong-headed: a target scanning /proc isn't looking for our
+ * process by comm — our process runs as the target UID, not as
+ * shell UID, and its comm is the target's name. Filtering /proc
+ * entries would hide the target's own siblings, which the
+ * target expects to see.
+ *
+ * The real leaks are /proc/self/fd (fd count and targets) and
+ * /proc/self/task (thread names). Those are the two we filter.
  * ───────────────────────────────────────────────────────────── */
 
 static int classify_dir(const char *path) {
@@ -172,18 +193,10 @@ static int classify_dir(const char *path) {
     if (strcmp(path, "/proc/self/fd")   == 0) return TRACKED_KIND_FD;
     if (strcmp(path, "/proc/self/task") == 0) return TRACKED_KIND_TASK;
 
-    if (strcmp(path, "/proc") == 0) return TRACKED_KIND_PROC;
-    if (strcmp(path, "/proc/") == 0) return TRACKED_KIND_PROC;
+    /* /proc/self/fd/ and /proc/self/task/ with trailing slash. */
+    if (strcmp(path, "/proc/self/fd/")   == 0) return TRACKED_KIND_FD;
+    if (strcmp(path, "/proc/self/task/") == 0) return TRACKED_KIND_TASK;
 
-    if (strncmp(path, "/proc/", 6) != 0) return TRACKED_KIND_NONE;
-    if (strncmp(path + 6, "self/", 5) != 0) return TRACKED_KIND_NONE;
-
-    if (path[11] == 'f' && path[12] == 'd' && path[13] == '\0') {
-        return TRACKED_KIND_FD;
-    }
-    if (strcmp(path + 11, "task") == 0) {
-        return TRACKED_KIND_TASK;
-    }
     return TRACKED_KIND_NONE;
 }
 
@@ -223,7 +236,7 @@ static int read_proc_comm(const char *pid, char *buf, size_t bufsize) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%s/comm", pid);
 
-    int fd = raw_open(path, O_RDONLY);
+    int fd = raw_open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
 
     memset(buf, 0, bufsize);
@@ -247,78 +260,60 @@ struct dirent *readdir(DIR *dirp) {
         }
     }
 
-    int kind = TRACKED_KIND_NONE;
-    if (dirp != NULL && g_bridge_active) {
-        pthread_mutex_lock(&g_bridge_lock);
-        for (int i = 0; i < g_tracked_count; i++) {
-            if (g_tracked[i].dir == dirp) {
-                kind = g_tracked[i].kind;
-                break;
+    /* Loop instead of recursing — a directory with many
+     * consecutive filtered entries would recurse deeply enough
+     * to matter on a tight stack. */
+    while (1) {
+        int kind = TRACKED_KIND_NONE;
+        if (dirp != NULL && g_bridge_active) {
+            pthread_mutex_lock(&g_bridge_lock);
+            for (int i = 0; i < g_tracked_count; i++) {
+                if (g_tracked[i].dir == dirp) {
+                    kind = g_tracked[i].kind;
+                    break;
+                }
             }
+            pthread_mutex_unlock(&g_bridge_lock);
         }
-        pthread_mutex_unlock(&g_bridge_lock);
-    }
 
-    struct dirent *e = real_readdir(dirp);
-    if (e == NULL) return NULL;
+        struct dirent *e = real_readdir(dirp);
+        if (e == NULL) return NULL;
 
-    if (kind == TRACKED_KIND_TASK) {
-        char commpath[64];
-        snprintf(commpath, sizeof(commpath),
-                 "/proc/self/task/%s/comm", e->d_name);
-        int fd = raw_open(commpath, O_RDONLY);
-        if (fd >= 0) {
-            char comm[64];
-            memset(comm, 0, sizeof(comm));
-            ssize_t n = raw_read(fd, comm, sizeof(comm) - 1);
-            raw_close(fd);
-            if (n >= 1 && is_hidden_string(comm)) {
-                ALOGI("readdir task: filtered %s (%s)",
-                      e->d_name, comm);
-                return readdir(dirp);
+        if (kind == TRACKED_KIND_TASK) {
+            char commpath[64];
+            snprintf(commpath, sizeof(commpath),
+                     "/proc/self/task/%s/comm", e->d_name);
+            int fd = raw_open(commpath, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) {
+                char comm[64];
+                memset(comm, 0, sizeof(comm));
+                ssize_t n = raw_read(fd, comm, sizeof(comm) - 1);
+                raw_close(fd);
+                if (n >= 1 && is_hidden_string(comm)) {
+                    ALOGI("readdir task: filtered %s (%s)",
+                          e->d_name, comm);
+                    continue;
+                }
             }
-        }
-    } else if (kind == TRACKED_KIND_FD) {
-        char linkpath[64];
-        snprintf(linkpath, sizeof(linkpath),
-                 "/proc/self/fd/%s", e->d_name);
-        if (real_readlink != NULL) {
+        } else if (kind == TRACKED_KIND_FD) {
+            char linkpath[64];
+            snprintf(linkpath, sizeof(linkpath),
+                     "/proc/self/fd/%s", e->d_name);
             char target[512];
-            ssize_t n = real_readlink(linkpath, target, 0x1ff);
+            ssize_t n = raw_readlinkat(AT_FDCWD, linkpath,
+                                        target, sizeof(target) - 1);
             if (n >= 1) {
                 target[n] = '\0';
                 if (is_hidden_string(target)) {
                     ALOGI("readdir fd: filtered %s -> %s",
                           e->d_name, target);
-                    return readdir(dirp);
+                    continue;
                 }
             }
         }
-    } else if (kind == TRACKED_KIND_PROC) {
-        if (e->d_name[0] == '.' &&
-            (e->d_name[1] == '\0' ||
-             (e->d_name[1] == '.' && e->d_name[2] == '\0'))) {
-            return e;
-        }
 
-        int all_digits = 1;
-        for (const char *p = e->d_name; *p; p++) {
-            if (*p < '0' || *p > '9') { all_digits = 0; break; }
-        }
-        if (!all_digits) return e;
-
-        char comm[64];
-        if (read_proc_comm(e->d_name, comm, sizeof(comm)) == 0) {
-            if (is_hidden_string(comm)) {
-                __sync_fetch_and_add(&g_proc_entries_skipped, 1);
-                ALOGI("readdir /proc: filtered pid %s (%s)",
-                      e->d_name, comm);
-                return readdir(dirp);
-            }
-        }
+        return e;
     }
-
-    return e;
 }
 
 int closedir(DIR *dirp) {
@@ -382,12 +377,11 @@ ssize_t readlink(const char *path, char *buf, size_t bufsize) {
 
 static int fd_is_proc_pid_file(int fd, char *pidbuf, size_t pidbufsize) {
     if (fd < 0 || pidbuf == NULL || pidbufsize < 2) return 0;
-    if (real_readlink == NULL) return 0;
 
     char fd_path[64];
     snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
     char target[512] = {0};
-    ssize_t n = real_readlink(fd_path, target, sizeof(target) - 1);
+    ssize_t n = raw_readlinkat(AT_FDCWD, fd_path, target, sizeof(target) - 1);
     if (n <= 0) return 0;
     target[n] = '\0';
 
@@ -448,6 +442,18 @@ ssize_t read(int fd, void *buf, size_t count) {
 }
 
 /* ─────────────────────────────────────────────────────────────
+ * getppid — via SYS_getppid
+ * ───────────────────────────────────────────────────────────── */
+
+pid_t getppid(void) {
+    if (!g_bridge_active) {
+        return (pid_t) syscall(SYS_getppid);
+    }
+    __sync_fetch_and_add(&g_getppid_intercepted, 1);
+    return 1;
+}
+
+/* ─────────────────────────────────────────────────────────────
  * getenv
  * ───────────────────────────────────────────────────────────── */
 
@@ -458,7 +464,9 @@ char *getenv(const char *name) {
     }
 
     if (name != NULL && g_bridge_active) {
-        if (strncmp(name, "shizuposed.", 11) == 0) {
+        /* Case-insensitive substring match — catches
+         * "shizuposed.", "SHIZUPOSED_", "x.shizuposed.y" etc. */
+        if (strcasestr(name, "shizuposed") != NULL) {
             return NULL;
         }
     }
@@ -492,6 +500,10 @@ Java_com_shizuposed_manager_stealth_XStealthBridge_nativeInit(JNIEnv *env,
     real_read         = (ssize_t (*)(int, void *, size_t))
                         dlsym(RTLD_NEXT, "read");
 
+    /* Optional: libxstealth.so's path classifier. */
+    p_xstealth_path_is_blocked = (xstealth_path_is_blocked_fn)
+        dlsym(RTLD_DEFAULT, "xstealth_path_is_blocked");
+
     int resolved = 0;
     if (real_dl_iterate_phdr) resolved++;
     if (real_opendir)         resolved++;
@@ -501,7 +513,10 @@ Java_com_shizuposed_manager_stealth_XStealthBridge_nativeInit(JNIEnv *env,
     if (real_getenv)          resolved++;
     if (real_read)            resolved++;
 
-    ALOGI("XStealthBridge: initialized (%d/7 symbols resolved)", resolved);
+    ALOGI("XStealthBridge: initialized (%d/7 symbols resolved, "
+          "path_classifier=%s)",
+          resolved,
+          p_xstealth_path_is_blocked ? "libxstealth" : "local");
     return resolved == 7 ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -544,10 +559,12 @@ Java_com_shizuposed_manager_stealth_XStealthBridge_nativeDescribe(
     char buf[384];
     snprintf(buf, sizeof(buf),
              "libxstealth_bridge %s active=%d tracked_dirs=%d "
-             "procPidReadsBlocked=%d procEntriesSkipped=%d",
-             "0.4.0", g_bridge_active, g_tracked_count,
+             "procPidReadsBlocked=%d getppidIntercepted=%d "
+             "path_classifier=%s",
+             BRIDGE_VERSION, g_bridge_active, g_tracked_count,
              g_proc_pid_reads_blocked,
-             g_proc_entries_skipped);
+             g_getppid_intercepted,
+             p_xstealth_path_is_blocked ? "libxstealth" : "local");
     return (*env)->NewStringUTF(env, buf);
 }
 
@@ -562,6 +579,7 @@ Java_com_shizuposed_manager_stealth_XStealthBridge_nativeGetCoverage(
     if (real_getenv) bits |= 4;
     if (real_readlink) bits |= 8;
     if (real_read) bits |= 16;
+    if (p_xstealth_path_is_blocked) bits |= 32;
     return bits;
 }
 
@@ -573,17 +591,17 @@ Java_com_shizuposed_manager_stealth_XStealthBridge_nativeGetProcPidReadsBlockedC
 }
 
 JNIEXPORT jint JNICALL
-Java_com_shizuposed_manager_stealth_XStealthBridge_nativeGetProcEntriesSkippedCount(
+Java_com_shizuposed_manager_stealth_XStealthBridge_nativeGetGetppidInterceptedCount(
         JNIEnv *env, jclass clazz) {
     (void) env; (void) clazz;
-    return g_proc_entries_skipped;
+    return g_getppid_intercepted;
 }
 
 JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void) vm; (void) reserved;
 
-    ALOGI("JNI_OnLoad: libxstealth_bridge %s", "0.4.0");
+    ALOGI("JNI_OnLoad: libxstealth_bridge %s", BRIDGE_VERSION);
 
     void *libandroid = dlopen("libandroid.so", RTLD_NOW);
     if (libandroid != NULL) {
