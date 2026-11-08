@@ -9,16 +9,48 @@
 
   "developer_message": "Built for people who can't root or won't. If a module doesn't work, check the compatibility notes on XDA before reporting it as broken — many modules need system_server or zygote coverage, and that's a structural limit, not a bug.",
 
-  "version_name": "1.2.6",
-  "version_code": 5430,
-  "min_sdk": 29,
+  "version_name": "1.3.9",
+  "version_code": 5670,
+  "min_sdk": 28,
   "target_sdk": 37,
   "license": "Apache-2.0",
   "requires_shizuku": true,
   "open_source": true,
 
   "repo_url": "https://github.com/Sharif-bot-cmd/ShizuPosed",
-  "download_url": "https://github.com/Sharif-bot-cmd/ShizuPosed/releases/latest/download/app-release.apk",
+
+  "download_url": "https://github.com/Sharif-bot-cmd/ShizuPosed/releases/latest/download/app-standard-release.apk",
+  "download_url_standard": "https://github.com/Sharif-bot-cmd/ShizuPosed/releases/latest/download/app-standard-release.apk",
+  "download_url_stealth": "https://github.com/Sharif-bot-cmd/ShizuPosed/releases/latest/download/app-stealth-release.apk",
+
+  "build_variants": [
+    {
+      "id": "standard",
+      "name": "Standard",
+      "description": "Normal build. Package name com.shizuposed.manager. Updates like any other app.",
+      "package_name": "com.shizuposed.manager",
+      "download_url": "https://github.com/Sharif-bot-cmd/ShizuPosed/releases/latest/download/app-standard-release.apk",
+      "recommended": true
+    },
+    {
+      "id": "stealth",
+      "name": "Stealth",
+      "description": "Separate build with a scrambled package name. Launcher label is 'Sync Service'. Cannot update the standard build; switching between them requires uninstalling one and installing the other.",
+      "package_name": "com.shizuposed.manager.stealth",
+      "download_url": "https://github.com/Sharif-bot-cmd/ShizuPosed/releases/latest/download/app-stealth-release.apk",
+      "recommended": false
+    }
+  ],
+
+  "modules": [
+    {
+      "id": "sysku-adb",
+      "name": "Sysku ADB Module",
+      "description": "Optional ADB-side helper for Sysku, the syscall-level interposer. Provides the heartbeat loop and service.sh that let libsysku.so run in full mode. Install only if you have enabled Sysku in the manager and the manager reports 'Enabled (module not running)'.",
+      "download_url": "https://github.com/Sharif-bot-cmd/ShizuPosed/releases/latest/download/Sysku-universal-adb-modules.zip",
+      "optional": true
+    }
+  ],
 
   "tags": [
     "xposed",

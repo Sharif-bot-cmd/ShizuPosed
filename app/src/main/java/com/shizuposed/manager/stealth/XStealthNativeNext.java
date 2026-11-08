@@ -41,9 +41,17 @@ public final class XStealthNativeNext {
     // LOAD / ACTIVATE
     // ═════════════════════════════════════════════════════════════
 
+    /**
+     * Load libxstealth_next.so from libDir.
+     *
+     * sLoaded is set only AFTER System.load() succeeds, so a
+     * transient failure (file not yet deployed, wrong path on
+     * first launch, race with ensurePayloadReady) doesn't
+     * permanently poison the field for the rest of the process.
+     * A later call to load() will retry.
+     */
     public static synchronized boolean load(String libDir) {
         if (sLoaded) return sAvailable;
-        sLoaded = true;
 
         if (libDir == null || libDir.isEmpty()) {
             Log.w(TAG, "load: no lib dir provided");
@@ -52,12 +60,13 @@ public final class XStealthNativeNext {
 
         try {
             System.load(libDir + "/libxstealth_next.so");
+            sLoaded = true;
             sAvailable = nativeInit();
             Log.i(TAG, "libxstealth_next.so loaded, available=" + sAvailable);
         } catch (Throwable t) {
             sAvailable = false;
             Log.w(TAG, "libxstealth_next.so not loaded: " + t.getMessage());
-            return sAvailable;
+            return false;
         }
 
         // Tell the native side which package prefix to trust. Must
@@ -124,11 +133,32 @@ public final class XStealthNativeNext {
         return sAvailable;
     }
 
+    /**
+     * Set the Next engine active or inactive.
+     *
+     * nativeSetActive(true) triggers install_all_patches() on the
+     * C side. If every strategy declined, the flag is set but no
+     * patches landed — isActive() would return true even though
+     * the engine is inert. This method logs the honest state by
+     * checking isEffectivelyActive() and the patch counter, so a
+     * reader of the log knows whether patches actually applied.
+     */
     public static void setActive(boolean active) {
         if (!sAvailable) return;
         try {
             nativeSetActive(active);
-            Log.i(TAG, "Next hiding active=" + active);
+
+            if (!active) {
+                Log.i(TAG, "Next hiding active=false");
+            } else if (isEffectivelyActive()) {
+                Log.i(TAG, "Next hiding active=true ("
+                    + getPatchCount() + " patches via "
+                    + getStrategy() + ")");
+            } else {
+                Log.w(TAG, "Next hiding active=true but NO PATCHES "
+                    + "APPLIED (strategy=" + getStrategy()
+                    + ") — engine is loaded but ineffective");
+            }
         } catch (Throwable t) {
             Log.w(TAG, "setActive failed: " + t.getMessage());
         }
@@ -198,6 +228,45 @@ public final class XStealthNativeNext {
         catch (Throwable t) { return 0; }
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // PER-SYSCALL COUNTERS
+    // ═════════════════════════════════════════════════════════════
+    //
+    // These are safe wrappers around the JNI counters. Calling the
+    // native methods directly from outside the class throws
+    // UnsatisfiedLinkError when the library isn't loaded. The
+    // wrappers return 0 in that case.
+
+    public static int getOpenat2InterceptedCount() {
+        if (!sAvailable) return 0;
+        try { return nativeGetOpenat2InterceptedCount(); }
+        catch (Throwable t) { return 0; }
+    }
+
+    public static int getIoctlInterceptedCount() {
+        if (!sAvailable) return 0;
+        try { return nativeGetIoctlInterceptedCount(); }
+        catch (Throwable t) { return 0; }
+    }
+
+    public static int getStatxInterceptedCount() {
+        if (!sAvailable) return 0;
+        try { return nativeGetStatxInterceptedCount(); }
+        catch (Throwable t) { return 0; }
+    }
+
+    public static int getFaccessat2InterceptedCount() {
+        if (!sAvailable) return 0;
+        try { return nativeGetFaccessat2InterceptedCount(); }
+        catch (Throwable t) { return 0; }
+    }
+
+    public static int getFchmodat2InterceptedCount() {
+        if (!sAvailable) return 0;
+        try { return nativeGetFchmodat2InterceptedCount(); }
+        catch (Throwable t) { return 0; }
+    }
+
     public static int getGetppidInterceptedCount() {
         if (!sAvailable) return 0;
         try { return nativeGetGetppidInterceptedCount(); }
@@ -222,10 +291,11 @@ public final class XStealthNativeNext {
     private static native int     nativeGetMmapInterceptedCount();
     private static native String  nativeGetMmapGuardInfo();
     private static native int     nativeGetPread64InterceptedCount();
-    public  static native int     nativeGetOpenat2InterceptedCount();
-    public  static native int     nativeGetIoctlInterceptedCount();
-    public  static native int     nativeGetStatxInterceptedCount();
-    public  static native int     nativeGetFaccessat2InterceptedCount();
-    public  static native int     nativeGetFchmodat2InterceptedCount();
-    public  static native int     nativeGetGetppidInterceptedCount();
+
+    private static native int     nativeGetOpenat2InterceptedCount();
+    private static native int     nativeGetIoctlInterceptedCount();
+    private static native int     nativeGetStatxInterceptedCount();
+    private static native int     nativeGetFaccessat2InterceptedCount();
+    private static native int     nativeGetFchmodat2InterceptedCount();
+    private static native int     nativeGetGetppidInterceptedCount();
 }

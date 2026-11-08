@@ -17,6 +17,20 @@ import de.robv.android.xposed.XC_MethodHook;
  * HookDispatcher
  *
  * Sits between XposedHookBridge and the actual hook backends.
+ *
+ * ENABLE / DISABLE
+ * ----------------
+ * A backend can be present but disabled. Disabled backends are
+ * skipped during dispatch — they still occupy their slot in the
+ * ordering, so re-enabling one doesn't change which backend wins
+ * a tie. This is how Sysku is shipped: the .so is present, the
+ * user hasn't turned it on, so dispatch behaves exactly as if
+ * Sysku weren't there.
+ *
+ * The enable state is exposed via setBackendEnabled(name, on)
+ * and isBackendEnabled(name). Both are safe to call before
+ * initialize() — the flag is stored on the Backend entry, not
+ * on the chosen primary.
  */
 public final class HookDispatcher {
 
@@ -53,10 +67,14 @@ public final class HookDispatcher {
         public final AtomicInteger ctorDeclined  = new AtomicInteger();
         public final AtomicInteger ctorFailed    = new AtomicInteger();
 
+        /** Skipped because the backend was disabled by the user. */
+        public final AtomicInteger skippedDisabled = new AtomicInteger();
+
         @Override public String toString() {
             return "installed=" + installed.get()
                     + " declined=" + declined.get()
                     + " failed=" + failed.get()
+                    + " skipped(disabled)=" + skippedDisabled.get()
                     + " | ctor installed=" + ctorInstalled.get()
                     + " declined=" + ctorDeclined.get()
                     + " failed=" + ctorFailed.get();
@@ -65,6 +83,15 @@ public final class HookDispatcher {
 
     private final List<Backend> backends = new CopyOnWriteArrayList<>();
     private final ConcurrentHashMap<Backend, BackendStats> stats =
+            new ConcurrentHashMap<>();
+
+    /**
+     * Per-backend enable state. Key is backend.name(), value is
+     * whether it's enabled. A backend with no entry defaults to
+     * enabled — this preserves existing behavior for every backend
+     * that doesn't opt into the Sysku pattern.
+     */
+    private final ConcurrentHashMap<String, Boolean> enabledByName =
             new ConcurrentHashMap<>();
 
     private volatile Backend primary;
@@ -100,6 +127,36 @@ public final class HookDispatcher {
     }
 
     // ─────────────────────────────────────────────────────────────
+    // ENABLE / DISABLE
+    // ─────────────────────────────────────────────────────────────
+
+    /**
+     * Enable or disable a backend by name. Disabled backends are
+     * skipped during dispatch. The slot is preserved, so
+     * re-enabling a backend restores its original priority.
+     *
+     * Safe to call before initialize() and from any thread.
+     */
+    public void setBackendEnabled(String name, boolean enabled) {
+        if (name == null || name.isEmpty()) return;
+        enabledByName.put(name, enabled);
+        log("Backend " + name + " "
+                + (enabled ? "enabled" : "disabled") + " by user");
+    }
+
+    /** True if this backend is enabled (default: true). */
+    public boolean isBackendEnabled(String name) {
+        if (name == null) return true;
+        Boolean v = enabledByName.get(name);
+        return v == null || v;
+    }
+
+    /** Convenience for callers that hold a Backend reference. */
+    public boolean isBackendEnabled(Backend b) {
+        return b == null || isBackendEnabled(b.name());
+    }
+
+    // ─────────────────────────────────────────────────────────────
     // REGISTRATION
     // ─────────────────────────────────────────────────────────────
 
@@ -112,12 +169,13 @@ public final class HookDispatcher {
         }
         backends.add(backend);
         stats.put(backend, new BackendStats());
-        log("Registered backend: " + backend.name());
+        log("Registered backend: " + backend.name()
+                + (isBackendEnabled(backend.name()) ? "" : " (disabled)"));
     }
 
     /**
-     * Called once after all backends have been registered. Picks the
-     * first one that reports itself available.
+     * Called once after all backends have been registered. Picks
+     * the first enabled backend that reports itself available.
      */
     public synchronized void initialize() {
         if (initialized) return;
@@ -129,6 +187,10 @@ public final class HookDispatcher {
         }
 
         for (Backend b : backends) {
+            if (!isBackendEnabled(b)) {
+                log("Backend skipped (disabled): " + b.name());
+                continue;
+            }
             try {
                 if (b.isAvailable()) {
                     primary = b;
@@ -157,7 +219,7 @@ public final class HookDispatcher {
         ensureInitialized();
 
         Backend p = primary;
-        if (p != null && backends.indexOf(p) != 0) {
+        if (p != null && backends.indexOf(p) != 0 && isBackendEnabled(p)) {
             if (tryHook(p, original, callback, true)) return true;
         }
 
@@ -166,7 +228,7 @@ public final class HookDispatcher {
             if (tryHook(b, original, callback, false)) return true;
         }
 
-        if (p != null && backends.indexOf(p) == 0) {
+        if (p != null && backends.indexOf(p) == 0 && isBackendEnabled(p)) {
             if (tryHook(p, original, callback, true)) return true;
         }
 
@@ -183,7 +245,7 @@ public final class HookDispatcher {
         ensureInitialized();
 
         Backend p = primary;
-        if (p != null && backends.indexOf(p) != 0) {
+        if (p != null && backends.indexOf(p) != 0 && isBackendEnabled(p)) {
             if (tryCtorHook(p, original, callback, true)) return true;
         }
 
@@ -192,7 +254,7 @@ public final class HookDispatcher {
             if (tryCtorHook(b, original, callback, false)) return true;
         }
 
-        if (p != null && backends.indexOf(p) == 0) {
+        if (p != null && backends.indexOf(p) == 0 && isBackendEnabled(p)) {
             if (tryCtorHook(p, original, callback, true)) return true;
         }
 
@@ -208,6 +270,12 @@ public final class HookDispatcher {
     private boolean tryHook(Backend b, Method original,
                             XC_MethodHook callback, boolean isPrimary) {
         BackendStats s = stats.get(b);
+
+        if (!isBackendEnabled(b)) {
+            if (s != null) s.skippedDisabled.incrementAndGet();
+            return false;
+        }
+
         try {
             if (b.hook(original, callback)) {
                 if (s != null) s.installed.incrementAndGet();
@@ -240,6 +308,12 @@ public final class HookDispatcher {
     private boolean tryCtorHook(Backend b, Constructor<?> original,
                                 XC_MethodHook callback, boolean isPrimary) {
         BackendStats s = stats.get(b);
+
+        if (!isBackendEnabled(b)) {
+            if (s != null) s.skippedDisabled.incrementAndGet();
+            return false;
+        }
+
         try {
             if (b.hookConstructor(original, callback)) {
                 if (s != null) s.ctorInstalled.incrementAndGet();
@@ -286,7 +360,9 @@ public final class HookDispatcher {
           .append("):");
         for (Backend b : backends) {
             BackendStats s = stats.get(b);
-            sb.append("\n  ").append(b.name()).append(": ");
+            sb.append("\n  ").append(b.name())
+              .append(isBackendEnabled(b) ? "" : " [disabled]")
+              .append(": ");
             sb.append(s == null ? "(no stats)" : s.toString());
         }
         return sb.toString();

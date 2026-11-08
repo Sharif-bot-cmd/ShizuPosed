@@ -1,44 +1,3 @@
-/*
- * libxstealth.c — v0.17.0
- *
- * Primary XStealth library. Provides:
- *   • File path blocking (settings XML, sysfs USB state, persistent props)
- *   • /proc path scrubbing (maps, smaps, status, cmdline, /proc/net)
- *   • Netlink enumeration filtering (hides tunnel interfaces)
- *   • ioctl interposition on blocked FDs
- *   • dlsym / ptrace / pread / sysprop / getppid interposition
- *   • Unsafe gate (neutralizes sun.misc.Unsafe)
- *   • libart backup (in-memory copy for pread redirection)
- *   • Stub template capture and verification (Phase 2b hardened)
- *
- * v0.17.0 changes (Phase 2b hardening):
- *   • verify_prologue now extracts every save offset into
- *     reg_save_off[8] (indexed by saved register number), not just
- *     the receiver's. The backends use these to regenerate the
- *     restore sequence at the same offsets the prologue wrote.
- *   • The verified window is now up to 6 words (24 bytes) when
- *     word 5 is a continuation of the save sequence. This covers
- *     prologues that spill x30 as the 6th instruction rather than
- *     the 3rd or 4th.
- *   • prologue_info grew reg_save_off[8] and save_x30_at. Layout
- *     change: backends must be recompiled against this version.
- *   • New xstealth_get_template_info_full returns both the
- *     extracted offsets and a per-register bitmask of which
- *     registers were seen, so the backend can refuse a template
- *     that doesn't cover every register the stub needs to restore.
- *
- * v0.16.0 changes (carried forward):
- *   • capture_stub_template runs the prologue verifier on the
- *     captured bytes. Only verified templates are exposed.
- *   • New xstealth_get_template_info getter.
- *   • StubProbe probe0/probe1 for the interpreter shape.
- *
- * Build:
- *   clang -shared -fPIC -O2 -Wall -Wextra \
- *       -o libxstealth.so libxstealth.c \
- *       -llog -ldl -lpthread
- */
-
 #define _GNU_SOURCE
 
 #include <jni.h>
@@ -74,7 +33,7 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-#define XSTEALTH_VERSION "0.17.0"
+#define XSTEALTH_VERSION "0.18.1"
 
 #define STUB_TEMPLATE_MAX 64
 #define STUB_TEMPLATE_VERIFIED_MAX 32
@@ -473,6 +432,12 @@ static const char *BLOCKED_PATHS[] = {
     NULL
 };
 
+static const char PLAUSIBLE_COMM[]   = "app_process64";
+static const char PLAUSIBLE_EXE[]    = "/system/bin/app_process64";
+static const char PLAUSIBLE_PARENT[] = "zygote64";
+static const char PLAUSIBLE_CMDLINE[] =
+    "com.android.commands.am.Am\0";
+
 enum scrub_mode {
     SCRUB_LINE = 0,
     SCRUB_ENVIRON,
@@ -592,6 +557,9 @@ static const char *TRUSTED_PREFIXES[] = {
 
 static char g_runtime_trusted_prefix[128] = {0};
 
+static __thread char t_cached_comm[64];
+static __thread int  t_comm_checked = 0;
+
 static volatile int g_xstealth_active = 0;
 static volatile int g_resolved = 0;
 static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -632,6 +600,7 @@ static int (*real_getsockname)(int, struct sockaddr *, socklen_t *) = NULL;
 
 static volatile int g_key_symbols_resolved = 0;
 static volatile int g_symbols_resolved = 0;
+static void *resolve_real_dlsym(void);
 
 static volatile int g_unsafe_gate_installed = 0;
 static volatile int g_unsafe_gate_field_neutralized = 0;
@@ -667,32 +636,44 @@ static bool is_trusted_caller(void) {
     jint rc = (*g_vm)->GetEnv(g_vm, (void **) &env, JNI_VERSION_1_6);
     if (rc != JNI_OK || env == NULL) return true;
 
-    char comm_path[64];
-    snprintf(comm_path, sizeof(comm_path),
-             "/proc/self/task/%d/comm", (int) gettid());
+    if (!t_comm_checked) {
+        t_comm_checked = 1;
+        t_cached_comm[0] = '\0';
 
-    int fd = open(comm_path, O_RDONLY);
-    if (fd < 0) return true;
+        char comm_path[64];
+        snprintf(comm_path, sizeof(comm_path),
+                 "/proc/self/task/%d/comm",
+                 (int) syscall(SYS_gettid));
 
-    char comm[64] = {0};
-    ssize_t n = read(fd, comm, sizeof(comm) - 1);
-    close(fd);
-
-    if (n <= 0) return true;
-
-    for (ssize_t i = 0; i < n; i++) {
-        if (comm[i] == '\n') { comm[i] = '\0'; break; }
+        long fd = syscall(SYS_openat, AT_FDCWD, comm_path,
+                          O_RDONLY | O_CLOEXEC, 0);
+        if (fd >= 0) {
+            ssize_t n = (ssize_t) syscall(SYS_read, fd, t_cached_comm,
+                                          sizeof(t_cached_comm) - 1);
+            syscall(SYS_close, fd);
+            if (n > 0) {
+                t_cached_comm[n] = '\0';
+                for (ssize_t i = 0; i < n; i++) {
+                    if (t_cached_comm[i] == '\n') {
+                        t_cached_comm[i] = '\0';
+                        break;
+                    }
+                }
+            }
+        }
     }
+
+    if (t_cached_comm[0] == '\0') return true;
 
     for (int i = 0; TRUSTED_PREFIXES[i]; i++) {
-        if (strstr(comm, TRUSTED_PREFIXES[i]) != NULL) return true;
+        if (strstr(t_cached_comm, TRUSTED_PREFIXES[i]) != NULL) return true;
     }
     if (g_runtime_trusted_prefix[0] != '\0'
-            && strstr(comm, g_runtime_trusted_prefix) != NULL) {
+            && strstr(t_cached_comm, g_runtime_trusted_prefix) != NULL) {
         return true;
     }
-    if (strstr(comm, "ShizuPosed") != NULL) return true;
-    if (strstr(comm, "Xposed") != NULL) return true;
+    if (strstr(t_cached_comm, "ShizuPosed") != NULL) return true;
+    if (strstr(t_cached_comm, "Xposed") != NULL) return true;
 
     return false;
 }
@@ -728,16 +709,31 @@ static void capture_libart_backup(void) {
     strncpy(g_libart_path, path, sizeof(g_libart_path) - 1);
     g_libart_path[sizeof(g_libart_path) - 1] = '\0';
 
-    int src_fd = open(path, O_RDONLY | O_CLOEXEC);
+    int src_fd = (int) syscall(SYS_openat, AT_FDCWD, path,
+                               O_RDONLY | O_CLOEXEC, 0);
     if (src_fd < 0) {
         LOGW("libart backup: open(%s) failed: %s", path, strerror(errno));
         return;
     }
 
+    /* fstat via raw syscall. AT_EMPTY_PATH lets us stat an fd
+     * without going back through path resolution. Fall back to
+     * a plain fd-based syscall where AT_EMPTY_PATH isn't exposed. */
     struct stat st;
-    if (fstat(src_fd, &st) != 0 || st.st_size <= 0) {
-        LOGW("libart backup: fstat failed");
-        close(src_fd);
+    memset(&st, 0, sizeof(st));
+#ifdef SYS_newfstatat
+    long frc = syscall(SYS_newfstatat, src_fd, "", &st, AT_EMPTY_PATH);
+#elif defined(SYS_fstatat)
+    long frc = syscall(SYS_fstatat, src_fd, "", &st, AT_EMPTY_PATH);
+#elif defined(SYS_fstat)
+    long frc = syscall(SYS_fstat, src_fd, &st);
+#else
+    long frc = -1;
+    errno = ENOSYS;
+#endif
+    if (frc != 0 || st.st_size <= 0) {
+        LOGW("libart backup: fstat failed: %s", strerror(errno));
+        syscall(SYS_close, src_fd);
         return;
     }
 
@@ -748,29 +744,31 @@ static void capture_libart_backup(void) {
     if (memfd < 0) {
         char tmp_path[128];
         snprintf(tmp_path, sizeof(tmp_path),
-                 "/data/local/tmp/.xstealth_libart_%d", getpid());
-        memfd = open(tmp_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                 "/data/local/tmp/.xstealth_libart_%d", (int) syscall(SYS_getpid));
+        memfd = (int) syscall(SYS_openat, AT_FDCWD, tmp_path,
+                              O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
         if (memfd >= 0) {
-            unlink(tmp_path);
+            syscall(SYS_unlinkat, AT_FDCWD, tmp_path, 0);
         }
     }
     if (memfd < 0) {
         LOGW("libart backup: could not create backup fd");
-        close(src_fd);
+        syscall(SYS_close, src_fd);
         return;
     }
 
     char buf[65536];
     ssize_t n;
     off_t total = 0;
-    while ((n = read(src_fd, buf, sizeof(buf))) > 0) {
+    while ((n = (ssize_t) syscall(SYS_read, src_fd, buf, sizeof(buf))) > 0) {
         ssize_t written = 0;
         while (written < n) {
-            ssize_t w = write(memfd, buf + written, n - written);
+            ssize_t w = (ssize_t) syscall(SYS_write, memfd,
+                                          buf + written, n - written);
             if (w <= 0) {
-                LOGW("libart backup: write failed");
-                close(memfd);
-                close(src_fd);
+                LOGW("libart backup: write failed: %s", strerror(errno));
+                syscall(SYS_close, memfd);
+                syscall(SYS_close, src_fd);
                 return;
             }
             written += w;
@@ -778,11 +776,11 @@ static void capture_libart_backup(void) {
         total += n;
     }
 
-    close(src_fd);
+    syscall(SYS_close, src_fd);
 
     if (n < 0 || total <= 0) {
         LOGW("libart backup: copy failed");
-        close(memfd);
+        syscall(SYS_close, memfd);
         return;
     }
 
@@ -1262,21 +1260,44 @@ static void scrub_buffer_maps(char *buf, ssize_t n) {
             const char *q = p;
             const char *line_end = p + linelen;
             int field = 0;
+            const char *inode_start = NULL;
             const char *path_start = NULL;
+
             while (q < line_end && field < 6) {
                 while (q < line_end && (*q == ' ' || *q == '\t')) q++;
                 if (q >= line_end) break;
-                if (field == 5) {
+
+                if (field == 4) {
+                    inode_start = q;
+                    while (q < line_end && *q != ' ' && *q != '\t' &&
+                           *q != '\n') q++;
+                } else if (field == 5) {
                     const char *r = q;
                     while (r < line_end && (*r == ' ' || *r == '\t')) r++;
                     if (r < line_end && *r == '/') path_start = r;
                     break;
+                } else {
+                    while (q < line_end && *q != ' ' && *q != '\t' &&
+                           *q != '\n') q++;
                 }
-                while (q < line_end && *q != ' ' && *q != '\t' &&
-                       *q != '\n') q++;
                 field++;
             }
 
+            /* Rewrite inode → "0" padded to original width. */
+            if (inode_start != NULL) {
+                const char *ie = inode_start;
+                while (ie < line_end && *ie != ' ' && *ie != '\t' &&
+                       *ie != '\n') ie++;
+                size_t inode_len = (size_t)(ie - inode_start);
+                if (inode_len > 0) {
+                    ((char *) inode_start)[0] = '0';
+                    for (size_t i = 1; i < inode_len; i++) {
+                        ((char *) inode_start)[i] = ' ';
+                    }
+                }
+            }
+
+            /* Rewrite path → "/dev/zero" padded to original width. */
             if (path_start != NULL) {
                 size_t path_len = nl ? (size_t)(nl - path_start)
                                      : (size_t)(line_end - path_start);
@@ -1443,41 +1464,24 @@ static void scrub_buffer_cmdline(char *buf, ssize_t n) {
     }
 
     size_t first_len = (size_t)(first_nul - buf);
-    bool first_hidden = false;
-    for (int i = 0; HIDDEN_STRINGS[i]; i++) {
-        if (memmem(buf, first_len, HIDDEN_STRINGS[i],
-                   strlen(HIDDEN_STRINGS[i]))) {
-            first_hidden = true;
-            break;
-        }
-    }
-    if (first_hidden) {
-        memset(buf, ' ', first_len);
-        *first_nul = '\0';
-    }
+    size_t repl_len  = sizeof(PLAUSIBLE_CMDLINE) - 1;
 
+    /* Rewrite the first slot. */
+    if (first_len >= repl_len) {
+        memcpy(buf, PLAUSIBLE_CMDLINE, repl_len);
+        memset(buf + repl_len, ' ', first_len - repl_len);
+    } else {
+        memcpy(buf, PLAUSIBLE_CMDLINE, first_len);
+    }
+    *first_nul = '\0';
+
+    /* Blank the remaining argv slots. */
     char *p = first_nul + 1;
     char *end = buf + n;
     while (p < end) {
         char *next_nul = memchr(p, '\0', end - p);
         size_t len = next_nul ? (size_t)(next_nul - p) : (size_t)(end - p);
-        bool hidden = false;
-        for (int i = 0; HIDDEN_STRINGS[i]; i++) {
-            if (memmem(p, len, HIDDEN_STRINGS[i],
-                       strlen(HIDDEN_STRINGS[i]))) {
-                hidden = true;
-                break;
-            }
-        }
-        if (!hidden) {
-            if ((len >= 2 && memcmp(p, "-D", 2) == 0) ||
-                (len >= 2 && memcmp(p, "-X", 2) == 0)) {
-                hidden = true;
-            }
-        }
-        if (hidden) {
-            memset(p, ' ', len);
-        }
+        if (len > 0) memset(p, 0, len);
         if (!next_nul) break;
         p = next_nul + 1;
     }
@@ -1490,15 +1494,78 @@ static void scrub_ppid_line(char *buf, ssize_t n) {
         char *nl = memchr(p, '\n', end - p);
         size_t linelen = nl ? (size_t)(nl - p) + 1 : (size_t)(end - p);
 
-        if (linelen >= 5 && memcmp(p, "PPid:", 5) == 0) {
-            memset(p, ' ', linelen);
-            memcpy(p, "PPid:\t1", 7);
+        /* Name: <comm>  — rewrite the value, keep "Name:\t". */
+        if (linelen >= 6 && memcmp(p, "Name:\t", 6) == 0) {
+            char *val = p + 6;
+            char *val_end = nl ? nl : p + linelen;
+            size_t val_len = (size_t)(val_end - val);
+            size_t repl_len = sizeof(PLAUSIBLE_COMM) - 1;
+            if (val_len >= repl_len) {
+                memcpy(val, PLAUSIBLE_COMM, repl_len);
+                memset(val + repl_len, ' ', val_len - repl_len);
+            } else {
+                memcpy(val, PLAUSIBLE_COMM, val_len);
+            }
+            if (nl) *nl = '\n';
+        }
+
+        /* PPid:\t<ppid>  — rewrite to 1, keep "PPid:\t". */
+        if (linelen >= 6 && memcmp(p, "PPid:\t", 6) == 0) {
+            char *val = p + 6;
+            char *val_end = nl ? nl : p + linelen;
+            size_t val_len = (size_t)(val_end - val);
+            if (val_len >= 1) {
+                val[0] = '1';
+                for (size_t i = 1; i < val_len; i++) val[i] = ' ';
+            }
             if (nl) *nl = '\n';
         }
 
         if (!nl) break;
         p = nl + 1;
     }
+}
+
+static void scrub_stat_ppid(char *buf, ssize_t n) {
+    if (n <= 0) return;
+
+    /* Field 1: pid — skip to first space. */
+    char *p = buf;
+    char *end = buf + n;
+    while (p < end && *p != ' ' && *p != '\n') p++;
+    if (p >= end || *p != ' ') return;
+    p++;
+
+    /* Field 2: comm — in parens. Substitute, don't blank. */
+    if (p >= end || *p != '(') return;
+    char *comm_start = p + 1;
+    char *close = memchr(p, ')', (size_t)(end - p));
+    if (close == NULL) return;
+    size_t comm_len = (size_t)(close - comm_start);
+    size_t repl_len = sizeof(PLAUSIBLE_COMM) - 1;
+    if (comm_len >= repl_len) {
+        memcpy(comm_start, PLAUSIBLE_COMM, repl_len);
+        memset(comm_start + repl_len, ' ', comm_len - repl_len);
+    } else {
+        memcpy(comm_start, PLAUSIBLE_COMM, comm_len);
+    }
+
+    p = close + 1;
+
+    /* Field 3: state — one char. */
+    if (p >= end || *p != ' ') return;
+    p++;
+    while (p < end && *p != ' ' && *p != '\n') p++;
+    if (p >= end || *p != ' ') return;
+    p++;
+
+    /* Field 4: ppid — rewrite to 1. */
+    char *ppid_start = p;
+    while (p < end && *p != ' ' && *p != '\n') p++;
+    size_t ppid_len = (size_t)(p - ppid_start);
+    if (ppid_len == 0) return;
+    ppid_start[0] = '1';
+    for (size_t i = 1; i < ppid_len; i++) ppid_start[i] = ' ';
 }
 
 static void scrub_buffer_stat(char *buf, ssize_t n) {
@@ -1913,40 +1980,130 @@ ssize_t readlink(const char *path, char *buf, size_t len) {
     if (!real_readlink) resolve_real_symbols();
     if (!real_readlink) { errno = ENOENT; return -1; }
 
-    if (g_xstealth_active && !is_trusted_caller()
-            && path != NULL
-            && strcmp(path, "/proc/self/fd/3") == 0) {
-        static const char k_fd3_answer[] = "socket:[12345]";
-        size_t n = sizeof(k_fd3_answer) - 1;
-        if (len < n) {
-            errno = ERANGE;
-            return -1;
-        }
-        memcpy(buf, k_fd3_answer, n);
-        return (ssize_t) n;
-    }
+    if (g_xstealth_active && path != NULL && !is_trusted_caller()) {
 
-    /* New: scrub readlink of another process's exe symlink if it
-     * points at a hidden path. */
-    if (g_xstealth_active && !is_trusted_caller()
-            && path != NULL
-            && strncmp(path, "/proc/", 6) == 0) {
-        const char *rest = path + 6;
-        if (*rest >= '0' && *rest <= '9') {
-            while (*rest >= '0' && *rest <= '9') rest++;
-            if (strcmp(rest, "/exe") == 0) {
-                ssize_t n = real_readlink(path, buf, len);
-                if (n > 0 && (size_t)n < len) {
-                    buf[n] = '\0';
-                    if (is_hidden_path(buf)) {
-                        static const char k_answer[] = "/system/bin/app_process64";
-                        size_t alen = sizeof(k_answer) - 1;
+        /* ── /proc/self/fd/3 ──────────────────────────────────
+         * Legacy shim: fd 3 is the Shizuku binder. Report it
+         * as a socket so a detector doesn't see a binder fd. */
+        if (strcmp(path, "/proc/self/fd/3") == 0) {
+            static const char k_fd3_answer[] = "socket:[12345]";
+            size_t n = sizeof(k_fd3_answer) - 1;
+            if (len < n) { errno = ERANGE; return -1; }
+            memcpy(buf, k_fd3_answer, n);
+            return (ssize_t) n;
+        }
+
+        /* ── /proc/self/exe ───────────────────────────────────
+         * The executable is app_process64. Report it explicitly
+         * rather than letting the target resolve the symlink
+         * against the dex path. */
+        if (strcmp(path, "/proc/self/exe") == 0) {
+            size_t alen = sizeof(PLAUSIBLE_EXE) - 1;
+            if (len < alen) { errno = ERANGE; return -1; }
+            memcpy(buf, PLAUSIBLE_EXE, alen);
+            return (ssize_t) alen;
+        }
+
+        /* ── /proc/self/task/<tid>/comm ───────────────────────
+         * Thread names. ThreadNameScrub (Java) renames
+         * ShizuPosed's own threads, but a detector that
+         * enumerates /proc/self/task sees the real names on
+         * this path. Substitute a plausible ART/app thread name
+         * for any thread whose name matches a framework pattern. */
+        if (strncmp(path, "/proc/self/task/", 16) == 0) {
+            const char *rest = path + 16;
+            if (*rest >= '0' && *rest <= '9') {
+                while (*rest >= '0' && *rest <= '9') rest++;
+                if (strcmp(rest, "/comm") == 0) {
+                    char real_comm[64];
+                    ssize_t n = real_readlink(path, real_comm,
+                                              sizeof(real_comm) - 1);
+                    if (n > 0) {
+                        real_comm[n] = '\0';
+                        for (int i = 0; HIDDEN_STRINGS[i]; i++) {
+                            if (strstr(real_comm, HIDDEN_STRINGS[i])
+                                    != NULL) {
+                                /* Plausible ART thread names. */
+                                static const char *const k_threads[] = {
+                                    "Signal Catcher",
+                                    "Jit thread pool",
+                                    "JDWP",
+                                    "ReferenceQueueDaemon",
+                                    "FinalizerDaemon",
+                                    "HeapTaskDaemon",
+                                    NULL
+                                };
+                                unsigned idx = (unsigned) (
+                                    (uintptr_t) rest % 6);
+                                const char *repl = k_threads[idx];
+                                size_t alen = strlen(repl);
+                                if (len < alen) {
+                                    errno = ERANGE;
+                                    return -1;
+                                }
+                                memcpy(buf, repl, alen);
+                                return (ssize_t) alen;
+                            }
+                        }
+                    }
+                    return real_readlink(path, buf, len);
+                }
+            }
+        }
+
+        /* ── /proc/<pid>/{comm,exe} ───────────────────────────
+         * Any numeric pid. For /comm, rewrite to a plausible
+         * parent name ONLY when the pid matches the scrubbed
+         * ppid (1). For /exe, rewrite to PLAUSIBLE_EXE if the
+         * target would otherwise see a hidden path. */
+        if (strncmp(path, "/proc/", 6) == 0) {
+            const char *num = path + 6;
+            if (*num >= '0' && *num <= '9') {
+                const char *slash = num;
+                while (*slash >= '0' && *slash <= '9') slash++;
+                size_t num_len = (size_t)(slash - num);
+
+                if (strcmp(slash, "/comm") == 0) {
+                    /* The scrubbed ppid is always 1 — see
+                     * scrub_ppid_line(). Match against "1", not
+                     * against the real parent pid. A detector
+                     * reading /proc/self/status sees PPid: 1, so
+                     * /proc/1/comm must say "zygote64" for the
+                     * picture to be consistent. */
+                    if (num_len == 1 && num[0] == '1') {
+                        size_t alen = sizeof(PLAUSIBLE_PARENT) - 1;
                         if (len < alen) { errno = ERANGE; return -1; }
-                        memcpy(buf, k_answer, alen);
+                        memcpy(buf, PLAUSIBLE_PARENT, alen);
                         return (ssize_t) alen;
                     }
+                    return real_readlink(path, buf, len);
                 }
-                return n;
+
+                if (strcmp(slash, "/exe") == 0) {
+                    ssize_t n = real_readlink(path, buf, len);
+                    if (n > 0) {
+                        /* is_hidden_path works on C strings; use
+                         * memmem on the returned length instead,
+                         * so we don't need to NUL-terminate and
+                         * risk a one-byte overflow when n==len. */
+                        for (int i = 0; HIDDEN_STRINGS[i]; i++) {
+                            if (memmem(buf, (size_t) n,
+                                       HIDDEN_STRINGS[i],
+                                       strlen(HIDDEN_STRINGS[i]))
+                                    != NULL) {
+                                size_t alen =
+                                    sizeof(PLAUSIBLE_EXE) - 1;
+                                if (len < alen) {
+                                    errno = ERANGE;
+                                    return -1;
+                                }
+                                memcpy(buf, PLAUSIBLE_EXE, alen);
+                                return (ssize_t) alen;
+                            }
+                        }
+                    }
+                    return n;
+                }
             }
         }
     }
@@ -2006,6 +2163,7 @@ ssize_t read(int fd, void *buf, size_t count) {
             break;
         case SCRUB_STAT:
             scrub_buffer_stat((char *)buf, n);
+            scrub_stat_ppid((char *)buf, n);
             break;
         case SCRUB_NET_UNIX:
             scrub_buffer_net_unix((char *)buf, n);
@@ -2052,11 +2210,50 @@ static bool fd_is_blocked_path(int fd) {
     return false;
 }
 
+/* ─────────────────────────────────────────────────────────────
+ * Cross-library exports
+ *
+ * libsysku.so resolves these to piggy-back on libxstealth's path
+ * classification and activation flag. They are the only public
+ * surface libxstealth exposes to a sibling library; everything
+ * else stays static.
+ *
+ * Added in libxstealth 0.18.0. libsysku.so refuses to activate
+ * its path-filtering arm if these are missing (fail-open).
+ * ───────────────────────────────────────────────────────────── */
+
+__attribute__((visibility("default")))
+int xstealth_path_is_blocked(const char *path) {
+    return is_blocked_path(path) ? 1 : 0;
+}
+
+__attribute__((visibility("default")))
+int xstealth_fd_resolves_to_hidden(int fd) {
+    return fd_is_blocked_path(fd) ? 1 : 0;
+}
+
+__attribute__((visibility("default")))
+int xstealth_is_active(void) {
+    return g_xstealth_active ? 1 : 0;
+}
+
+__attribute__((visibility("default")))
+void xstealth_set_active(int active) {
+    g_xstealth_active = active ? 1 : 0;
+    LOGI("XStealth native: active=%d (set externally)", g_xstealth_active);
+}
+
 __attribute__((overloadable))
 int ioctl(int fd, unsigned long request, ...) {
     if (real_ioctl == NULL) {
-        real_ioctl = (int (*)(int, unsigned long, ...))
-            dlsym(RTLD_NEXT, "ioctl");
+        if (real_dlsym == NULL) {
+            real_dlsym = (void *(*)(void *, const char *))
+                resolve_real_dlsym();
+        }
+        if (real_dlsym != NULL) {
+            real_ioctl = (int (*)(int, unsigned long, ...))
+                real_dlsym(RTLD_NEXT, "ioctl");
+        }
         if (real_ioctl == NULL) {
             errno = ENOSYS;
             return -1;
@@ -2093,8 +2290,14 @@ static bool fd_is_netlink(int fd) {
 
 ssize_t recvmsg(int fd, struct msghdr *msg, int flags) {
     if (real_recvmsg == NULL) {
-        real_recvmsg = (ssize_t (*)(int, struct msghdr *, int))
-            dlsym(RTLD_NEXT, "recvmsg");
+        if (real_dlsym == NULL) {
+            real_dlsym = (void *(*)(void *, const char *))
+                resolve_real_dlsym();
+        }
+        if (real_dlsym != NULL) {
+            real_recvmsg = (ssize_t (*)(int, struct msghdr *, int))
+                real_dlsym(RTLD_NEXT, "recvmsg");
+        }
         if (real_recvmsg == NULL) {
             errno = ENOSYS;
             return -1;
@@ -2182,8 +2385,14 @@ ssize_t recvmsg(int fd, struct msghdr *msg, int flags) {
 
 ssize_t sendmsg(int fd, const struct msghdr *msg, int flags) {
     if (real_sendmsg == NULL) {
-        real_sendmsg = (ssize_t (*)(int, const struct msghdr *, int))
-            dlsym(RTLD_NEXT, "sendmsg");
+        if (real_dlsym == NULL) {
+            real_dlsym = (void *(*)(void *, const char *))
+                resolve_real_dlsym();
+        }
+        if (real_dlsym != NULL) {
+            real_sendmsg = (ssize_t (*)(int, const struct msghdr *, int))
+                real_dlsym(RTLD_NEXT, "sendmsg");
+        }
         if (real_sendmsg == NULL) {
             errno = ENOSYS;
             return -1;
@@ -2194,8 +2403,15 @@ ssize_t sendmsg(int fd, const struct msghdr *msg, int flags) {
 
 int getsockname(int fd, struct sockaddr *addr, socklen_t *len) {
     if (real_getsockname == NULL) {
-        real_getsockname = (int (*)(int, struct sockaddr *, socklen_t *))
-            dlsym(RTLD_NEXT, "getsockname");
+        if (real_dlsym == NULL) {
+            real_dlsym = (void *(*)(void *, const char *))
+                resolve_real_dlsym();
+        }
+        if (real_dlsym != NULL) {
+            real_getsockname = (int (*)(int, struct sockaddr *,
+                                        socklen_t *))
+                real_dlsym(RTLD_NEXT, "getsockname");
+        }
         if (real_getsockname == NULL) { errno = ENOSYS; return -1; }
     }
 
@@ -2473,13 +2689,19 @@ int system(const char *cmd) {
 
 int __system_property_get(const char *name, char *value) {
     if (real_system_property_get == NULL) {
-        real_system_property_get =
-            (int (*)(const char *, char *))
-            dlsym(RTLD_NEXT, "__system_property_get");
-        if (real_system_property_get == NULL) {
+        if (real_dlsym == NULL) {
+            real_dlsym = (void *(*)(void *, const char *))
+                resolve_real_dlsym();
+        }
+        if (real_dlsym != NULL) {
             real_system_property_get =
                 (int (*)(const char *, char *))
-                dlsym(RTLD_DEFAULT, "__system_property_get");
+                real_dlsym(RTLD_NEXT, "__system_property_get");
+            if (real_system_property_get == NULL) {
+                real_system_property_get =
+                    (int (*)(const char *, char *))
+                    real_dlsym(RTLD_DEFAULT, "__system_property_get");
+            }
         }
     }
 
@@ -2512,9 +2734,17 @@ int __system_property_get(const char *name, char *value) {
 
 pid_t getppid(void) {
     if (real_getppid == NULL) {
-        real_getppid = (pid_t (*)(void)) dlsym(RTLD_NEXT, "getppid");
-        if (real_getppid == NULL) {
-            real_getppid = (pid_t (*)(void)) dlsym(RTLD_DEFAULT, "getppid");
+        if (real_dlsym == NULL) {
+            real_dlsym = (void *(*)(void *, const char *))
+                resolve_real_dlsym();
+        }
+        if (real_dlsym != NULL) {
+            real_getppid = (pid_t (*)(void))
+                real_dlsym(RTLD_NEXT, "getppid");
+            if (real_getppid == NULL) {
+                real_getppid = (pid_t (*)(void))
+                    real_dlsym(RTLD_DEFAULT, "getppid");
+            }
         }
     }
 
@@ -2590,6 +2820,10 @@ void *dlsym(void *handle, const char *symbol) {
     }
 
     if (!g_xstealth_active || symbol == NULL) {
+        return real_dlsym(handle, symbol);
+    }
+
+    if (handle == RTLD_NEXT) {
         return real_dlsym(handle, symbol);
     }
 
@@ -2888,6 +3122,12 @@ Java_com_shizuposed_manager_stealth_XStealthNative_nativeInit(
     return (g_key_symbols_resolved == 5) ? JNI_TRUE : JNI_FALSE;
 }
 
+JNIEXPORT void JNICALL
+Java_com_shizuposed_manager_stealth_XStealthNative_nativeSetActive(
+        JNIEnv *env, jclass clazz, jboolean active) {
+    (void) env; (void) clazz;
+    xstealth_set_active(active ? 1 : 0);
+}
 
 JNIEXPORT void JNICALL
 Java_com_shizuposed_manager_stealth_XStealthNative_nativeSetTrustedPackage(

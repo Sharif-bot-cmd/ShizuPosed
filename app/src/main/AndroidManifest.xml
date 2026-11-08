@@ -24,11 +24,40 @@
         android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
 
+    <!--
+        <queries> — package visibility (Android 11+).
+
+        The scope editors use two filters that query the
+        PackageManager:
+
+          • AppSelectionAdapter.isIdleUiLessSystemPackage()
+          • SmartForegroundScopeSheet.hasNoUiAndNoProcess()
+
+        Both call queryIntentActivities() with ACTION_MAIN +
+        CATEGORY_LAUNCHER to decide whether a package exposes a
+        user-facing UI. Without the intent entry below, that query
+        returns an empty list on Android 11+ for every package the
+        manager cannot see — which would make every package look
+        like "no UI" and cause the filters to drop far more than
+        intended.
+
+        The status-provider entry is the existing contract used by
+        XposedBridge.isModuleActive() from module UIs. The HOME
+        entry is defensive: a few OEM system panels expose a HOME
+        activity without a LAUNCHER activity, and the filter
+        should recognize them as having a UI.
+    -->
     <queries>
         <provider android:authorities="${statusAuthority}" />
+
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.HOME" />
         </intent>
     </queries>
 
