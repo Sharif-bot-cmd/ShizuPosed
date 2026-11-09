@@ -6,83 +6,13 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.util.Log;
 
-/**
- * LSPosed-compatible manager API shim.
- *
- * Modules written for LSPosed call these methods to discover which
- * framework they're running under and to query per-module state. By
- * providing the same class name and method signatures, ShizuPosed
- * makes those modules behave as if they were running under LSPosed.
- *
- * All answers are backed by ShizuPosed's ModuleStatusProvider. The
- * authority the provider is registered under is build-specific: the
- * standard build uses "com.shizuposed.manager.status", the stealth
- * build uses "com.<x>.<y>.status". The authority is read from the
- * "shizuposed.status.authority" system property at runtime, which
- * ShizuPosedService passes to every spawned app_process.
- *
- * Two distinct questions modules ask:
- *   • isModuleEnabled(pkg) — did the user turn this module on?
- *   • isModuleActive(pkg)  — has the module actually loaded into at
- *                            least one target process at least once?
- *
- * SEMANTICS UNDER LSPosed vs ShizuPosed
- * -------------------------------------
- * Under LSPosed, isModuleActive(pkg) often functions as "am I
- * loaded anywhere" because LSPosed injects into every process — the
- * module's own UI included. Modules that scope themselves to a
- * target app and then call isModuleActive(getPackageName()) see
- * true as soon as the framework has loaded them into any process.
- *
- * ShizuPosed's coverage is narrower. Only processes that ShizuPosed
- * bootstrapped have hooks, so the honest answer to "am I loaded
- * into target T" is false until the user has launched T under
- * ShizuPosed. That's correct for the question being asked, but it
- * breaks the LSPosed idiom.
- *
- * To bridge that gap without changing what isModuleActive(pkg)
- * means, ShizuPosed provides isModuleActiveAnywhere(pkg). That
- * answers the LSPosed-style question directly: true if the module
- * is listed in any marker, regardless of which target the marker
- * belongs to.
- *
- * A module UI that wants to show "Activated" under both frameworks
- * can check its own hook first (the pure self-hook pattern), then
- * fall back to isModuleActive(getPackageName()), then
- * isModuleActiveAnywhere(getPackageName()).
- *
- * NO-ARG OVERLOADS
- * ----------------
- * LSPosed declares isModuleActive() and isModuleEnabled() with no
- * arguments. Module UIs call these forms because they run in their
- * own process and mean "am I — this module — active?" ShizuPosed
- * cannot inject a "current module" flag into the module's process
- * the way a zygote-level framework can, so the calling package is
- * derived from the stack.
- *
- * CONTEXT RESOLUTION
- * ------------------
- * ActivityThread.currentApplication() reliably returns the
- * Application only on the main thread. Module UIs frequently call
- * isModuleActive() from background threads, WorkManager workers,
- * ContentProvider.onCreate, etc., where it can return null.
- *
- * This class therefore tries three sources in order:
- *   1. ActivityThread.currentApplication()
- *   2. ActivityThread.currentActivityThread().getSystemContext()
- *   3. A static fallback context registered via setFallbackContext()
- *
- * The static fallback is populated automatically by XposedBridge.log()
- * on first use, since log() runs in a context where the caller usually
- * has a valid Application.
- */
 public final class LSPosedManager {
 
     /** Framework name reported to modules. */
-    public static final String FRAMEWORK_NAME = "1.2.6";
+    public static final String FRAMEWORK_NAME = "1.4.3";
 
     /** Reported API version. Matches XposedBridge.XPOSED_BRIDGE_VERSION. */
-    public static final int API_VERSION = 100;
+    public static final int API_VERSION = 101;
 
     /**
      * Status provider authority for the running build.
@@ -149,7 +79,7 @@ public final class LSPosedManager {
     }
 
     public static String getVersionName() {
-        return "(5430)";
+        return "(5710)";
     }
 
     public static String getManagerPackageName() {
