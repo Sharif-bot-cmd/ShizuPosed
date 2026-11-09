@@ -1,8 +1,12 @@
 package com.shizuposed.manager.ui;
 
+import android.app.ActivityManager;
 import android.content.Context;
+import android.content.Intent;
+import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.graphics.drawable.Drawable;
 import android.os.Bundle;
 import android.os.Handler;
@@ -67,7 +71,7 @@ import java.util.concurrent.Executors;
  * ASYNC LOADING
  * -------------
  * getInstalledApplications + getApplicationLabel + getApplicationIcon
- * take 2–3 seconds on a device with 200+ packages. That work has to
+ * take 2-3 seconds on a device with 200+ packages. That work has to
  * happen off the UI thread, because otherwise the sheet doesn't
  * appear until it completes — the user sees a blank screen for a
  * couple of seconds before the picker opens.
@@ -86,12 +90,20 @@ import java.util.concurrent.Executors;
  *
  * FILTERED OUT
  * ------------
- *   • ShizuPosed's own package
+ *   • ShizuPosed's own package.
+ *
  *   • Packages with uid < 10000 — SYSTEM_UID (1000) and the
  *     reserved system UID pool (1001-1999). These are the packages
  *     the shell UID cannot setuid to, so a smart-foreground scope
  *     entry for them would never fire. System UI, Settings, Phone,
  *     Bluetooth, NFC, Shell, and system_server all live there.
+ *
+ *   • Packages with no user-facing UI AND no running process.
+ *     Some system packages (e.g. the 3-button navigation overlay)
+ *     expose neither a launcher activity nor a live process. They
+ *     cannot be scoped usefully — the smart-foreground monitor
+ *     would never see them come to the foreground. See
+ *     hasNoUiAndNoProcess().
  *
  * NOT FILTERED
  * ------------
@@ -99,6 +111,11 @@ import java.util.concurrent.Executors;
  *     app that the OEM assigned a dedicated uid is a normal
  *     userspace target from the shell's point of view. Those are
  *     still listed, marked with a "System" chip.
+ *
+ *   • Packages with no launcher activity but a live background
+ *     process (accessibility services, widgets, IMEs with no
+ *     launcher entry). The process probe says they are reachable,
+ *     so they stay listed.
  */
 public class SmartForegroundScopeSheet extends BottomSheetDialogFragment {
 
@@ -311,6 +328,14 @@ public class SmartForegroundScopeSheet extends BottomSheetDialogFragment {
 
         String self = appCtx.getPackageName();
 
+        // Snapshot the set of processes that are currently running.
+        // On Android 5+ this only reliably reports our own process
+        // and a small set of system ones, so we use it strictly as
+        // a POSITIVE "this package has a live process" signal. We
+        // never infer "not running" from absence alone; that would
+        // wrongly hide every third-party app.
+        Set<String> runningProcs = snapshotRunningProcessNames(appCtx);
+
         for (ApplicationInfo ai : apps) {
             if (ai == null || ai.packageName == null) continue;
             if (self.equals(ai.packageName)) continue;
@@ -332,6 +357,16 @@ public class SmartForegroundScopeSheet extends BottomSheetDialogFragment {
                         continue;
                     }
                 }
+            }
+
+            // Skip packages that expose neither a user-facing UI
+            // nor a running process. Those cannot be scoped
+            // usefully — the smart-foreground monitor would never
+            // observe them come to the foreground. Examples: the
+            // 3-button navigation overlay, some OEM telemetry
+            // stubs, hidden system helpers.
+            if (hasNoUiAndNoProcess(ai, pm, runningProcs)) {
+                continue;
             }
 
             CharSequence labelCs = pm.getApplicationLabel(ai);
@@ -359,6 +394,119 @@ public class SmartForegroundScopeSheet extends BottomSheetDialogFragment {
         Collections.sort(out, (a, b) -> col.compare(a.label, b.label));
 
         return out;
+    }
+
+    /**
+     * Return the set of process names that ActivityManager reports
+     * as running. Names include the package name for the default
+     * process, and "pkg:remote" for secondary processes.
+     *
+     * On Android 5+ this API only returns our own process and a
+     * small whitelist of system processes. That is fine for our
+     * use — we treat membership as "definitely running" and
+     * absence as "unknown," not "definitely not running."
+     */
+    private Set<String> snapshotRunningProcessNames(Context appCtx) {
+        Set<String> names = new HashSet<>();
+        try {
+            ActivityManager am = (ActivityManager)
+                appCtx.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) return names;
+            List<ActivityManager.RunningAppProcessInfo> procs =
+                am.getRunningAppProcesses();
+            if (procs == null) return names;
+            for (ActivityManager.RunningAppProcessInfo p : procs) {
+                if (p == null) continue;
+                if (p.processName != null) names.add(p.processName);
+                if (p.pkgList != null) {
+                    for (String pkg : p.pkgList) {
+                        if (pkg != null) names.add(pkg);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.d(TAG, "snapshotRunningProcessNames failed: "
+                + t.getMessage());
+        }
+        return names;
+    }
+
+    /**
+     * True if this package has no user-facing UI AND no process
+     * currently running. Such packages cannot be meaningfully
+     * scoped — the foreground monitor would never see them.
+     *
+     * "No UI" is decided by the same signal the launcher uses:
+     * the package has no activity matching
+     * ACTION_MAIN + CATEGORY_LAUNCHER. This is queried once per
+     * package, which is cheap (PackageManager caches the result).
+     *
+     * "No process running" is decided by the ActivityManager
+     * snapshot. Because that API is restricted on Android 5+, we
+     * only treat absence as meaningful when combined with "no UI"
+     * — a third-party app with no launcher activity but a live
+     * background process will be in runningProcs and will be
+     * kept. A system overlay with neither will be dropped.
+     *
+     * Fails open: any error (query returns null, throws, etc.)
+     * returns false, which keeps the package in the list. Better
+     * to offer a row the user can ignore than to hide an app that
+     * might actually be useful.
+     */
+    private boolean hasNoUiAndNoProcess(ApplicationInfo ai,
+                                        PackageManager pm,
+                                        Set<String> runningProcs) {
+        try {
+            boolean hasUi = hasLauncherActivity(ai.packageName, pm);
+            if (hasUi) return false;
+
+            // No launcher activity. Check whether any of the
+            // package's processes is in the running snapshot.
+            if (ai.processName != null
+                    && runningProcs.contains(ai.processName)) {
+                return false;
+            }
+            if (runningProcs.contains(ai.packageName)) {
+                return false;
+            }
+
+            // No UI and no observed process. Filter it out.
+            return true;
+        } catch (Throwable t) {
+            // Fail open: keep the package.
+            return false;
+        }
+    }
+
+    /**
+     * True if the package exposes at least one activity that a
+     * launcher would show: ACTION_MAIN + CATEGORY_LAUNCHER. This
+     * is the same signal the launcher uses, so it is the most
+     * reliable "has a user-facing UI" test available without
+     * extra permission.
+     */
+    private boolean hasLauncherActivity(String packageName,
+                                        PackageManager pm) {
+        try {
+            Intent intent = new Intent(Intent.ACTION_MAIN);
+            intent.addCategory(Intent.CATEGORY_LAUNCHER);
+            intent.setPackage(packageName);
+            List<ResolveInfo> ris = pm.queryIntentActivities(
+                intent, 0);
+            if (ris == null || ris.isEmpty()) return false;
+            for (ResolveInfo ri : ris) {
+                if (ri == null) continue;
+                ActivityInfo a = ri.activityInfo;
+                if (a == null) continue;
+                // Exported + has a real class name is the launcher
+                // contract. A non-exported activity can't be
+                // started by the launcher, so it doesn't count.
+                if (a.exported && a.name != null) return true;
+            }
+            return false;
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     private void rebuildFiltered(String query) {
