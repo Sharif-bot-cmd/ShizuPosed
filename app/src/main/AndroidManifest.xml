@@ -11,6 +11,15 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!--
+        Required so ShizuPosedManagerApp.promptForBatteryWhitelist()
+        can start Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS.
+        Without it, the intent throws SecurityException and the
+        prompt never appears.
+    -->
+    <uses-permission
+        android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
 
     <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
@@ -22,13 +31,59 @@
 
     <uses-permission
         android:name="android.permission.QUERY_ALL_PACKAGES"
-        tools:ignore="QueryAllPackagesPermission" />
+        tools:ignore="QueryAllPackagesPermissions" />
 
+    <!--
+        <queries> — package visibility (Android 11+).
+
+        Three groups of entries:
+
+        1. Shizuku packages. ShizuPosedManagerApp's
+           isShizukuManagerInstalled() calls
+           PackageManager.getPackageInfo() on both of these. On
+           Android 11+ that call returns NameNotFoundException
+           for any package the app can't see, so without these
+           entries the "Shizuku Manager not installed" log fires
+           even when Shizuku is running.
+
+        2. The status provider authority. Used by
+           XposedBridge.isModuleActive() from module UIs. The
+           ${statusAuthority} placeholder is rewritten by the
+           build to <package>.status, and again by the cloak
+           flow's byte patcher when the manager is rebuilt under
+           a new package name. A module that queries the provider
+           after a cloak needs the cloaked authority in its own
+           <queries> block — that's a module-side change, not
+           the manager's.
+
+        3. The scope editors. AppSelectionAdapter and
+           SmartForegroundScopeSheet both call
+           queryIntentActivities() with ACTION_MAIN +
+           CATEGORY_LAUNCHER (and CATEGORY_HOME, defensively) to
+           decide whether a package has a user-facing UI.
+           Without these intents, the query returns an empty
+           list on Android 11+ for every package the manager
+           cannot see — which would make every package look like
+           "no UI" and cause the filters to drop far more than
+           intended.
+    -->
     <queries>
+        <!-- Shizuku: standard and Next -->
+        <package android:name="moe.shizuku.privileged.api" />
+        <package android:name="moe.shizuku.manager" />
+
+        <!-- Status provider: rewritten by the cloak flow -->
         <provider android:authorities="${statusAuthority}" />
+
+        <!-- Scope editor UI detection -->
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.HOME" />
         </intent>
     </queries>
 
