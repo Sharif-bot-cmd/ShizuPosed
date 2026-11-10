@@ -1048,8 +1048,7 @@ ShizuPosed is built from sources in this repository. The APK is reproducible fro
     export ANDROID_HOME=$HOME/Android/Sdk
     git clone <repo>
     cd ShizuPosed
-    ./gradlew clean :app:assembleRelease
-    adb install -r app/build/outputs/apk/release/app-release.apk
+    gradle clean :app:assembleBothRelease
 
 ### The native libraries
 
@@ -1061,7 +1060,7 @@ The six native libraries (`libshizuposed.so`, `libamiru.so`, `libcallsite.so`, `
 
 The `app/build.gradle` includes seven verification tasks: `checkNativeShim` (required), `checkCallSite`, `checkAmiru`, `checkXStealth`, `checkXStealthNext`, `checkXStealthBridge`, `checkSysku` (all optional, warn-only). Skip all seven with:
 
-    ./gradlew assembleRelease -PskipNativeCheck=true
+    gradle assembleBothRelease -PskipNativeCheck=true
 
 ### Configuration cache
 
