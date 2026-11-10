@@ -25,10 +25,12 @@ import androidx.fragment.app.Fragment;
 import com.google.android.material.materialswitch.MaterialSwitch;
 import com.google.android.material.slider.Slider;
 import com.shizuposed.manager.R;
-import com.shizuposed.manager.ShizukuHelper;
 import com.shizuposed.manager.ShizuPosedManagerApp;
+import com.shizuposed.manager.ShizukuHelper;
+import com.shizuposed.manager.cloak.ManagerCloakFlow;
 import com.shizuposed.manager.receiver.BootReceiver;
 import com.shizuposed.manager.runtime.RuntimePrefs;
+import com.shizuposed.manager.runtime.SyskuController;
 import com.shizuposed.manager.service.ShizuPosedService;
 import com.shizuposed.manager.updates.UpdateChecker;
 import com.shizuposed.manager.utils.Logger;
@@ -44,6 +46,7 @@ import java.util.concurrent.Executors;
  *   • Runtime toggles (auto-start, debug, log-to-file)
  *   • Scan interval slider (ProcessMonitor refresh rate)
  *   • Hook delay slider (framework-to-bootstrap pause)
+ *   • Hide ShizuPosed app / Unhide ShizuPosed app
  *   • Maintenance actions (clear logs, clean all caches)
  *   • Check for updates (GitHub Releases)
  *   • Config export
@@ -51,53 +54,41 @@ import java.util.concurrent.Executors;
  * The XStealth master toggle lives in the XStealth detail sheet,
  * not here.
  *
- * SCAN INTERVAL / HOOK DELAY
- * --------------------------
- * Both are stored in RuntimePrefs and read at their point of use:
- *   • Scan interval: ProcessMonitor.startMonitoring()
- *   • Hook delay: XposedHook via -Dshizuposed.hook.delay
+ * SYSKU
+ * -----
+ * The Sysku row is a two-part UI:
  *
- * The scan interval takes effect on the next service start (it's
- * read when the scheduler is created). The hook delay takes effect
- * on the next app launch, because it's passed as a -D property to
- * app_process.
+ *   • A status line ("Sysku: Enabled / Disabled / Not installed /
+ *     Stale / Load failed") updated from SyskuController.getState().
+ *   • A toggle switch that drives SyskuController.setEnabled().
  *
- * MAINTENANCE ACTIONS
- * -------------------
- * Two actions are dispatched to ShizuPosedService via startForegroundService:
+ * Both the status and the toggle read from the same source of truth
+ * (SharedPreferences "sysku_enabled"), so a toggle from here is
+ * immediately reflected in the next status refresh. The heartbeat
+ * (which is a shell-side file) is read asynchronously and does not
+ * gate the toggle.
  *
- *   • ACTION_CLEAR_LOGS — removes launch.log and other shell-side
- *     logs. Manager's own log is cleared separately from the Logs
- *     tab.
+ * HIDE / UNHIDE
+ * -------------
+ * Both flows use the bundled APK from assets (stealth or
+ * standard) and read the target package name from that APK's
+ * manifest. There is no dialog for package-name or label
+ * input — the stealth package name and the "Sync Service" label
+ * are baked into the bundled APK by the build.
  *
- *   • ACTION_CLEAN_ALL — removes the deployed dex, native libs,
- *     module files, markers, and logs. Resets the service's deploy
- *     flags, so the next routed launch redeploys everything from
- *     scratch. This is the "nuclear option" for stale caches.
- *
- * Both actions report their outcome via ACTION_LAUNCH_RESULT with
- * the sentinel package name MAINTENANCE_RESULT_PKG ("__logs__").
- * The receiver in this fragment filters on that sentinel so
- * maintenance results don't collide with launch results.
- *
- * CHECK FOR UPDATES
- * -----------------
- * The button calls UpdateChecker.checkNowAsync(), which bypasses
- * the 12-hour throttle and posts a notification if a newer release
- * exists. The result is delivered via the same notification path
- * as the automatic check, so the user sees the same UI whether the
- * check was triggered manually or automatically.
- *
- * If the current version is already latest, the notification is
- * suppressed (UpdateChecker only notifies for a newer tag) and the
- * button shows a "you're up to date" toast instead.
+ * The confirm dialog explains what will happen and asks for
+ * confirmation. Progress is reported through the
+ * ManagerCloakFlow.ProgressListener, which this fragment
+ * translates into AlertDialog message updates.
  */
 public class SettingsFragment extends Fragment {
 
-    private MaterialSwitch swAutoStart, swDebugMode, swLogToFile;
+    private MaterialSwitch swAutoStart, swDebugMode, swLogToFile, swSyskuEnabled;
     private Slider sliderScanInterval, sliderHookDelay;
     private TextView tvScanIntervalValue, tvHookDelayValue;
+    private TextView tvSyskuStatus, tvSyskuHint;
     private Button btnClearLogs, btnCleanAll, btnExportConfig, btnCheckUpdates;
+    private Button btnHideShizuPosed, btnUnhideShizuPosed;
     private TextView tvVersion, tvShizukuStatus, tvServiceStatus;
 
     private Logger logger;
@@ -145,6 +136,22 @@ public class SettingsFragment extends Fragment {
                 Toast.LENGTH_SHORT).show();
         };
 
+    private final CompoundButton.OnCheckedChangeListener syskuToggleListener =
+        (buttonView, isChecked) -> {
+            if (!isAdded()) return;
+            SyskuController.setEnabled(requireContext(), isChecked);
+            if (logger != null) {
+                logger.i("Sysku " + (isChecked ? "enabled" : "disabled")
+                    + " by user");
+            }
+            Toast.makeText(requireContext(),
+                isChecked
+                    ? "Sysku enabled — takes effect on next launch"
+                    : "Sysku disabled",
+                Toast.LENGTH_SHORT).show();
+            refreshSyskuStatus();
+        };
+
     @Override
     public void onAttach(@NonNull Context context) {
         super.onAttach(context);
@@ -172,6 +179,7 @@ public class SettingsFragment extends Fragment {
         setupListeners();
         loadSettings();
         updateRealStatus();
+        refreshSyskuStatus();
         registerMaintenanceReceiver();
     }
 
@@ -181,6 +189,7 @@ public class SettingsFragment extends Fragment {
         if (logger == null) return;
         loadSettings();
         updateRealStatus();
+        refreshSyskuStatus();
     }
 
     @Override
@@ -191,14 +200,19 @@ public class SettingsFragment extends Fragment {
         swAutoStart = null;
         swDebugMode = null;
         swLogToFile = null;
+        swSyskuEnabled = null;
         sliderScanInterval = null;
         sliderHookDelay = null;
         tvScanIntervalValue = null;
         tvHookDelayValue = null;
+        tvSyskuStatus = null;
+        tvSyskuHint = null;
         btnClearLogs = null;
         btnCleanAll = null;
         btnExportConfig = null;
         btnCheckUpdates = null;
+        btnHideShizuPosed = null;
+        btnUnhideShizuPosed = null;
         tvVersion = null;
         tvShizukuStatus = null;
         tvServiceStatus = null;
@@ -212,22 +226,23 @@ public class SettingsFragment extends Fragment {
         swAutoStart = view.findViewById(R.id.swAutoStart);
         swDebugMode = view.findViewById(R.id.swDebugMode);
         swLogToFile = view.findViewById(R.id.swLogToFile);
+        swSyskuEnabled = view.findViewById(R.id.swSyskuEnabled);
         sliderScanInterval = view.findViewById(R.id.sliderScanInterval);
         sliderHookDelay = view.findViewById(R.id.sliderHookDelay);
         tvScanIntervalValue = view.findViewById(R.id.tvScanIntervalValue);
         tvHookDelayValue = view.findViewById(R.id.tvHookDelayValue);
+        tvSyskuStatus = view.findViewById(R.id.tvSyskuStatus);
+        tvSyskuHint = view.findViewById(R.id.tvSyskuHint);
         btnClearLogs = view.findViewById(R.id.btnClearLogs);
         btnCleanAll = view.findViewById(R.id.btnCleanAll);
         btnExportConfig = view.findViewById(R.id.btnExportConfig);
         btnCheckUpdates = view.findViewById(R.id.btnCheckUpdates);
+        btnHideShizuPosed = view.findViewById(R.id.btnHideShizuPosed);
+        btnUnhideShizuPosed = view.findViewById(R.id.btnUnhideShizuPosed);
         tvVersion = view.findViewById(R.id.tvVersion);
         tvShizukuStatus = view.findViewById(R.id.tvShizukuStatus);
         tvServiceStatus = view.findViewById(R.id.tvServiceStatus);
 
-        // Read the version from the installed package instead of
-        // hardcoding it. This is the same string UpdateChecker
-        // compares against the GitHub tag, so the footer and the
-        // check are always in sync.
         if (tvVersion != null) {
             try {
                 String v = requireContext().getPackageManager()
@@ -253,6 +268,12 @@ public class SettingsFragment extends Fragment {
         if (btnCheckUpdates != null) {
             btnCheckUpdates.setOnClickListener(v -> checkForUpdates());
         }
+        if (btnHideShizuPosed != null) {
+            btnHideShizuPosed.setOnClickListener(v -> showHideConfirm());
+        }
+        if (btnUnhideShizuPosed != null) {
+            btnUnhideShizuPosed.setOnClickListener(v -> confirmUncloak());
+        }
         if (swAutoStart != null) {
             swAutoStart.setOnCheckedChangeListener(autoStartListener);
         }
@@ -262,8 +283,10 @@ public class SettingsFragment extends Fragment {
         if (swLogToFile != null) {
             swLogToFile.setOnCheckedChangeListener(logToFileListener);
         }
+        if (swSyskuEnabled != null) {
+            swSyskuEnabled.setOnCheckedChangeListener(syskuToggleListener);
+        }
 
-        // ── Scan interval slider ──────────────────────────────────
         if (sliderScanInterval != null) {
             sliderScanInterval.addOnChangeListener((slider, value, fromUser) -> {
                 int ms = Math.round(value) * 1000;
@@ -276,7 +299,6 @@ public class SettingsFragment extends Fragment {
             });
         }
 
-        // ── Hook delay slider ─────────────────────────────────────
         if (sliderHookDelay != null) {
             sliderHookDelay.addOnChangeListener((slider, value, fromUser) -> {
                 int ms = Math.round(value);
@@ -291,23 +313,164 @@ public class SettingsFragment extends Fragment {
     }
 
     // ═════════════════════════════════════════════════════════════
+    // SYSKU
+    // ═════════════════════════════════════════════════════════════
+
+    private void refreshSyskuStatus() {
+        if (!isAdded() || !viewReady) return;
+
+        final Context appCtx = requireContext().getApplicationContext();
+
+        final boolean enabled = SyskuController.isEnabled(appCtx);
+        if (swSyskuEnabled != null) {
+            swSyskuEnabled.setOnCheckedChangeListener(null);
+            swSyskuEnabled.setChecked(enabled);
+            swSyskuEnabled.setOnCheckedChangeListener(syskuToggleListener);
+        }
+
+        if (tvSyskuHint != null) {
+            tvSyskuHint.setText(enabled
+                ? "Syscall-based hook backend. Takes effect on next launch."
+                : "Syscall-based hook backend. Off by default.");
+        }
+
+        executor.execute(() -> {
+            if (executor.isShutdown()) return;
+            final SyskuController.State st = SyskuController.getState(appCtx);
+            final String label = SyskuController.describe(st);
+            final int color = SyskuController.colorFor(st);
+
+            if (!isAdded() || !viewReady || tvSyskuStatus == null) return;
+            requireActivity().runOnUiThread(() -> {
+                if (tvSyskuStatus == null) return;
+                tvSyskuStatus.setText(label);
+                tvSyskuStatus.setTextColor(color);
+            });
+        });
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // HIDE / UNHIDE (cloak flow)
+    // ═════════════════════════════════════════════════════════════
+
+    private void showHideConfirm() {
+        if (!isAdded()) return;
+        new AlertDialog.Builder(requireContext())
+            .setTitle("Hide ShizuPosed app?")
+            .setMessage("This will install the bundled stealth APK as a "
+                + "new package, then uninstall this one.\n\n"
+                + "The launcher will show \"Sync Service\" instead of "
+                + "\"ShizuPosed Manager\".\n\n"
+                + "The stealth package name is bundled with this "
+                + "APK and is not user-selectable.")
+            .setPositiveButton("Hide", (d, w) -> runCloak())
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    private void runCloak() {
+        if (!isAdded()) return;
+        Context ctx = requireContext();
+
+        AlertDialog progress = new AlertDialog.Builder(ctx)
+            .setTitle("Hiding ShizuPosed")
+            .setMessage("Preparing…")
+            .setCancelable(false)
+            .create();
+        progress.show();
+
+        new Thread(() -> {
+            ManagerCloakFlow.hideShizuPosed(new ManagerCloakFlow.ProgressListener() {
+                @Override public void onMessage(String text) {
+                    if (!isAdded() || !viewReady) return;
+                    requireActivity().runOnUiThread(() -> {
+                        if (progress.isShowing()) progress.setMessage(text);
+                    });
+                }
+                @Override public void onSuccess(String newPkg) {
+                    if (!isAdded() || !viewReady) return;
+                    requireActivity().runOnUiThread(() -> {
+                        if (progress.isShowing()) progress.dismiss();
+                        Toast.makeText(ctx,
+                            "Installed as " + newPkg
+                                + ". The old package has been uninstalled.",
+                            Toast.LENGTH_LONG).show();
+                    });
+                }
+                @Override public void onError(String message) {
+                    if (!isAdded() || !viewReady) return;
+                    requireActivity().runOnUiThread(() -> {
+                        if (progress.isShowing()) progress.dismiss();
+                        new AlertDialog.Builder(ctx)
+                            .setTitle("Hide failed")
+                            .setMessage(message)
+                            .setPositiveButton("OK", null)
+                            .show();
+                    });
+                }
+            });
+        }, "ShizuPosed-cloak").start();
+    }
+
+    private void confirmUncloak() {
+        if (!isAdded()) return;
+        new AlertDialog.Builder(requireContext())
+            .setTitle("Unhide ShizuPosed app?")
+            .setMessage("This will install the bundled standard APK "
+                + "(com.shizuposed.manager) as a new package, then "
+                + "uninstall this one.")
+            .setPositiveButton("Unhide", (d, w) -> runRevert())
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    private void runRevert() {
+        if (!isAdded()) return;
+        Context ctx = requireContext();
+
+        AlertDialog progress = new AlertDialog.Builder(ctx)
+            .setTitle("Unhiding ShizuPosed")
+            .setMessage("Preparing…")
+            .setCancelable(false)
+            .create();
+        progress.show();
+
+        new Thread(() -> {
+            ManagerCloakFlow.unhideShizuPosed(new ManagerCloakFlow.ProgressListener() {
+                @Override public void onMessage(String text) {
+                    if (!isAdded() || !viewReady) return;
+                    requireActivity().runOnUiThread(() -> {
+                        if (progress.isShowing()) progress.setMessage(text);
+                    });
+                }
+                @Override public void onSuccess(String newPkg) {
+                    if (!isAdded() || !viewReady) return;
+                    requireActivity().runOnUiThread(() -> {
+                        if (progress.isShowing()) progress.dismiss();
+                        Toast.makeText(ctx,
+                            "Restored as " + newPkg,
+                            Toast.LENGTH_LONG).show();
+                    });
+                }
+                @Override public void onError(String message) {
+                    if (!isAdded() || !viewReady) return;
+                    requireActivity().runOnUiThread(() -> {
+                        if (progress.isShowing()) progress.dismiss();
+                        new AlertDialog.Builder(ctx)
+                            .setTitle("Unhide failed")
+                            .setMessage(message)
+                            .setPositiveButton("OK", null)
+                            .show();
+                    });
+                }
+            });
+        }, "ShizuPosed-uncloak").start();
+    }
+
+    // ═════════════════════════════════════════════════════════════
     // CHECK FOR UPDATES
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Manual update check. Bypasses the 12-hour throttle so the
-     * user gets an answer immediately.
-     *
-     * The check runs on a background thread (UpdateChecker handles
-     * that). If a newer version exists, the notification is posted
-     * as usual. If the current version is latest, the button shows
-     * a "you're up to date" toast instead of a notification.
-     *
-     * The "latest version" answer comes from UpdateChecker's
-     * internal state after the check completes, which is why the
-     * toast has to wait for the check. We do that by having
-     * UpdateChecker post a broadcast when it's done.
-     */
     private void checkForUpdates() {
         if (!isAdded()) return;
 
@@ -347,7 +510,6 @@ public class SettingsFragment extends Fragment {
     private void loadSettings() {
         if (prefs == null || !viewReady) return;
 
-        // Detach listeners first so setChecked doesn't fire them.
         if (swAutoStart != null) swAutoStart.setOnCheckedChangeListener(null);
         if (swDebugMode != null) swDebugMode.setOnCheckedChangeListener(null);
         if (swLogToFile != null) swLogToFile.setOnCheckedChangeListener(null);
@@ -362,7 +524,6 @@ public class SettingsFragment extends Fragment {
             swLogToFile.setChecked(prefs.getBoolean("log_to_file", true));
         }
 
-        // ── Sliders ───────────────────────────────────────────────
         if (sliderScanInterval != null) {
             int ms = RuntimePrefs.getScanIntervalMs(requireContext());
             sliderScanInterval.setValue(ms / 1000f);
@@ -378,7 +539,6 @@ public class SettingsFragment extends Fragment {
             }
         }
 
-        // Reattach listeners.
         if (swAutoStart != null) {
             swAutoStart.setOnCheckedChangeListener(autoStartListener);
         }
@@ -404,12 +564,6 @@ public class SettingsFragment extends Fragment {
     // MAINTENANCE ACTIONS
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Register a receiver for maintenance action results. The
-     * service broadcasts on ACTION_LAUNCH_RESULT with the sentinel
-     * package name MAINTENANCE_RESULT_PKG; anything else is a
-     * launch result and is ignored here.
-     */
     private void registerMaintenanceReceiver() {
         if (maintenanceReceiverRegistered) return;
         if (!isAdded() || getContext() == null) return;
@@ -500,11 +654,6 @@ public class SettingsFragment extends Fragment {
             .show();
     }
 
-    /**
-     * Dispatch a maintenance action to the service. The service
-     * must be running — the actions are handled in onStartCommand,
-     * which requires the service to be alive.
-     */
     private void dispatchMaintenance(String action) {
         if (!isAdded()) return;
         if (!ShizuPosedService.isServiceRunning()) {
@@ -681,6 +830,16 @@ public class SettingsFragment extends Fragment {
                   .append("\n");
             config.append("boot_receiver_enabled=")
                   .append(prefs.getBoolean("boot_receiver_enabled", false))
+                  .append("\n");
+
+            config.append("\n## Sysku\n");
+            config.append("sysku_enabled=")
+                  .append(SyskuController.isEnabled(requireContext()))
+                  .append("\n");
+            SyskuController.State st =
+                SyskuController.getState(requireContext());
+            config.append("sysku_state=")
+                  .append(SyskuController.describe(st))
                   .append("\n");
 
             config.append("\n## XStealth\n");

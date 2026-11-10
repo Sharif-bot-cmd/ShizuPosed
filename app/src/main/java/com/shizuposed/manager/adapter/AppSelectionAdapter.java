@@ -1,8 +1,12 @@
 package com.shizuposed.manager.adapter;
 
+import android.app.ActivityManager;
 import android.content.Context;
+import android.content.Intent;
+import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.graphics.drawable.Drawable;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -59,6 +63,37 @@ import java.util.Set;
  * reach: any package whose uid is below 10000 (SYSTEM_UID = 1000
  * and the reserved system UID pool 1001-1999), and the manager's
  * own package. See isSelectable().
+ *
+ * UI-LESS + IDLE SYSTEM PACKAGE FILTERING (1.3.6)
+ * -----------------------------------------------
+ * System packages that expose neither a launcher activity nor a
+ * live process are also filtered out. These cannot be meaningfully
+ * scoped: a module hooks a process, and the smart-foreground
+ * monitor watches a foreground activity. A package with neither
+ * has nothing to attach to.
+ *
+ * The filter applies to SYSTEM packages only. Third-party apps are
+ * always kept — the user installed them, and a module may legitimately
+ * scope a background service, widget, or IME that has no launcher
+ * activity. See hasNoUiAndNoProcess().
+ *
+ * Signals used (no extra permission, no Shizuku):
+ *   • "No UI"      — no activity matching ACTION_MAIN + CATEGORY_LAUNCHER.
+ *                    This is the same signal the launcher uses.
+ *   • "No process" — no process in ActivityManager.getRunningAppProcesses()
+ *                    matching ai.processName or ai.packageName.
+ *
+ * ActivityManager.getRunningAppProcesses() is restricted on Android 5+:
+ * it reliably reports only our own process plus a small whitelist of
+ * system processes. That makes it safe as a POSITIVE signal ("this
+ * package has a live process") but NOT as a negative one ("this
+ * package is not running"). The filter therefore only drops a
+ * package when BOTH signals agree it is dead — and even then only
+ * for system packages.
+ *
+ * Fails open: any error in the UI or process probe keeps the
+ * package listed. Better to show a row the user can ignore than to
+ * hide one they might need.
  */
 public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapter.AppViewHolder> {
 
@@ -93,14 +128,21 @@ public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapte
      * Recommended apps are sorted to the top.
      *
      * Packages the framework cannot reach (protected UIDs, the
-     * manager itself) are filtered out before the list is stored.
+     * manager itself) and UI-less idle system packages are filtered
+     * out before the list is stored.
      */
     public void setApps(List<ApplicationInfo> apps) {
+        // Snapshot the running-process set once per call rather than
+        // once per row. On a device with 200+ packages this is the
+        // difference between one ActivityManager query and 200.
+        Set<String> runningProcs = snapshotRunningProcessNames();
+
         List<ApplicationInfo> copy = new ArrayList<>();
         if (apps != null) {
             for (ApplicationInfo app : apps) {
                 if (app == null) continue;
                 if (!isSelectable(app)) continue;
+                if (isIdleUiLessSystemPackage(app, runningProcs)) continue;
                 copy.add(app);
             }
         }
@@ -160,6 +202,116 @@ public class AppSelectionAdapter extends RecyclerView.Adapter<AppSelectionAdapte
         return !(pkg.startsWith("android.")
                 || pkg.startsWith("com.android.")
                 || pkg.startsWith("com.google.android."));
+    }
+
+    /**
+     * True if this is a SYSTEM package that has no launcher activity
+     * AND no process currently running. These cannot be scoped
+     * usefully — the framework hooks processes, and the
+     * smart-foreground monitor watches foreground activities. A
+     * package with neither has nothing to attach to.
+     *
+     * Third-party apps are never filtered here, even when they have
+     * no launcher activity and no process. The user installed them,
+     * and a module may legitimately scope a background service,
+     * widget, or IME. See the class Javadoc.
+     *
+     * "No UI"      — no activity with ACTION_MAIN + CATEGORY_LAUNCHER.
+     * "No process" — no entry in getRunningAppProcesses() matching
+     *                ai.processName or ai.packageName.
+     *
+     * Fails open: any error keeps the package listed.
+     */
+    private boolean isIdleUiLessSystemPackage(ApplicationInfo app,
+                                              Set<String> runningProcs) {
+        try {
+            boolean isSystem = (app.flags & (ApplicationInfo.FLAG_SYSTEM
+                    | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) != 0;
+            if (!isSystem) return false;
+
+            if (hasLauncherActivity(app.packageName)) return false;
+
+            if (app.processName != null
+                    && runningProcs != null
+                    && runningProcs.contains(app.processName)) {
+                return false;
+            }
+            if (runningProcs != null
+                    && runningProcs.contains(app.packageName)) {
+                return false;
+            }
+
+            // System package, no UI, no observed process. Drop it.
+            return true;
+        } catch (Throwable t) {
+            // Fail open: keep the package.
+            return false;
+        }
+    }
+
+    /**
+     * True if the package exposes at least one activity a launcher
+     * would show: ACTION_MAIN + CATEGORY_LAUNCHER. Same signal the
+     * launcher uses, so it is the most reliable "has a user-facing
+     * UI" test available without extra permission.
+     */
+    private boolean hasLauncherActivity(String packageName) {
+        try {
+            Intent intent = new Intent(Intent.ACTION_MAIN);
+            intent.addCategory(Intent.CATEGORY_LAUNCHER);
+            intent.setPackage(packageName);
+            List<ResolveInfo> ris = packageManager.queryIntentActivities(
+                intent, 0);
+            if (ris == null || ris.isEmpty()) return false;
+            for (ResolveInfo ri : ris) {
+                if (ri == null) continue;
+                ActivityInfo a = ri.activityInfo;
+                if (a == null) continue;
+                // A non-exported activity cannot be started by the
+                // launcher, so it doesn't count.
+                if (a.exported && a.name != null) return true;
+            }
+            return false;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Snapshot the set of process names ActivityManager reports as
+     * running. Names include the package name for the default
+     * process, and "pkg:remote" for secondary processes.
+     *
+     * On Android 5+ this API only returns our own process and a
+     * small whitelist of system processes. That is fine here: we
+     * treat membership as "definitely running" and absence as
+     * "unknown," not "definitely not running."
+     */
+    private Set<String> snapshotRunningProcessNames() {
+        Set<String> names = new HashSet<>();
+        try {
+            ActivityManager am = (ActivityManager)
+                context.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) return names;
+            List<ActivityManager.RunningAppProcessInfo> procs =
+                am.getRunningAppProcesses();
+            if (procs == null) return names;
+            for (ActivityManager.RunningAppProcessInfo p : procs) {
+                if (p == null) continue;
+                if (p.processName != null) names.add(p.processName);
+                if (p.pkgList != null) {
+                    for (String pkg : p.pkgList) {
+                        if (pkg != null) names.add(pkg);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            // Fail open: an empty set just means no package is
+            // positively identified as running. The UI filter
+            // still requires "no launcher activity" before
+            // dropping anything, so the effect is bounded.
+        }
+        return names;
     }
 
     /** Seed the selection. Copies the incoming set. */
