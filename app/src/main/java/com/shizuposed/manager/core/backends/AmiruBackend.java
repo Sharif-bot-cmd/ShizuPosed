@@ -38,18 +38,43 @@ import de.robv.android.xposed.XC_MethodHook;
  * a single lock. The dispatcher resolves slots through
  * NativeBridge.amiruGetCallback / amiruGetMethod.
  *
- * CAPABILITIES (v0.3)
+ * CAPABILITIES (v0.5)
  * -------------------
- *   ✓ Static methods with primitive parameters
+ *   ✓ Static methods
+ *   ✓ Instance methods (thisObject populated from x0)
+ *   ✓ Primitive arguments (boxed by the C side)
+ *   ✓ Object arguments (handle passed through as-is)
  *   ✓ Primitive return-value replacement
+ *   ✓ Object return-value replacement (jobject handle in x0)
  *   ✓ Before-hooks
- *   ✗ Object arguments (arrive as null)
- *   ✗ thisObject for instance methods (arrives as null)
- *   ✗ After-hooks
- *   ✗ JIT invalidation
+ *   ✗ Constructors (stub shape assumes a method entry, not a
+ *     constructor entry; not supported)
+ *   ✗ After-hooks (the stub doesn't run an after-callback; the
+ *     framework's dispatch path is before-only)
+ *   ✗ JIT invalidation (deopt is implicit on entry patch, not a
+ *     separate API)
  *
  * The backend declines any method it cannot handle, so the
  * dispatcher falls through to the next backend.
+ *
+ * OBJECT ARGUMENTS
+ * ----------------
+ * The C side's box_arg() treats 'L' and '[' shorty characters as
+ * "this register value is a jobject handle, pass it through
+ * as-is" and everything else as "box the raw bits in the
+ * corresponding wrapper." The buildShorty() helper below must
+ * therefore emit 'L' for any non-primitive parameter and '[' for
+ * arrays. The previous primitive-only gate is gone.
+ *
+ * OBJECT RETURNS
+ * --------------
+ * For an object-return method, the value passed to
+ * NativeBridge.setAmiruResult is the jobject handle cast to long.
+ * The stub returns that value directly in x0, which is the
+ * correct register for an object return under the ARM64 ABI.
+ * AmiruDispatcher.jobjectHandle() is the token source; it is an
+ * ART-only heuristic (identity hash) and works for the vast
+ * majority of cases.
  */
 public final class AmiruBackend implements HookDispatcher.Backend {
 
@@ -88,13 +113,16 @@ public final class AmiruBackend implements HookDispatcher.Backend {
 
     @Override
     public boolean hook(Method original, XC_MethodHook callback) throws Throwable {
-        return tryHookStatic(original, callback);
+        return tryHook(original, callback);
     }
 
     @Override
     public boolean hookConstructor(Constructor<?> original,
                                    XC_MethodHook callback) throws Throwable {
-        // Constructors are not supported in v0.3.
+        // Constructors are not supported in v0.5: the stub shape
+        // assumes a method entry point, not a constructor entry
+        // point. The fallback chain will route constructor hooks
+        // to the next backend.
         return false;
     }
 
@@ -136,7 +164,9 @@ public final class AmiruBackend implements HookDispatcher.Backend {
                 return false;
             }
 
-            boolean ok = NativeBridge.amiruProbeLayout();
+            // Public wrapper: probeAmiruLayout() calls the
+            // JNI-native amiruProbeLayout() under the hood.
+            boolean ok = NativeBridge.probeAmiruLayout();
             if (!ok) {
                 sAvailable = false;
                 sStatus = "Amiru: layout probe failed";
@@ -144,7 +174,9 @@ public final class AmiruBackend implements HookDispatcher.Backend {
             }
 
             sAvailable = true;
-            sStatus = "Amiru: " + NativeBridge.amiruDescribeLayout();
+            // Public wrapper: describeAmiruLayout() calls the
+            // JNI-native amiruDescribeLayout().
+            sStatus = "Amiru: " + NativeBridge.describeAmiruLayout();
             Log.i(TAG, "probe: " + sStatus);
             return true;
 
@@ -160,23 +192,20 @@ public final class AmiruBackend implements HookDispatcher.Backend {
     // HOOK INSTALL
     // ═════════════════════════════════════════════════════════════
 
-    private static boolean tryHookStatic(Method method, XC_MethodHook callback) {
+    private static boolean tryHook(Method method, XC_MethodHook callback) {
         if (!probeOnce()) return false;
         if (method == null || callback == null) return false;
 
         Class<?>[] params = method.getParameterTypes();
-        if (!areParamsPrimitiveOnly(params)) {
-            Log.d(TAG, "skipping " + method + " — non-primitive parameter");
-            return false;
-        }
-
-        // Instance methods are not supported in v0.3 because
-        // thisObject arrives as null in the callback.
-        if (!Modifier.isStatic(method.getModifiers())) {
-            Log.d(TAG, "skipping instance method " + method
-                + " — thisObject not yet supported");
-            return false;
-        }
+        // Primitive-only gate removed: Amiru 0.5 handles object
+        // args via box_arg(). The only unsupported parameter shape
+        // would be something the C side can't classify, but every
+        // Java type maps to a shorty character, so the gate is
+        // gone. The buildShorty() helper emits '[' for arrays and
+        // 'L' for objects.
+        //
+        // The isStatic gate is also gone: thisObject is now
+        // populated from reg_frame[0] by amiru_dispatch().
 
         try {
             String shorty = buildShorty(params);
@@ -201,7 +230,7 @@ public final class AmiruBackend implements HookDispatcher.Backend {
             }
 
             Log.i(TAG, "installed hook on " + method + " (slot " + slot
-                + ", shorty " + shorty + ")");
+                + ", shorty " + shorty + ", static=" + isStatic + ")");
             return true;
 
         } catch (Throwable t) {
@@ -214,18 +243,24 @@ public final class AmiruBackend implements HookDispatcher.Backend {
     // HELPERS
     // ═════════════════════════════════════════════════════════════
 
-    private static boolean areParamsPrimitiveOnly(Class<?>[] params) {
-        for (Class<?> p : params) {
-            if (p == null) return false;
-            if (p.isPrimitive()) continue;
-            return false;
-        }
-        return true;
-    }
-
+    /**
+     * JNI shorty string, one character per parameter.
+     *
+     * Primitives map to their JNI shorty letter. Arrays map to '['.
+     * Everything else (classes, interfaces) maps to 'L'. The C
+     * side's box_arg() treats 'L' and '[' as "raw jobject handle"
+     * and the rest as "box the bits in the matching wrapper."
+     *
+     * The string is exactly method.getParameterTypes().length
+     * characters long. The C side reads it positionally.
+     */
     private static String buildShorty(Class<?>[] params) {
         StringBuilder sb = new StringBuilder(params.length);
         for (Class<?> p : params) {
+            if (p == null) {
+                sb.append('L');
+                continue;
+            }
             if (p == boolean.class)   sb.append('Z');
             else if (p == byte.class) sb.append('B');
             else if (p == char.class) sb.append('C');
@@ -234,6 +269,7 @@ public final class AmiruBackend implements HookDispatcher.Backend {
             else if (p == long.class) sb.append('J');
             else if (p == float.class) sb.append('F');
             else if (p == double.class) sb.append('D');
+            else if (p.isArray())     sb.append('[');
             else                      sb.append('L');
         }
         return sb.toString();

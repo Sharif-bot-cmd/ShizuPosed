@@ -2,21 +2,17 @@
 
 **An Xposed-compatible hook framework that doesn't need root — it runs on `app_process`.**
 
-ShizuPosed runs Xposed-API modules inside target apps without root. No bootloader unlock, no system partition changes. Shizuku calls `app_process` as the shell UID, a Java runtime spins up, and hooks get installed through a dispatcher that tries several backends until one sticks. Modules built for LSPosed and classic Xposed keep working.
+ShizuPosed runs Xposed-API modules inside target apps without root. No bootloader unlock, no system partition changes. Shizuku calls `app_process` as the shell UID, a Java runtime spins up, and hooks get installed through a dispatcher that tries several backends until one sticks. Modules built for LSPosed and classic Xposed keep working, and modules built against libxposed API 101 or 102 are supported as well.
 
 ---
 
-## Two builds
+## One build
 
-ShizuPosed ships as two APKs with the same code and the same signature:
+ShizuPosed ships as a single APK. Package name `com.shizuposed.manager`. Its updates work like any other app's — and 1.4.9 also ships an in-app update flow (see [Updates](#updates)).
 
-**Standard** — the normal build. Package name `com.shizuposed.manager`. Its updates work like any other app's.
+If a target app checks for `com.shizuposed.manager` by name, use the **Hide ShizuPosed app** flow in the Settings tab. It patches the current APK's manifest in place, re-signs with a **per-install** key, installs under a new random package name, and uninstalls the old one. See [Hide ShizuPosed app](#hide-shizuposed-app).
 
-**Stealth** — a separate build with a scrambled package name of the form `<letter>.<letters>.<letters>`, like `h.sghdt.kihyturd`. Nothing in that name hints at ShizuPosed. Its status provider authority is scrambled the same way.
-
-Pick the standard build unless you have a reason not to. Pick the stealth build if a target app checks for `com.shizuposed.manager` by name, or if you want the launcher to show something other than "ShizuPosed". The stealth build is a separate install — it cannot update the standard one, and vice versa. Switching between them means uninstalling the one you have, installing the other, and setting it up from scratch.
-
-Details are in [Installation](#installation) and [The stealth build](#the-stealth-build).
+Details are in [Installation](#installation).
 
 ---
 
@@ -24,15 +20,13 @@ Details are in [Installation](#installation) and [The stealth build](#the-stealt
 
 ShizuPosed is **not** a drop-in replacement for LSPosed. It uses a different injection primitive — `app_process` into a target it starts — because that's the only injection path that reliably works without root on modern Android. That choice is what makes ShizuPosed possible, and it's also what sets the ceiling.
 
-If you need zygote-wide hooking, `system_server` interception, cross-UID hooks, or cross-process hooks, use LSPosed. ShizuPosed is for people who can't root or won't, and who still want LSPosed-API modules to work in the apps it can reach.
+If you need zygote-wide hooking, `system_server` interception, cross-UID hooks, or cross-process hooks, use LSPosed. ShizuPosed is for people who can't root or won't, and who still want LSPosed-API and libxposed-API modules to work in the apps it can reach.
 
 The rest of this document is honest about where that line falls.
 
 ---
 
 ## Why `app_process`
-
-It helps to understand what ShizuPosed _can't_ do before looking at what it can.
 
 Without root, the injection primitives on Android 10+ are narrow. `ptrace` is blocked by SELinux for non-root UIDs. `LD_PRELOAD` needs a writable, executable path the target will load from, and app data directories are mounted `noexec`. Zygote fork requires being inside zygote, which means root or being the ROM. `Runtime.exec` runs as the caller's UID, not the target's. `am instrument` gives you an `Instrumentation` handle only after `Application.onCreate` — too late for bootstrap hooks. ContentProvider hijack works only if the target already declares a provider you can take over.
 
@@ -46,10 +40,24 @@ That's the entire mechanism. Everything else in ShizuPosed is a consequence of i
 
 This means:
 
-  * A preinstalled app with its own UID in the 10000+ range is a normal target. It can be hooked.
-  * `com.android.systemui`, `com.android.settings`, `com.android.phone`, `com.android.bluetooth`, `com.android.nfc`, `com.android.shell`, and `system_server` all run under protected UIDs. They cannot be hooked by ShizuPosed, and they are not offered as scope targets.
+- A preinstalled app with its own UID in the 10000+ range is a normal target. It can be hooked.
+- `com.android.systemui`, `com.android.settings`, `com.android.phone`, `com.android.bluetooth`, `com.android.nfc`, `com.android.shell`, and `system_server` all run under protected UIDs. They cannot be hooked by ShizuPosed, and they are not offered as scope targets.
 
 The scope editor hides protected-UID packages, so what you see in the picker is what the framework can actually reach.
+
+### After `setuid` — what the process is and isn't
+
+Once `XposedHook.main()` calls `Process.setuid(targetUid)`, the process **runs as the target's UID**. It can read the target's private data, and its SELinux context is the target's context on most ROMs.
+
+What it is _not_:
+
+- **It is not a zygote fork.** Its parent process is `app_process`, not `zygote`. `getppid()` and the `PPid` field in `/proc/self/status` reflect the bootstrapped parent, not zygote's PID. XStealth scrubs both, but the scrub is userspace — a kernel-level reader can still see the real parent.
+- **Its SELinux context can differ** on ROMs that enforce stricter labels for non-zygote processes.
+- **It does not inherit zygote's open file descriptors** for the target's data directory.
+
+These differences are what XStealth's appearance layer and `libxstealth_bridge`'s `/proc` scrubbing are for. They are userspace scrubs, not lineage changes, and cannot close every gap.
+
+**If `setuid` fails on a ROM**, the process runs as UID 2000 and cannot access the target's data at all. `XposedHook` logs the failure clearly, and the launch will typically fail at `handleBindApplication`.
 
 ---
 
@@ -59,86 +67,185 @@ LSPosed is a zygote-timing framework: it forks from zygote and installs hooks be
 
 Here's what ShizuPosed can reach in bootstrap mode:
 
-  * `Application.attachBaseContext` — hookable
-  * `Application.onCreate` — hookable
-  * `ContentProvider.onCreate` — hookable, and provider classes are pre-loaded so the hook is live before the first provider is created
-  * `Activity.onCreate` — hookable via Pine, Amiru, Native, or Instrumentation
-  * `LayoutInflater.inflate` — hookable, drives `XC_LayoutInflated` callbacks
-  * `Service.onCreate` — hookable via `ApplicationThread.scheduleCreateService`
-  * `BroadcastReceiver.onReceive` — hookable, and receiver classes are pre-loaded so the hook is live before the first broadcast
-  * Classes loaded at runtime — hookable before their static initializer runs, via the `ClassLoader.loadClass` bridge
-  * Dynamic code (plugin/split APKs loaded via `DexClassLoader`) — reachable via the loader-construction listener
-  * `system_server` — not hookable
+- `Application.attachBaseContext` — hookable
+- `Application.onCreate` — hookable
+- `ContentProvider.onCreate` — hookable, provider classes pre-loaded
+- `Activity.onCreate` — hookable via Pine, Amiru, Native, or Instrumentation
+- `LayoutInflater.inflate` — hookable, drives `XC_LayoutInflated` callbacks
+- `Service.onCreate` — hookable via `ApplicationThread.scheduleCreateService`
+- `BroadcastReceiver.onReceive` — hookable, receiver classes pre-loaded
+- Classes loaded at runtime — hookable before their static initializer runs
+- Dynamic code (plugin/split APKs loaded via `DexClassLoader`) — reachable via the loader-construction listener
+- `system_server` — not hookable
 
-The `system_server` gap is structural. There's no fallback because there's no mechanism. If you need it, LSPosed is the answer.
+The `system_server` gap is structural.
 
-`Service.onCreate` used to be on that list too. It isn't anymore — the `ApplicationThread` binder interface that `ActivityManagerService` calls into is reachable from the bootstrapped process, so the lifecycle events AMS schedules arrive before `ActivityThread` or `Instrumentation` sees them.
+### `IXposedHookZygoteInit` under ShizuPosed
 
-### How module rows respond to touch
+ShizuPosed is not a zygote-timing framework, so `initZygote()` fires **once per bootstrapped process**, not once per zygote fork. It runs at the start of bootstrap, before any module's `handleLoadPackage`.
 
-The Modules tab row supports four gestures, each doing one thing:
+`StartupParam`:
 
-Gesture | Action
----|---
-Tap the row body | Opens the scope editor
-Tap the enable switch | Toggles the module
-Tap the icon | Opens the detail sheet
-Long-press the row | Opens the module's UI through ShizuPosed
+- `modulePath` is the **installed APK path**, not the cached dex path.
+- `startsSystemServer` is always `false`.
 
-Uninstall lives in the detail sheet's `Uninstall` button. That's deliberate: opening a module's UI is a much more common action than removing it, and long-press is a reasonable gesture for it.
+---
 
-### XStealth's row behaves differently
+## API surfaces
 
-XStealth's row keeps its special treatment. No enable switch on the row (its toggle lives in the detail sheet), and long-press opens the detail sheet rather than the UI, because XStealth has no launchable UI.
+ShizuPosed speaks two API surfaces, and they report two different version numbers. That's deliberate — the numbers describe different things.
+
+### Classic Xposed API — reported **101**
+
+`XposedBridge.getXposedVersion()` returns **101**. The classic surface is 93/94/95/96/97/98/99/100/101. There is no classic 102.
+
+- **93** — LSPosed base. `IXUnhook`, `isModuleActive`, provider-backed state queries.
+- **94** — `hookAllMethods` returns `Set<XC_MethodHook.Unhook>`.
+- **95** — `hookAllConstructors` returns the same.
+- **96** — `MethodHookParam.isReturnEarly()` exposed.
+- **97** — Instance field accessors on `XposedBridge`.
+- **98** — Static field accessors, `XposedHelpers.getSurroundingThis`.
+- **99** — Method invokers on `XposedBridge`.
+- **100** — ShizuPosed extensions: `getShizuPosedApiMin()`, `getShizuPosedApiMax()`, `supportsApi(int)`, `isModuleActiveAnywhere(...)`.
+- **101** — Reported version. The surface below 101 is unchanged.
+
+A classic module that checks `getXposedVersion() >= 102` gets `false`. That's correct: there is no classic 102.
+
+### libxposed API — reported **102**
+
+`XposedInterface.getApiVersion()` returns **102**. The 102-only features are functional:
+
+- `HookBuilder.setId(String)` — stores the id.
+- `HookHandle.getId()` — returns the id, or `null` if none was set.
+- `HookHandle.replaceHook(Hooker)` — swaps the live callback on the same `Executable` without reinstalling the native stub.
+
+`onHotReloading` / `onHotReloaded` are declared on `XposedModuleInterface` for source compatibility but are **not invoked** — ShizuPosed doesn't reload module classloaders. Same pattern as `onSystemServerStarting`: the callback exists, the framework doesn't call it.
+
+A 101 libxposed module that never touches a 102 entry point works unchanged. A 101 libxposed module that branches on `getApiVersion() >= 102` now takes the 102 branch — which is the correct answer for a framework that implements 102.
+
+**Capability bits** (`getFrameworkProperties()`):
+
+| Bit | Constant | Value | Meaning |
+|---|---|---|---|
+| system-server hooking | `PROP_CAP_SYSTEM` | **0** | Cannot hook `system_server`. |
+| remote IPC | `PROP_CAP_REMOTE` | **0** | `getRemotePreferences` / `openRemoteFile` not implemented. |
+| runtime API protection | `PROP_RT_API_PROTECTION` | **1** | XStealth's `ApiProtectionCheck` is active. |
+
+**For classic modules that want to know about libxposed support**, `LSPosedManager.getLibxposedApiVersion()` returns 102, and `LSPosedManager.supportsLibxposedApi(int)` answers the boolean form. A classic module that wants to use libxposed-only features should check this accessor, not the classic version.
+
+### The version matrix
+
+| Path | Constant | Value |
+|---|---|---|
+| Classic Xposed | `XposedBridge.XPOSED_BRIDGE_VERSION` | 101 |
+| Classic Xposed | `LSPosedManager.API_VERSION` | 101 |
+| Classic Xposed | `LSPosedManager.getLibxposedApiVersion()` | 102 |
+| libxposed | `ShizuPosedXposedInterface.REPORTED_API` | 102 |
+| libxposed | `XposedInterface.LIB_API` | 102 |
+
+---
+
+## How module rows respond to touch
+
+The Modules tab row supports four gestures:
+
+| Gesture | Action |
+|---|---|
+| Tap the row body | Opens the scope editor |
+| Tap the enable switch | Toggles the module |
+| Tap the icon | Opens the detail sheet |
+| Long-press the row | Opens the module's UI through ShizuPosed |
+
+Uninstall lives in the detail sheet.
+
+### The API badge
+
+Every third-party module row shows an API badge when the module declares one:
+
+- **`API 93`**, **`API 94`**, … — classic Xposed API level.
+- **`libxposed 101`** or **`libxposed 102`** — extends `io.github.libxposed.api.XposedModule`.
+
+The badge reports **exactly what the module declared**. Whether the module will actually activate is answered by the detail sheet's **Run activation diagnostic**.
 
 ---
 
 ## Architecture
 
-    ShizuPosed Manager (APK)
-            │
-            │  Shizuku AIDL
-            ▼
-    Shizuku (shell, UID 2000)
-            │
-            │  app_process
-            ▼
-    Target process
-      ├── XposedHook.main()          bootstrap entry
-      ├── ClassLoadingBridge         loadClass + loader discovery + pre-load
-      ├── HookEngine                 backend selection + fingerprint tracking
-      ├── HookDispatcher             per-method backend chain
-      ├── DexLoadingBridge           dex load fallback ladder
-      ├── ModuleLoader               dex load + entry invocation
-      ├── ResourceHooking            resource + layout hooks
-      ├── ApplicationThreadBackend   binder-level lifecycle hooks
-      ├── XStealthModule             built-in privacy module
-      │     ├── DevOptionsCheck      Settings.Global + resolver + Binder
-      │     ├── AdbCheck             Settings.Secure + Global + resolver + Binder
-      │     ├── CachedValueCheck     SharedPreferences reads (opt-in)
-      │     ├── SettingsFileCheck    Runtime.exec + ProcessBuilder
-      │     ├── SystemPropertiesCheck SystemProperties reads
-      │     ├── BuildCheck           Build.TAGS/TYPE sanitization
-      │     ├── PropertyScrubCheck   System.getProperties() scrubbing
-      │     ├── SocketCheck          LocalSocket shim (opt-in)
-      │     ├── PackageCheck         PackageManager lookups + Binder
-      │     ├── RunningProcessCheck  ActivityManager lookups
-      │     ├── ApiProtectionCheck   reflection + baselines
-      │     ├── XStealthNative       libc symbol interposition
-      │     ├── XStealthNativeNext   libc syscall stub patching (strategy ladder)
-      │     ├── XStealthBridge       enumeration hiding
-      │     └── ThreadNameScrub      thread renaming
-      └── markers written to         <shell-base>/hooked/
+```
+ShizuPosed Manager (APK)
+        │
+        │  Shizuku AIDL
+        ▼
+Shizuku (shell, UID 2000)
+        │
+        │  app_process
+        ▼
+Target process
+  ├── XposedHook.main()          bootstrap entry
+  ├── LibXposedDriver            libxposed API 102 driver
+  ├── ShizuPosedXposedInterface  XposedInterface impl (reports 102)
+  ├── LibXposedHookerAdapter     Hooker.intercept(Chain) → XC_MethodHook
+  ├── ModuleClassLoader          chained loader (module + target + framework)
+  ├── ClassLoadingBridge         loadClass + loader discovery + pre-load
+  ├── HookEngine                 backend selection + fingerprint tracking
+  ├── HookDispatcher             per-method backend chain
+  ├── DexLoadingBridge           dex load fallback ladder
+  ├── ModuleLoader               dex load + entry invocation
+  ├── ResourceHooking            resource + layout hooks
+  ├── ApplicationThreadBackend   binder-level lifecycle hooks
+  ├── XStealthModule             built-in privacy module
+  │     ├── DevOptionsCheck      Settings.Global + resolver + Binder
+  │     ├── AdbCheck             Settings.Secure + Global + resolver + Binder
+  │     ├── CachedValueCheck     SharedPreferences reads (opt-in)
+  │     ├── SettingsFileCheck    Runtime.exec + ProcessBuilder
+  │     ├── SystemPropertiesCheck SystemProperties reads
+  │     ├── BuildCheck           Build.TAGS/TYPE sanitization
+  │     ├── PropertyScrubCheck   System.getProperties() scrubbing
+  │     ├── PackageCheck         PackageManager lookups + Binder
+  │     ├── RunningProcessCheck  ActivityManager lookups
+  │     ├── ApiProtectionCheck   reflection + baselines
+  │     ├── XStealthNative       libc symbol interposition (libxstealth.so)
+  │     ├── XStealthNativeNext   libc syscall stub patching (libxstealth_next.so)
+  │     ├── SyskuNative          syscall() + getdents64() interposition (libsysku.so)
+  │     ├── XStealthBridge       enumeration hiding (libxstealth_bridge.so)
+  │     └── ThreadNameScrub      thread renaming
+  └── markers written to         <shell-base>/hooked/
 
-    Manager process
-      ├── ProcessMonitor             /proc scan + marker mirror refresh
-      ├── MarkerCache                local mirror of <shell-base>/hooked/
-      ├── IconResolver               LruCache for app icons
-      ├── RuntimePrefs               scan interval + hook delay storage
-      ├── ModuleStatusProvider       reads the mirror, never Shizuku
-      └── ModuleDiagnostics          activation-state report for a module
+Manager process
+  ├── ProcessMonitor             /proc scan + marker mirror refresh
+  ├── MarkerCache                local mirror of <shell-base>/hooked/
+  ├── IconResolver               LruCache for app icons
+  ├── RuntimePrefs               scan interval + hook delay storage
+  ├── SyskuController            state / heartbeat / diagnostics
+  ├── ModuleStatusProvider       reads the mirror, never Shizuku
+  ├── ModuleDiagnostics          activation-state report for a module
+  ├── UpdateChecker              GitHub Releases query + notification
+  ├── UpdateDownloader           APK download + size/ZIP verification
+  ├── UpdateInstallActivity      download → confirm → pm install
+  └── ManagerCloakFlow           Hide / Unhide flow
+        ├── ManagerCloak         manifest patch + re-sign with per-install key
+        ├── AxmlPatcher          in-place AXML string-pool rewrite
+        └── ManagerMigrate       settings / DB / module keystore / cloak key transfer
+```
 
-The manager never touches the target process directly. Everything passes through Shizuku.
+---
+
+## Module classloaders
+
+When a module's `handleLoadPackage` runs, `lpparam.classLoader` is a **`ModuleClassLoader`** — a chained loader that resolves both the module's own classes and the target app's classes.
+
+Delegation order:
+
+1. Bootstrap classes (`java.*`, `javax.*`, `sun.*`, `dalvik.*`, `android.*`) → boot classloader.
+2. Module classes → module's `DexClassLoader`.
+3. Target classes → target's `PathClassLoader`.
+4. Framework classes → `XposedHook`'s own loader.
+5. Parent → boot classloader.
+
+This is what makes both of these work through the same `lpparam.classLoader`:
+
+- `XposedHelpers.findAndHookMethod("com.example.target.MainActivity", lpparam.classLoader, ...)` — target class resolves through step 3.
+- `XposedHelpers.findAndHookMethod(MyActivity.class.getName(), lpparam.classLoader, ...)` — module class resolves through step 2 (self-hook pattern).
 
 ---
 
@@ -148,78 +255,23 @@ ShizuPosed reaches a target in one of two ways. Both use the same `app_process` 
 
 ### Routed launch (user-triggered)
 
-The **Launch App under ShizuPosed** button, the module row's long-press, and the detail sheet's "Open module app" entry all go through this path. It has two steps:
+The **Launch App under ShizuPosed** button, the module row's long-press, and the detail sheet's "Open module app" entry all go through this path:
 
-  1. Boot the target process with hooks installed:
-
-         unset CLASSPATH; unset BOOTCLASSPATH;
-         <prefix> app_process ... XposedHook <pkg> 0 <uid> & [disown]
-
-     This starts the process and installs hooks during bootstrap.
-
-  2. Open the target's UI in that already-running process:
-
-         am start --user current -n <resolved-component>
-
-Step 2 is required for this path. `app_process` booting a process does not start any activity, and without step 2 the process runs idle and the user sees nothing.
-
-This is the path a **self-hooking module** needs. The module's own app is a normal, cooperative package with a launcher activity, so spawning it under ShizuPosed and then `am start`-ing its UI puts the module's own UI inside the process where its hook is installed. Its self-check then passes. That's why the README tells you to launch a module's UI through ShizuPosed — long-press the module row, or tap "Open module app" in the detail sheet.
+1. Boot the target process with hooks installed:
+   ```
+   unset CLASSPATH; unset BOOTCLASSPATH;
+   <prefix> app_process ... XposedHook <pkg> 0 <uid> & [disown]
+   ```
+2. Open the target's UI in that already-running process:
+   ```
+   am start --user current -n <resolved-component>
+   ```
 
 ### Monitor-triggered injection
 
-`ProcessMonitor` scans `/proc` on a timer (default interval from Settings). When it sees a newly-started app process that at least one enabled module scopes, it calls `injectProcess`. That method performs a **spawn-only** routed launch for the package — it runs step 1 above but **not** step 2.
+`ProcessMonitor` scans `/proc` on a timer. When it sees a newly-started app process that at least one enabled module scopes, it calls `injectProcess`, which performs a **spawn-only** routed launch. The monitor path is silent.
 
-The spawn-only form matters: the user already opened the app themselves, and Android routes that launch into the bootstrapped process. Running `am start` on top of that would pop the app to the foreground a second time, on top of the user's own tap. So the monitor installs hooks and then leaves the UI alone.
-
-The monitor path is also silent. It does not broadcast a launch result, so the manager UI never raises a popup for an app you opened yourself. The Logs tab records everything the service does; that is where to look.
-
-Four guards keep the monitor from misbehaving:
-
-  * **UID.** Packages with `uid < 10000` are refused. The shell cannot `setuid` to protected UIDs, so a monitor-triggered launch for System UI, Settings, Phone, and the rest would fail or spawn a process as the wrong UID. They are skipped.
-  * **Scope.** Only packages a module actually scopes are launched. An unscoped app the user opens is ignored, even if modules exist.
-  * **Dedup.** A package that already has a shell-side hooked marker, or whose launch is already in flight, is skipped. This prevents the scan interval from queuing a second launch for an app whose first launch hasn't finished.
-  * **In-flight set.** A package currently being spawned is skipped until that spawn completes.
-
-### What neither path can do
-
-Neither path can inject into a process someone else started. If you launch Facebook from the launcher, the process that comes up is not the one ShizuPosed will hook. The monitor notices it, but the only injection it can perform is a spawn-only routed launch — which starts a fresh process for the same package, with hooks installed during bootstrap. For apps that cooperate with that, it works. For apps that manage their own process lifecycle aggressively, it may not.
-
-The two paths differ only in two flags on `launchAppUnderShizuPosed`:
-
-  * `openUi` — whether to run step 2 (`am start`) after the spawn.
-  * `notifyUi` — whether to broadcast `ACTION_LAUNCH_RESULT`.
-
-The button path uses `openUi=true, notifyUi=true`. The monitor path uses `openUi=false, notifyUi=false`.
-
-### Spawn construction
-
-The spawn command is wrapped in a subshell whose stdout is redirected to `/dev/null`, and the whole thing is backgrounded:
-
-    unset CLASSPATH; unset BOOTCLASSPATH; \
-    ( <prefix> app_process ... </dev/null >>launch.log 2>&1 & ) \
-    >/dev/null 2>&1 < /dev/null &
-
-The outer redirect is what makes the manager's shell call return immediately. Without it, `app_process` inherits the shell's stdout pipe, the manager's reader never sees EOF, and the shell command blocks for the lifetime of the target process. The `<prefix>` is `setsid -d` when available, `nohup` otherwise. `setsid -d` is the toybox detach flag — the util-linux `--fork` flag does not exist on Android.
-
-The launch then waits `BOOTSTRAP_DELAY_MS` (default 1500 ms) before checking whether the target process came up. That check is a single `ps -A` call, not a shell loop over `/proc`, so it returns in a few hundred milliseconds rather than tens of seconds.
-
----
-
-## The lifecycle bridges
-
-Two bridges extend what the framework can reach without changing the injection model.
-
-**`ApplicationThreadBackend`** hooks the binder interface `ActivityThread` exposes to `system_server` (its `mAppThread` field). Everything `ActivityManagerService` schedules — activity launches, service creates, receiver broadcasts — arrives on this interface before `ActivityThread` or `Instrumentation` sees it. Hooking it closes the `Service.onCreate` gap (`scheduleCreateService`) and gives modules a place to observe or rewrite binder-level lifecycle events.
-
-Methods hooked: `scheduleCreateService`, `scheduleBindService`, `scheduleUnbindService`, `scheduleStopService`, `scheduleServiceArgs`, `scheduleTransaction` (Android 9+). Each is a fail-open hook: if a signature differs on a ROM, that method is skipped and the others still install.
-
-**`ClassLoadingBridge`** does three things:
-
-  1. **`ClassLoader.loadClass` hook** — fires listeners *before* a class is defined, so a module can install hooks on a class before its static initializer runs.
-  2. **`DexClassLoader` / `PathClassLoader` constructor hook** — when a target constructs a new loader at runtime, a listener is notified with the new loader.
-  3. **Component pre-load** — asks `PackageManager` for the target's receivers and providers, then forces each class to load.
-
-Both bridges are installed by `XposedHook` during bootstrap, before `handleLoadPackage` runs for any module. Modules register listeners via the bridge classes. XStealth registers its own listeners when `Protect Xposed API calls` is on, and those listeners observe only — they never block a class load or a binder call.
+Neither path can inject into a process someone else started.
 
 ---
 
@@ -227,74 +279,54 @@ Both bridges are installed by `XposedHook` during bootstrap, before `handleLoadP
 
 Not every method can be hooked the same way, so the dispatcher tries a fixed order and takes the first backend that succeeds.
 
-Pine AUTO is the primary engine. Pine REPLACEMENT catches methods Pine AUTO rejects. Amiru is a per-method stub engine reached when Pine declines. CallSite patches the ART interpreter dispatch table. Native is the original `libshizuposed.so` shared-dispatcher engine. Instrumentation covers the Application and Activity lifecycle only. Proxy handles interface methods. Noop always succeeds and does nothing — so a module that hooks ten methods and finds one it can't hook doesn't lose the other nine.
-
-`HookEngine` records the declaring class of every method or constructor it attempts to hook. That record feeds `ApiProtectionCheck`'s fingerprint baselines.
+**Pine AUTO** is the primary engine. Pine REPLACEMENT catches methods Pine AUTO rejects. Amiru is a per-method stub engine reached when Pine declines. CallSite patches the ART interpreter dispatch table (non-functional; every install is refused — see [CallSite backend status](#callsite-backend-status)). Native is the original `libshizuposed.so` shared-dispatcher engine. Instrumentation covers the Application and Activity lifecycle only. Proxy handles interface methods. Noop always succeeds and does nothing.
 
 ### What each backend can actually hook
 
-| Backend | Primitive args | Object args | Primitive returns | Object returns | `thisObject` |
-|---|---|---|---|---|---|
-| Pine AUTO | yes | yes | yes | yes | yes |
-| Pine REPLACEMENT | yes | yes | yes | yes | yes |
-| Amiru | yes | **null** | yes | **not replaceable** | **null** |
-| CallSite | **n/a** | **n/a** | **n/a** | **n/a** | **n/a** |
-| Native (`libshizuposed`) | yes | **null** | yes | **not replaceable** | **null** |
-| Instrumentation | yes | yes | n/a | n/a | yes |
-| Proxy | yes | yes | yes | yes | yes |
+| Backend | Primitive args | Object args | Primitive returns | Object returns | `thisObject` | Constructors |
+|---|---|---|---|---|---|---|
+| Pine AUTO | yes | yes | yes | yes | yes | yes |
+| Pine REPLACEMENT | yes | yes | yes | yes | yes | yes |
+| Amiru | yes | **yes (1.4.9)** | yes | **yes (1.4.9)** | **yes (1.4.9)** | no |
+| CallSite | n/a | n/a | n/a | n/a | n/a | n/a |
+| Native (`libshizuposed`) | yes | **null** | yes | **not replaceable** | **null** | yes |
+| Instrumentation | yes | yes | n/a | n/a | yes | n/a |
+| Proxy | yes | yes | yes | yes | yes | no |
 
-The two rows in bold are the important ones. A module that hooks `void foo(String s)` and reads `s` from `beforeHookedMethod` receives `null` if the hook landed on Amiru or Native.
+The **Native** row is the one that carries the important limitation. A module that hooks `void foo(String s)` and reads `s` receives `null` if the hook lands on Native.
+
+Amiru carries objects since 1.4.9 (the C-side `box_arg` passes `L` / `[` register values through as `jobject` handles; `AmiruDispatcher` reports results via `setAmiruResult` so the stub distinguishes "returned null" from "did nothing"). Constructors and after-hooks are still unsupported on Amiru.
+
+### Pine's argument contract
+
+Pine's `MethodHook` gives a `CallFrame` with `thisObject` and `args`, and `PineBackend` translates both directions against `MethodHookParam`. A `beforeHookedMethod` that writes `param.args[i] = ...` or `param.thisObject = ...` has its changes honored by the original invocation.
 
 ### CallSite backend status
 
-CallSite is present in the dispatcher chain, but it is **not functional**. It patches the ART interpreter handler table but does not yet reconstruct Java-level arguments from the interpreter's `ShadowFrame`. No callback is ever invoked through this path.
+CallSite is present in the dispatcher chain, but it is **not functional**. `install_hook_impl` refuses every install with a logged reason. The interpreter-table scanner, decoder, and patch machinery are preserved as scaffolding. Until a future implementation actually invokes the Java callback, the backend refuses installs.
 
-Since 8.9 the backend has been honest about this: `install_hook_impl` refuses every install with a logged reason, so `CallSiteBackend.hook` returns `false` and the dispatcher falls through to the next backend.
+### Native-hook safety gate
+
+`libshizuposed.so`'s `nHookNative` refuses native hooks whose first instruction is PC-relative (ADRP, ADR, B, BL, LDR-literal, ADD/SUB-from-PC). The trampoline replays `src[0]` verbatim; a PC-relative first instruction would compute its target relative to the trampoline instead of the original function. Refusing with `JNI_FALSE` lets the dispatcher fall back to another backend instead of producing a wrong trampoline that crashes.
+
+### Disabling a backend
+
+`HookDispatcher.setBackendEnabled(name, on)` toggles a backend by name. A disabled backend keeps its slot but is skipped during dispatch.
 
 ---
 
-## The dex-loading fallback ladder
+## Updates
 
-Loading a module's dex into a target process can fail for several reasons. `DexLoadingBridge` tries three strategies in order:
+ShizuPosed 1.4.9 ships an in-app update flow.
 
-  1. **`InMemoryDexClassLoader`** (Android 8+).
-  2. **`DexClassLoader`.**
-  3. **`BaseDexClassLoader` injection.**
+- **Background check** — `UpdateChecker.checkAsync` runs on app start, throttled to once per 12 hours. Posts a notification with an "Install update" action if a newer release exists.
+- **Manual check** — "Check for updates" in Settings. Shows *"You're on the latest version (X)"* if no update, or an *"Update available"* dialog with a Download button if there is one.
+- **Download** — `UpdateDownloader` fetches the APK to cache, verifies the size against GitHub's reported asset size, and verifies the ZIP magic (`PK`) so a captive-portal HTML page served in place of the APK is rejected before `pm install` runs.
+- **Install** — `UpdateInstallActivity` prompts for confirmation (manual, not silent), stages the APK to a shell-readable path, and runs `pm install -r --user 0` via Shizuku. The install replaces the current package, so the user keeps their data — including the per-install cloak key at `files/cloak-install.p12`.
 
-Each strategy logs its outcome.
+**If the manager is cloaked**, the update flow refuses with a clear message: *"Unhide first, update, then re-Hide."* The downloaded APK's manifest declares `com.shizuposed.manager`, not the cloaked package name; installing it with `-r` would install a second ShizuPosed alongside the cloak. A seamless in-place patch of a downloaded APK is a follow-up.
 
-### Spawn-tool fallback
-
-At startup, ShizuPosed runs a single shell probe that checks for `setsid`, `nohup`, and the `disown` shell builtin. Detection prefers `command -v` and falls back to `type`. The result is cached in static fields.
-
-| Condition | Spawn prefix |
-|---|---|
-| `setsid` present | `/system/bin/setsid -d` |
-| `setsid` missing, `nohup` present | `/system/bin/nohup` |
-| neither present | bare spawn |
-
-The command is always wrapped in a subshell with the outer stdout redirected to `/dev/null`, so the shell returns immediately regardless of which prefix is used. The child process is detached via `setsid -d` (toybox's detach flag) so it survives the shell exit.
-
-### ART policy flags
-
-Two ART flags are passed to every spawned `app_process`:
-
-    -Xhidden-api-policy:enabled
-    -Xcore-platform-api-policy:enabled
-
-Setting both flags to `enabled` relaxes hidden-API enforcement for the process regardless of UID. They are safe: they only affect the process we spawned.
-
-### Post-spawn verification
-
-After the `BOOTSTRAP_DELAY_MS` wait (1500ms), ShizuPosed runs a single `ps -A -o ARGS` call and greps for the target package name. If the process is not found, the launch logs a warning and proceeds to `am start` anyway.
-
-### Launch-result timeout
-
-The manager's UI waits for a result broadcast from `ShizuPosedService` after dispatching a button-path launch. A timeout (`LAUNCH_TIMEOUT_MS`, 20s) guards against a lost broadcast. The monitor path does not broadcast, so it never waits on this.
-
-### Timing
-
-The gap between step 1 and step 2 is `BOOTSTRAP_DELAY_MS`, defaulted to 1500ms. The post-spawn check that runs after it is a single `ps` invocation, not a shell loop.
+**No signature verification on the downloaded APK.** The size and ZIP magic checks catch truncation and HTML-instead-of-APK, but not a malicious APK served from a compromised GitHub response.
 
 ---
 
@@ -306,121 +338,79 @@ XStealth applies to every app ShizuPosed launches. It has no per-app scope.
 
 XStealth is organized in four layers, each independently toggleable:
 
-  * **Java-layer checks** — hook Android APIs inside the target's own process.
-  * **Binder-layer checks** — inspect `IBinder.transact` calls before they leave the process.
-  * **Native layer** — interpose libc symbols and patch libc syscall stubs.
-  * **Bridge layer** — hide from native enumeration paths.
+- **Java-layer checks** — hook Android APIs inside the target's own process.
+- **Binder-layer checks** — inspect `IBinder.transact` calls before they leave the process.
+- **Native layer** — interpose libc symbols, patch libc syscall stubs, and substitute plausible values into procfs fields.
+- **Bridge layer** — hide from native enumeration paths, and rename threads / rewrite environment variables to look like an ordinary app process.
 
-All layers fail open. A bug in a check means the target gets the real API result, not a crash.
+All layers fail open.
 
 ### Java-layer checks
 
 **Developer Options and ADB.** `DevOptionsCheck` and `AdbCheck` hook every settings read path.
 
-**Cached detection values.** `CachedValueCheck` hooks `SharedPreferences` reads for a per-app allow-list of keys. Opt-in, off by default, fail-open.
+**Cached detection values.** `CachedValueCheck` hooks `SharedPreferences` reads for a per-app allow-list of keys.
 
 **Subprocess reads of the settings XML.** `SettingsFileCheck` hooks `Runtime.exec` (all five overloads) and `ProcessBuilder.start()`.
 
-**System properties.** `SystemPropertiesCheck` hooks `android.os.SystemProperties.get`, `getBoolean`, `getInt`, and `getLong` for a watched key list.
+**System properties.** `SystemPropertiesCheck` hooks `android.os.SystemProperties.get`, `getBoolean`, `getInt`, `getLong`.
 
-**Build fields.** `BuildCheck` sets `Build.TAGS` to `release-keys`, `Build.TYPE` to `user`, `Build.HOST` and `Build.USER` to `android-build`.
+**Build fields.** `BuildCheck` sets `Build.TAGS` to `release-keys`, `Build.TYPE` to `user`.
 
 **Framework properties.** `PropertyScrubCheck` removes `shizuposed.*` entries from `System.getProperties()`.
 
-**Shizuku and ShizuPosed packages.** `PackageCheck` intercepts the standard `PackageManager` lookup methods.
+**Shizuku and ShizuPosed packages.** `PackageCheck` intercepts the standard `PackageManager` lookup methods. Since 1.4.9, it also filters queries for the **cloaked package name** (read from the `shizuposed.cloaked.package` system property set by the cloak flow), so a target app can't discover the cloaked install by enumerating installed packages.
 
 **Running processes.** Filters `ActivityManager` process and service listings.
 
-**The shim classes.** `ApiProtectionCheck` refuses `Class.forName` and `ClassLoader.loadClass` for `de.robv.android.xposed.*` when the caller isn't a loaded module.
-
-**Method-count fingerprinting.** Pins a baseline for every framework class the framework has actually hooked.
+**The shim classes.** `ApiProtectionCheck` refuses `Class.forName` and `ClassLoader.loadClass` for `de.robv.android.xposed.*` and `io.github.libxposed.api.*` when the caller isn't a loaded module.
 
 ### Binder-layer checks
 
-The Binder-layer checks intercept the calls the Java APIs make *internally*, and the calls a target can make *directly* by skipping the Java API.
-
-**`BinderProxy.transact` hook.** Every Binder call the target makes through the Java `IBinder` API goes through `BinderProxy.transact(int code, Parcel data, Parcel reply, int flags)`.
-
-Three classes install it: `PackageCheck` covers `IPackageManager`, `AdbCheck` and `DevOptionsCheck` cover `IContentProvider`.
-
-**`DUMP_TRANSACTION` handling.** `Binder.dump(fd, args)` calls also route through `transact`, with the fixed code `IBinder.DUMP_TRANSACTION`.
-
-**`Binder.ProxyTransactListener`.** `PackageCheck` installs one for observation. It cannot refuse — the listener fires for every call, including ones the `transact` hook's parcel parser can't handle.
+**`BinderProxy.transact` hook.** Every Binder call the target makes through the Java `IBinder` API goes through `BinderProxy.transact`.
 
 ### Native layer
 
-**`libxstealth.so`** — the primary native engine. Interposes the file, process, and exec-family libc symbols.
+**`libxstealth.so`** — interposes the file, process, and exec-family libc symbols, and substitutes plausible values into procfs fields.
 
-**`libxstealth_next.so`** — the aggressive engine. Inline-patches libc syscall stubs. Uses a **strategy ladder**: tries per-stub inline patching first, then falls back to patching the shared `syscall()` dispatcher.
+**`libxstealth_next.so`** — inline-patches libc syscall stubs.
 
-**Stub-shape verification.** Both `libxstealth.so` and the backends that build hook stubs coordinate around a captured prologue template. At boot, `libxstealth.so` reads the entry-point bytes of two probe methods, computes their common prefix, and runs a verifier over it.
+**`libsysku.so`** — the syscall-level interposer. See [Sysku](#sysku--the-syscall-level-interposer). Also applies the appearance substitutions on the raw-syscall path (`SYS_readlinkat`, `SYS_readlink`), and trust-gates `SYS_getppid`.
 
 ### Bridge layer
 
-**`libxstealth_bridge.so`** — the enumeration-hiding library.
+**`libxstealth_bridge.so`** — enumeration-hiding and appearance library.
 
-**Thread name scrubbing.** `ThreadNameScrub` renames ShizuPosed's own threads to innocuous patterns.
+- **`dl_iterate_phdr`** — filters framework library names.
+- **`opendir` / `readdir` / `closedir`** — tracks `/proc/self/fd` and `/proc/self/task`.
+- **`readlink`** — substitutes `/proc/self/exe` → `/system/bin/app_process64` and `/proc/1/comm` → `zygote64`.
+- **`read`** — refuses reads of hidden processes, renames `/proc/self/task/<tid>/comm`.
+- **`getppid`** — trust-gated. Returns `1` for untrusted callers, the real ppid for framework callers.
+- **`getenv`** — substitutes plausible values for framework environment variables, drops `LD_PRELOAD` and `JAVA_TOOL_OPTIONS`.
 
-### Smart foreground hiding (opt-in)
+### Legitimate process appearance
 
-XStealth's Java and native checks intercept reads of Developer Options and ADB state. They cover every read path the target app takes through libc, through the settings API, and through the content resolver.
+A detector's cheapest "is this process legitimate?" checks read procfs fields that reveal the bootstrap's parentage. The appearance layer substitutes plausible values:
 
-They do not cover two paths: a Binder call directly to `ISettingsProvider` (which bypasses the Java API and the content resolver), and a native read of the settings database's backing store (which bypasses the file interposers by using SQLite directly).
+| Field | Real value | Substituted value |
+|---|---|---|
+| `/proc/self/exe` | resolved against the dex path | `/system/bin/app_process64` |
+| `/proc/1/comm` | `init` | `zygote64` |
+| `/proc/self/status` `Name:` | `app_process64` | `app_process64` |
+| `/proc/self/status` `PPid:` | `app_process` pid | `1` |
+| `/proc/self/cmdline` | full bootstrap args | one plausible argument |
+| `/proc/self/stat` `comm` | `app_process64` | `app_process64` |
+| `/proc/self/mountinfo` hidden lines | shell-base paths | plausible `/data/user/...` mounts |
+| `/proc/self/cgroup` path field | shell-base paths | `/uid_<target_uid>/pid_<pid>` |
+| `/proc/self/task/<tid>/comm` | `ShizuPosed-*`, `Xposed-*`, … | `Signal Catcher`, `JDWP`, `Jit thread pool`, … |
+| `getenv("LD_PRELOAD")` | framework value | `NULL` (drop) |
+| `getenv("SHIZUPOSED_*")` | framework value | plausible value |
 
-Smart foreground hiding closes those paths by changing the *underlying state* rather than intercepting the read. When a scoped app comes to the foreground, the manager writes `adb_wifi_enabled` and `adb_enabled` to 0 through Shizuku. When the app leaves, the manager restores the prior values.
-
-Because the settings are genuinely off during that window, every reader sees 0 — including the paths XStealth's read interception doesn't cover.
-
-#### The cost
-
-Shizuku requires Developer Options to be enabled. When the settings are off, Shizuku's server stops. ShizuPosed's service loses its binder and shuts down. The framework is idle for the duration of the window.
-
-When the scoped app exits, the settings are restored, Shizuku's server comes back, and `ShizuBinderWatcher` restarts ShizuPosed's service. This is the same trade-off Shizuku-Next's "ADB without Developer options" switch makes.
-
-#### What you lose
-
-  * **Apps launched during the window are not hooked.** If the user opens a second scoped app while the first is still in the foreground, the second app is not launched through ShizuPosed, and modules scoped to it do not load.
-  * **The foreground-detection race.** The monitor detects the transition using `UsageStatsManager`, which polls. The poll interval is 500 ms. An app that reads its settings in `Application.attachBaseContext` before the monitor's next poll sees the previous value. XStealth's read interception does not have this race — the hooks install during bootstrap — so the two mechanisms are complementary: read interception covers the early reads, the state change covers the late ones.
-  * **`PACKAGE_USAGE_STATS`.** The monitor uses `UsageStatsManager`, which requires the user to grant the permission through Settings → Special app access → Usage access. Without it, the monitor does not start.
-
-#### When to use it
-
-Enable it when a scoped app is known to read the settings through a path XStealth does not intercept. The usual tell: XStealth is on, the app's scope is set, but the app still reports Developer Options as enabled.
-
-Do not enable it by default. XStealth's read interception covers the common cases, and the state change's cost — Shizuku and the service going down for the duration — is not worth paying unless it's necessary.
-
-### What each layer covers
-
-| Detection path | Java | Binder | Native | Bridge |
-|---|---|---|---|---|
-| `Settings.Global.getInt` in-process | ✅ | — | — | — |
-| `ContentResolver.query` in-process | ✅ | — | — | — |
-| Direct `IContentProvider.query` over Binder | — | ✅ | — | — |
-| `cat settings_global.xml` via `Runtime.exec` | ✅ | — | ✅ | — |
-| `open()` of settings XML | — | — | ✅ | — |
-| `dumpsys settings get global <key>` via Binder | — | ✅ | — | — |
-| Direct `IPackageManager` lookup over Binder | — | ✅ | — | — |
-| `dumpsys package <pkg>` via Binder | — | ✅ | — | — |
-| `PackageManager.getInstalledPackages` | ✅ | — | — | — |
-| `dl_iterate_phdr` loaded-library walk | — | — | — | ✅ |
-| `/proc/self/maps` scan for `.so` names | — | — | ✅ | — |
-| `/proc/self/fd` enumeration | — | — | ✅ | ✅ |
-| `/proc/self/task` enumeration | — | — | ✅ | ✅ |
-| `getppid()` | — | — | ✅ | — |
-| `PPid:` line in `/proc/self/status` | — | — | ✅ | — |
-| `SystemProperties` reads (API) | ✅ | — | ✅ | — |
-| `Build.TAGS`/`Build.TYPE` | ✅ | — | — | — |
-| Hook-stub entry-point byte pattern | — | — | ✅ | — |
-| **Second process the target spawned** | — | — | — | — |
-| **Native `/dev/binder` direct** | — | — | — | — |
-| **Property shared-memory area** | — | — | — | — |
-| **Hardware attestation** | — | — | — | — |
-
-The bottom four rows are the structural gaps — the ones no userspace framework closes.
+**The rule is: substitute, don't blank.** A blanked field is a stronger detection signal than a plausible wrong one.
 
 ### What XStealth doesn't hide
 
-Hardware attestation (Play Integrity `MEETS_STRONG_INTEGRITY`). Root-empowered inspection. Server-side cross-reference. Native reads of the settings database that bypass the exec family entirely. Method-list reconstruction. Exotic reflection via `Unsafe` or JNI-level private methods. Kernel-level monitors. Signals unrelated to ShizuPosed.
+Hardware attestation. Root-empowered inspection. Server-side cross-reference. Native reads of the settings database that bypass the exec family. Method-list reconstruction. Exotic reflection via `Unsafe` or JNI-level private methods. Kernel-level monitors. `Uid:`, SELinux context, and process start time — those are kernel state, and the appearance layer does not touch them.
 
 ### XStealth's practical ceiling
 
@@ -428,46 +418,124 @@ XStealth raises the bar significantly but it cannot make a ShizuPosed process ge
 
 ---
 
-## The subprocess gap
+## Sysku — the syscall-level interposer
 
-A common detection pattern is to bypass the Java settings API entirely and shell out.
+Sysku (`libsysku.so`) is an **optional** companion to `libxstealth.so` that closes detection paths the named libc interposers cannot reach.
 
-XStealth closes this in two layers: `SettingsFileCheck` at the Java level, and the exec-family interposers in `libxstealth.so` at the native level.
+### What it filters
 
-**Still not covered:** native `execve` called before the `.so` is loaded, or from a process that loaded its own copy of libc.
+**`syscall()` interposition.** A caller that bypasses the named wrapper — `syscall(SYS_openat, ...)` instead of `open(...)` — goes through libc's `syscall()` trampoline. `libsysku.so` filters the raw syscall number for path-takers (`SYS_openat`, `SYS_openat2`, `SYS_newfstatat`, `SYS_fstatat`, `SYS_statx`, `SYS_faccessat`, `SYS_faccessat2`, `SYS_readlinkat`, `SYS_open`, `SYS_stat`, `SYS_lstat`, `SYS_access`, `SYS_readlink`), pid-takers (`SYS_ptrace`, `SYS_process_vm_readv`, `SYS_perf_event_open`, `SYS_kcmp`, `SYS_pidfd_open`), and flag-takers (`SYS_getppid`, `SYS_prctl`, `SYS_mincore`).
+
+**`getdents64()` interposition.** A detector that opens `/proc/self/fd` as a directory and counts descriptors sees ShizuPosed's fds regardless of what `libxstealth.so` does to individual reads. `libsysku.so` drops any entry whose name matches a framework-owned pattern. For `/proc/self/task`, entries are **kept** — the rename is handled by `libxstealth_bridge`'s `read()` interposer, so the thread count stays correct.
+
+### Full mode and fallback mode
+
+Sysku runs in one of two modes:
+
+- **Full mode** — the Sysku ADB module's `service.sh` is running (heartbeat fresh). `syscall()` and `getdents64()` both filter.
+- **Fallback mode** — the module isn't running. `syscall()` filters; `getdents64` passes through unchanged.
+
+### Activation
+
+Sysku is active when `state.json` says `enabled: true` and `libsysku.so` is present in `<shell-base>/libs/`. The Settings tab reports five states: `Disabled`, `Not installed`, `Enabled (lib failed to load)`, `Enabled (module not running)`, `Enabled (load failed)`, `Enabled`.
+
+### Building `libsysku.so`
+
+```
+clang -shared -fPIC -O2 -Wall -Wextra -s \
+    -target aarch64-linux-android29 \
+    -o libsysku.so libsysku.c \
+    -llog -ldl
+```
+
+Save it to `app/src/main/jniLibs/arm64-v8a/libsysku.so`. If you build without it, the build succeeds, but the Settings tab will report **`Enabled (lib failed to load)`**.
 
 ---
 
-## Socket shim — opt-in, off by default
+## Hide ShizuPosed app
 
-`SocketCheck` is **off by default** and installs **no hooks** unless a specific daemon is configured. This is infrastructure, not a working feature.
+The Settings tab has a **Hide ShizuPosed app** row. The flow:
+
+1. Generates a random package name of the **same length** as the current one (22 chars for `com.shizuposed.manager`). Same length is a string-pool simplicity constraint, not a security feature: it lets the manifest patch avoid rebuilding the AXML string pool.
+2. Reads the current APK, patches `<manifest package="...">` in place, and rewrites the `applicationId`-derived suffixes (`DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`, `androidx-startup`, `fileprovider`, `shizuku`, `shizuku-watcher`, `status`) so the cloaked package doesn't collide with the original on install. Class names (`MainActivity`, `ShizuPosedManagerApp`, etc.) are **not** rewritten — the dex still defines them under the original name.
+3. Re-signs with the **per-install cloak signing key** (see below).
+4. Stages the patched APK to a shell-readable path, runs `pm install --user 0` (no `-r`), verifies via `am start --user 0 -n <newPkg>/<launcherClass>`, then uninstalls the old package.
+5. Relaunches the manager under the new package.
+
+The **per-install cloak signing key**: on the first Hide, a fresh RSA-2048 keypair is generated, self-signed, and stored in `files/cloak-install.p12`. Every subsequent cloak and every Unhide uses that key. Each cloaked install has a unique signature — a target app can no longer fingerprint one key to catch every ShizuPosed user. The key survives Unhide because `ManagerMigrate` carries `cloak-install.p12` across the cloak.
+
+### The trade-off
+
+The cloak patches the `package` attribute and the `applicationId`-derived suffixes. Class names in the manifest stay under the original package, because the dex still defines them there. Renaming activities or services in the source manifest would require patching the dex as well.
+
+The launcher label (`@string/app_name`) lives in `resources.arsc`, not the manifest, so it does not change per cloak. If you want an innocuous label, set it at build time.
+
+**Existing cloaked installs pick up the per-install key on their next Unhide.** The README recommends Unhide → re-Hide after upgrading to 1.4.9 to migrate cleanly.
+
+### The revert path
+
+The **Unhide ShizuPosed app** row patches the current APK's manifest back to the original package name, re-signs it with the same per-install key, installs, and uninstalls the cloaked package. Both directions carry a migrate zip — settings, module DB, module keystore, cloak key — that the new package reads on first launch.
 
 ---
 
-## API surface — version 100
+## API surface — classic (version 101)
 
-ShizuPosed reports Xposed API version **100** (LSPosed generation 93, plus fork revisions 94 through 100).
+ShizuPosed reports classic Xposed API version **101**.
 
-  * **93** — LSPosed base. `IXUnhook`, `isModuleActive` and `isModuleEnabled` with and without arguments, provider-backed state queries.
-  * **94** — `hookAllMethods` returns `Set<XC_MethodHook.Unhook>`.
-  * **95** — `hookAllConstructors` returns the same.
-  * **96** — `MethodHookParam.isReturnEarly()` exposed.
-  * **97** — Instance field accessors on `XposedBridge`: `getObjectField`, `setObjectField`.
-  * **98** — Static field accessors on `XposedBridge`, and `XposedHelpers.getSurroundingThis`.
-  * **99** — Method invokers on `XposedBridge`: `callMethod`, `callStaticMethod`.
-  * **100** — ShizuPosed-specific extensions: `getShizuPosedApiMin()`, `getShizuPosedApiMax()`, `supportsApi(int)`, and the `isModuleActiveAnywhere(...)` overloads.
+### `IXposedHookZygoteInit`
 
-Every revision past 93 is additive. A module compiled against API 93 loads and behaves the same way under this shim, because the shim still exposes the earlier surface. The version number is the ceiling, not the floor.
-
-Modules that guard on 101 or higher correctly believe ShizuPosed doesn't support those fork revisions.
+Modules that implement it get an `initZygote()` call at bootstrap, before `handleLoadPackage`. See [IXposedHookZygoteInit under ShizuPosed](#ixposedhookzygoteinit-under-shizuposed) for the timing detail.
 
 ### Active-state queries
 
-Two distinct questions. `isModuleActive(pkg)` asks "is this module loaded into the process for `pkg`?" `isModuleActiveAnywhere(pkg)` asks "is this module loaded into any process ShizuPosed has bootstrapped?"
+`isModuleActive(pkg)` asks "is this module loaded into the process for `pkg`?" `isModuleActiveAnywhere(pkg)` asks "is this module loaded into any process ShizuPosed has bootstrapped?"
 
-Under LSPosed the two questions have the same answer, because LSPosed injects into every process. Under ShizuPosed they differ. A module that scopes itself to a target app and calls `isModuleActive(getPackageName())` sees `true` under LSPosed as soon as the framework has loaded it anywhere. Under ShizuPosed that query is narrower, so `isModuleActiveAnywhere(getPackageName())` exists to answer the broader question directly.
+Under LSPosed the two questions have the same answer. Under ShizuPosed they differ.
 
-Both are available on `XposedBridge` and `LSPosedManager`.
+---
+
+## API surface — libxposed (version 102)
+
+ShizuPosed vendors the modern `io.github.libxposed.api.*` surface and reports **102**.
+
+### What's functional
+
+- `XposedInterface` — `hook(Executable)` → `HookBuilder` → `intercept(Hooker)` → `HookHandle`, `hookClassInitializer(Class)`, `deoptimize(Executable)`, `getInvoker(Method)` / `getInvoker(Constructor)`, `log(...)`, `getFrameworkName()` / `getFrameworkVersion()` / `getFrameworkVersionCode()` / `getFrameworkProperties()`, `getModuleApplicationInfo()`.
+- `HookBuilder.setId(String)` / `HookHandle.getId()` — id storage and retrieval.
+- `HookHandle.replaceHook(Hooker)` — swaps the live callback without reinstalling the stub.
+- `XposedModule` / `XposedModuleInterface` — `onModuleLoaded`, `onPackageLoaded` (Android 10+), `onPackageReady`, `onSystemServerStarting` (never called), `onHotReloading` / `onHotReloaded` (declared, never called).
+- `Chain` — `getExecutable()`, `getThisObject()`, `getArgs()`, `getArg(i)`, `proceed()`, `proceed(Object[])`, `proceedWith(Object)`, `proceedWith(Object, Object[])`.
+
+### What's not
+
+- `getRemotePreferences` / `openRemoteFile` — not implemented.
+- Hot reload — declared, never invoked.
+- `system_server` hooking — `onSystemServerStarting` is never called.
+- `deoptimize` — returns `false`. Hook installation deopts implicitly.
+
+### Hooking from a libxposed module
+
+```java
+public class MainModule extends XposedModule {
+    @Override
+    public void onPackageLoaded(PackageLoadedParam param) {
+        try {
+            Method m = param.getDefaultClassLoader()
+                .loadClass("com.example.target.MainActivity")
+                .getDeclaredMethod("onCreate", Bundle.class);
+            hook(m).setId("main-oncreate").intercept(chain -> {
+                Object r = chain.proceed();
+                // ... post-processing ...
+                return r;
+            });
+        } catch (Throwable t) {
+            log(Log.ERROR, "example", "onPackageLoaded failed: " + t);
+        }
+    }
+}
+```
+
+`replaceHook` swaps the live callback without reinstalling the stub. It is not atomic with respect to an in-flight invocation: the current call finishes on the old hooker, the next call uses the new one.
 
 ---
 
@@ -475,24 +543,24 @@ Both are available on `XposedBridge` and `LSPosedManager`.
 
 Standard Xposed module resolution. The manager scans each installed module's APK for one of four markers:
 
-  1. `assets/xposed_init` — the canonical marker.
-  2. `assets/xposed_module` — an older convention.
-  3. `META-INF/xposed/module.prop` — EdXposed-era.
-  4. `assets/native_init` — a weak signal.
+1. `assets/xposed_init` — the canonical marker.
+2. `assets/xposed_module` — an older convention.
+3. `META-INF/xposed/module.prop` — EdXposed-era.
+4. `assets/native_init` — a weak signal.
+
+### How ShizuPosed decides which API a module speaks
+
+- If the entry class extends `io.github.libxposed.api.XposedModule`, the module is driven through the **libxposed lifecycle**.
+- Otherwise, if the entry class implements a classic `de.robv.android.xposed.IXposedHook*` interface, the module is driven through the **classic lifecycle**.
+- Otherwise, a reflective scan for a `handleLoadPackage` method is the last resort.
 
 ### Recommended scope
 
-Modules can declare which apps they're _intended_ for by shipping an `assets/scope.list` file inside the APK.
+Modules can declare which apps they're intended for by shipping an `assets/scope.list` file.
 
 ### The scope editor
 
-The scope editor lists the apps a module can be applied to. Not every installed package appears:
-
-  * **Protected UIDs are hidden.** A package whose UID is below 10000 — `SYSTEM_UID` (1000) and the reserved system UID pool (1001–1999) — is not offered. Those are the packages the shell UID cannot `setuid` to, and a scope entry for them would never fire.
-  * **The manager itself is hidden.** Scoping ShizuPosed is meaningless; it's the framework, not a target.
-  * **Everything else is shown.** Ordinary apps (`uid >= 10000`) and preinstalled apps with a dedicated UID in that range appear and can be selected.
-
-A package whose UID is reported as 0 during package scanning falls back to a name-prefix check (`android.`, `com.android.`, `com.google.android.`) so framework packages are still excluded and preinstalled apps are still shown.
+The scope editor lists the apps a module can be applied to. Protected UIDs are hidden. The manager itself is hidden. System packages with no UI and no running process are hidden.
 
 ---
 
@@ -500,141 +568,149 @@ A package whose UID is reported as 0 during package scanning falls back to a nam
 
 A module UI shows "Activated" when one of three things is true:
 
-  * **Its own hook is installed in this process.** Some modules hook one of their own UI methods and use the hook's presence as the activation signal. Under ShizuPosed, this requires the module's UI to have been launched **through** ShizuPosed — long-press the module's row, or tap "Open module app" in the detail sheet. Launching from the launcher leaves the hook uninstalled and the UI reports its original state.
-  * **`isModuleActive(getPackageName())` returns true.** The module asks the provider whether a marker exists for its own package, listing it in `moduleList`. That marker is written when the module's UI has been launched through ShizuPosed and `handleLoadPackage` ran.
-  * **`isModuleActiveAnywhere(getPackageName())` returns true.** The module asks the provider whether any marker lists it, regardless of which target the marker belongs to. This is the LSPosed-style "am I active anywhere" question, and it's the most compatible check for modules that were written against LSPosed's semantics.
-
-### The marker mirror
-
-The shell-side `XposedHook` writes one JSON marker per process it bootstraps to `<shell-base>/hooked/<pkg>.json`. The marker is written whenever the bind attempt completes, even if zero modules loaded — a marker with `moduleList: []` still records that ShizuPosed attempted this package. The manager mirrors the markers into its own files directory.
-
-### The query chain
-
-    Module UI process
-      → XposedBridge.isModuleActive(pkg)
-        → LSPosedManager.isModuleActive(pkg)
-          → ContentResolver.query(content://<status-authority>/active/<pkg>)
-            → ModuleStatusProvider
-              → reads <manager files>/.markers/*.json
-              → returns active=1 or active=0
-
-The `<status-authority>` is `com.shizuposed.manager.status` in the standard build, and `<x>.<y>.status` in the stealth build. The `any-active` route follows the same chain with a different endpoint.
+- **Its own hook is installed in this process.** Under ShizuPosed, this requires the module's UI to have been launched **through** ShizuPosed.
+- **`isModuleActive(getPackageName())` returns true.**
+- **`isModuleActiveAnywhere(getPackageName())` returns true.**
 
 ### The Android 11+ package visibility requirement
 
-On Android 11 and later, a module that queries the status provider from its own UI must declare the provider's authority in the module's own `AndroidManifest.xml`:
+A module that queries the status provider from its own UI must declare the provider's authority in its own `AndroidManifest.xml`:
 
-    <queries>
-        <provider android:authorities="com.shizuposed.manager.status" />
-    </queries>
+```xml
+<queries>
+    <provider android:authorities="com.shizuposed.manager.status" />
+</queries>
+```
 
-In the stealth build, the authority is different. The module has to declare whichever authority matches the build it's running against. Without that declaration, every query returns an empty cursor — indistinguishable from "no marker." Both `XposedBridge` and `LSPosedManager` log a warning to logcat when this happens, with the exact manifest snippet to add. The warning tag is `ShizuPosed` (or `Xposed` for calls through `XposedBridge`).
-
-### Modules that check their own activation state
-
-Some modules don't query the framework's provider. They hook one of their own UI methods and use the hook's presence as the activation signal. Under ShizuPosed that means launching the module's UI through ShizuPosed.
-
-The module's own classloader is what `lpparam.classLoader` points at during a self-hook launch, so `findAndHookMethod` on the module's own classes resolves.
-
-**How to do it:**
-
-  * Long-press the module's row in the Modules tab.
-  * Or tap "Open module app" in the detail sheet.
-
-### Modules that don't self-hook
-
-Many modules don't use the self-hook pattern. Some are pure system-hook modules — CorePatch, for example, only does work when `packageName == "android"`. Those modules require LSPosed.
+Without that declaration, every query returns an empty cursor.
 
 ### When a module still reports "not activated"
 
-The module detail sheet has a **Run activation diagnostic** action. It reports, for the selected module:
-
-  * Whether the module is in the manager's module list.
-  * Whether its cached dex is present on the shell side.
-  * How many apps it's scoped to.
-  * Whether any marker lists it.
-  * The `<queries>` declaration it needs on Android 11+.
-
-If the diagnostic says the marker exists and lists the module, but the module UI still shows "not activated," the module is checking a signal ShizuPosed doesn't provide — typically a check for LSPosed-specific classes, the LSPosed manager package name, or a coverage model that assumes zygote-wide injection. That's a compatibility gap between the module and the framework, not a bug in either. The fix is on the module's side: check its own hook, or use `isModuleActiveAnywhere`.
+The module detail sheet has a **Run activation diagnostic**. It reports whether the module is in the manager's module list, whether its cached dex is present, how many apps it's scoped to, whether any marker lists it, and the `<queries>` declaration it needs on Android 11+.
 
 ---
 
 ## Module development
 
-Standard Xposed API.
+ShizuPosed supports two module APIs.
 
-    public class MainHook implements IXposedHookLoadPackage {
-        @Override
-        public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-            XposedBridge.log("Hooking " + lpparam.packageName);
-            XposedHelpers.findAndHookMethod(
-                "com.example.target.MainActivity", lpparam.classLoader,
-                "onCreate", android.os.Bundle.class,
-                new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam p) {
-                        // ...
-                    }
-                });
+### Classic API (`de.robv.android.xposed.*`)
+
+```java
+public class MainHook implements IXposedHookLoadPackage {
+    @Override
+    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+        XposedBridge.log("Hooking " + lpparam.packageName);
+        XposedHelpers.findAndHookMethod(
+            "com.example.target.MainActivity", lpparam.classLoader,
+            "onCreate", android.os.Bundle.class,
+            new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam p) {
+                    // ...
+                }
+            });
+    }
+}
+```
+
+### libxposed API (`io.github.libxposed.api.*`, API 102)
+
+```java
+public class MainModule extends XposedModule {
+    @Override
+    public void onModuleLoaded(ModuleLoadedParam param) {
+        log(Log.INFO, "example", "loaded in " + param.getProcessName());
+    }
+
+    @Override
+    public void onPackageLoaded(PackageLoadedParam param) {
+        try {
+            Method m = param.getDefaultClassLoader()
+                .loadClass("com.example.target.MainActivity")
+                .getDeclaredMethod("onCreate", Bundle.class);
+            hook(m).intercept(chain -> {
+                Object r = chain.proceed();
+                return r;
+            });
+        } catch (Throwable t) {
+            log(Log.ERROR, "example", "onPackageLoaded failed: " + t);
         }
     }
+}
+```
+
+#### What each callback sees
+
+| Callback | When it fires | What's available |
+|---|---|---|
+| `onModuleLoaded` | After class load, before any package work | `ModuleLoadedParam.getProcessName()`, `isSystemServer()` (always `false`) |
+| `onPackageLoaded` | During bootstrap, after classloader resolved, before `Application.onCreate` | `PackageLoadedParam.getPackageName()`, `getApplicationInfo()`, `getDefaultClassLoader()`, `isFirstPackage()` |
+| `onPackageReady` | After `Application.onCreate`, before any activity | Everything from `onPackageLoaded`, plus `getClassLoader()` and `getAppComponentFactory()` |
+| `onSystemServerStarting` | Never | — |
+| `onHotReloading` | Never | — |
+| `onHotReloaded` | Never | — |
 
 ### Using the lifecycle bridges
 
-A module that needs to act on a class *before* its static initializer runs:
+```java
+ClassLoadingBridge.registerClassLoadListener((name, loader) -> {
+    if ("com.example.target.SecretDetector".equals(name)) {
+        XposedHelpers.findAndHookMethod(name, loader, "check", ...);
+    }
+});
 
-    ClassLoadingBridge.registerClassLoadListener((name, loader) -> {
-        if ("com.example.target.SecretDetector".equals(name)) {
-            XposedHelpers.findAndHookMethod(name, loader, "check", ...);
-        }
-    });
-
-A module that needs to intercept a service before it is created:
-
-    ApplicationThreadBackend.registerListener((methodName, args) -> {
-        if ("scheduleCreateService".equals(methodName)) {
-            // ...
-        }
-        return true;
-    });
+ApplicationThreadBackend.registerListener((methodName, args) -> {
+    if ("scheduleCreateService".equals(methodName)) {
+        // ...
+    }
+    return true;
+});
+```
 
 ### Reporting state in a module UI
 
-    boolean enabled = XposedBridge.isModuleEnabled(getPackageName());
-    boolean active  = XposedBridge.isModuleActive(getPackageName());
-    boolean loaded  = XposedBridge.isModuleActiveAnywhere(getPackageName());
-    String[] scope  = XposedBridge.getModuleScope(getPackageName());
-
-For a module UI that wants to display "Activated" correctly under both LSPosed and ShizuPosed, check in this order:
-
-  1. Is my own hook installed in this process? If yes, active.
-  2. `isModuleActive(getPackageName())` — active in a specific process.
-  3. `isModuleActiveAnywhere(getPackageName())` — active anywhere.
-
-Step 1 is the pure self-hook pattern and works on both frameworks. Step 3 is the ShizuPosed-compatible equivalent of what LSPosed's `isModuleActive` effectively returns.
+```java
+boolean enabled = XposedBridge.isModuleEnabled(getPackageName());
+boolean active  = XposedBridge.isModuleActive(getPackageName());
+boolean loaded  = XposedBridge.isModuleActiveAnywhere(getPackageName());
+String[] scope  = XposedBridge.getModuleScope(getPackageName());
+```
 
 ### Resource replacement
 
-    public class Res implements IXposedHookInitPackageResources {
-        @Override
-        public void handleInitPackageResources(
-                XC_InitPackageResources.InitPackageResourcesParam resparam) {
-            resparam.res.setReplacement(R.string.some_string, "replacement");
-        }
+Classic API:
+
+```java
+public class Res implements IXposedHookInitPackageResources {
+    @Override
+    public void handleInitPackageResources(
+            XC_InitPackageResources.InitPackageResourcesParam resparam) {
+        resparam.res.setReplacement(R.string.some_string, "replacement");
     }
+}
+```
+
+libxposed API 102 does not include a resource-replacement callback.
 
 ### Layout hooks
 
-    resparam.res.hookLayout(R.layout.main, new XC_LayoutInflated() {
-        @Override
-        public void handleLayoutInflated(LayoutInflatedParam param) {
-            // param.view, param.resId, param.resName are set
-        }
-    });
+Classic API:
+
+```java
+resparam.res.hookLayout(R.layout.main, new XC_LayoutInflated() {
+    @Override
+    public void handleLayoutInflated(LayoutInflatedParam param) {
+        // param.view, param.resId, param.resName are set
+    }
+});
+```
+
+Layout hooks are classic-only in API 102.
 
 ### Writing a hook that works on every backend
 
-Because Amiru and Native can't carry object arguments or object returns, a module that needs those should either rely on Pine succeeding, avoid object arguments entirely, or accept that the hook may not fire with the values it expects.
+Pine honors every argument mutation a `beforeHookedMethod` or `afterHookedMethod` makes. Constructors are hookable on Pine and Native; Amiru and Proxy do not support constructor hooks. Native passes object arguments as `null`; Amiru carries object arguments since 1.4.9.
 
 ---
 
@@ -642,56 +718,29 @@ Because Amiru and Native can't carry object arguments or object returns, a modul
 
 Android 10 or newer, ARM64. Shizuku 13.1.1 or newer, running and authorized — the recommended build is **Shizuku-Next** by rushiranpise at `github.com/rushiranpise/Shizuku-Next`. About 200 MB free storage. No root required.
 
-For building the app: JDK 25 (with a Gradle toolchain), Gradle 9.8, Android SDK 37. Native libraries rebuild with `clang` alone on Termux; no NDK is required if you're building on-device. Building with the Android NDK (r25+) works and is what CI uses.
-
-Upstream Shizuku works. Shevery is also supported, though some of its privileged-API paths have known issues.
+For building the app: JDK 21 (with a Gradle toolchain), Gradle 9.8, Android SDK 37. Native libraries rebuild with `clang` alone on Termux. Building with the Android NDK (r25+) works and is what CI uses. BouncyCastle `bcprov-jdk18on:1.78.1` and `bcpkix-jdk18on:1.78.1` are required (used by `ManagerCloak.selfSign` for per-install key generation).
 
 ---
 
 ## Installation
 
-Install Shizuku (Shizuku-Next recommended) from the link above, then start it via ADB or via the Shizuku app's own start flow.
+Install Shizuku (Shizuku-Next recommended), then start it via ADB or via the Shizuku app's own start flow.
 
-Download the build you want from the Releases page:
+Download the APK from the Releases page:
 
-  * `app-standard-release.apk` — the normal build.
-  * `app-stealth-release.apk` — the scrambled-name build.
-
-Unless you have a specific reason to pick the stealth build, pick the standard one. Its updates work like any other app's, and everything in this README refers to it by name.
+- `app-release.apk` — the single build.
 
 Install it:
 
-    adb install -r app-standard-release.apk
+```
+adb install -r app-release.apk
+```
 
-Or `app-stealth-release.apk` for the stealth build.
+Open the manager. It requests Shizuku permission on first launch. Add a module from the Modules tab. Edit the module's scope. Then either tap **Launch App under ShizuPosed** and pick a scoped app, or just open a scoped app normally; the process monitor will trigger a spawn-only injection for it.
 
-Open the manager. It requests Shizuku permission on first launch. Add a module from the Modules tab, or use one that auto-detects. Edit the module's scope to choose which apps it applies to — protected-UID packages won't appear in the picker. Then either tap **Launch App under ShizuPosed** and pick a scoped app, or just open a scoped app normally; the process monitor will trigger a spawn-only injection for it.
+### Changing the installed package name
 
-Activation isn't retroactive for a process already running. The monitor catches a scoped app when it starts; an app that was already running before the module was scoped is not retroactively hooked.
-
-### The stealth build
-
-The stealth build has a scrambled package name of the form `<letter>.<letters>.<letters>`, like `h.sghdt.kihyturd`. Its status provider authority is scrambled the same way. A target app that checks for `com.shizuposed.manager` by name finds nothing, and a check for `com.shizuposed.manager.status` finds nothing either.
-
-It's a separate app to Android:
-
-  * It cannot update the standard build, and the standard build cannot update it. Installing one over the other fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`.
-  * It does not share settings, modules, or Shizuku permissions with the standard build.
-  * Its launcher label is **Sync Service** by default, so you can tell the two apart if both are installed.
-
-Switching between builds means uninstalling one, installing the other, and setting it up from scratch. Modules you added to one don't appear in the other.
-
-Before installing the stealth build over an existing standard install, clear the shell-side cache so the new build starts fresh:
-
-    rm -rf /data/user/0/com.android.shell/files/.syscall_cache
-
-On devices where that path isn't writable, use the fallback:
-
-    rm -rf /data/local/tmp/shizuposed
-
-Either is safe if the directory doesn't exist.
-
-The stealth build does not hide behavior. A target app that detects the hook by checking its own method entry points, or by running its own runtime-integrity SDK, still detects the hook regardless of which build you're running. The scrambled name closes name-based checks only.
+If a target app checks for `com.shizuposed.manager` by name, use **Settings → Hide ShizuPosed app**. The manager generates a random same-length name, patches the current APK's manifest, re-signs with the per-install key, installs via Shizuku, and uninstalls the old package. **Unhide ShizuPosed app** reverses it, re-signing with the same per-install key.
 
 ---
 
@@ -699,7 +748,7 @@ The stealth build does not hide behavior. A target app that detects the hook by 
 
 Five tabs.
 
-**Home** shows the status card, the counter tiles, and the Framework Info card.
+**Home** shows the status card, the counter tiles, and the Framework Info card (which now shows both the classic API level and the libxposed API level — 101 and 102).
 
 **Modules** lists installed modules with XStealth always at the top.
 
@@ -707,54 +756,23 @@ Five tabs.
 
 **Logs** shows the manager's own log with live search and a clear button.
 
-**Settings** has the runtime toggles, scan interval and hook delay sliders, the Maintenance section, a **Check for updates** button, and config export.
-
-### Module detail sheet
-
-For any module, the detail sheet has a **Run activation diagnostic** action. It prints a short report for that module:
-
-  * Whether the module is in the module list.
-  * Whether its cached dex is present.
-  * How many apps it's scoped to.
-  * Whether any marker lists it.
-  * The `<queries>` block the module needs on Android 11+.
-
-The report is designed to answer "why does this module show not activated?" in one screen, without needing to read logcat.
+**Settings** has runtime toggles, scan interval and hook delay sliders, the Sysku toggle and status line, the Maintenance section (including **Hide ShizuPosed app**, **Unhide ShizuPosed app**, **Clear logs**, **Clean all caches**), **Check for updates**, and config export.
 
 ### XStealth detail sheet
 
 Fifteen toggles, organized by layer:
 
-**Master toggles**
-  * **Enable XStealth** — the master switch
-  * **Enable XStealth Next** — the aggressive native engine
-  * **Use bridge** — the enumeration-hiding library
+**Master toggles:** Enable XStealth, Enable XStealth Next, Use bridge.
 
-**Settings-based checks**
-  * **Hide Developer Options**
-  * **Hide ADB enabled**
+**Settings-based checks:** Hide Developer Options, Hide ADB enabled.
 
-**System properties and Build fields**
-  * **Hide system properties**
-  * **Sanitize Build fields**
+**System properties and Build fields:** Hide system properties, Sanitize Build fields.
 
-**Framework properties and threads**
-  * **Scrub framework properties**
-  * **Rename framework threads**
+**Framework properties and threads:** Scrub framework properties, Rename framework threads.
 
-**Package and process**
-  * **Hide Shizuku package**
-  * **Hide ShizuPosed package**
-  * **Hide running processes**
-  * **Hide /proc entries**
+**Package and process:** Hide Shizuku package, Hide ShizuPosed package, Hide running processes, Hide `/proc` entries.
 
-**API protection and dex**
-  * **Protect Xposed API calls**
-  * **Optimize module dex**
-
-The status line at the top of the sheet summarizes which layers are armed.
-
-Note: `Hide Developer Options` and `Hide ADB enabled` change what a target *reads*, not what the device actually has set.
+**API protection and dex:** Protect Xposed API calls, Optimize module dex.
 
 ---
 
@@ -762,11 +780,15 @@ Note: `Hide Developer Options` and `Hide ADB enabled` change what a target *read
 
 ShizuPosed is built from sources in this repository. The APK is reproducible from a clean checkout with the documented toolchain.
 
-**Signed builds.** Both the standard and stealth APKs are signed with the project's release key.
+**Signed builds.** The released APK is signed with the project's release key.
 
-**Native library provenance.** Each `.so` is built from the `.c` file with the same name in the `native/` directory of this repository.
+**Native library provenance.** Each `.so` is built from the `.c` file with the same name in the `native/` directory.
 
-**What to look for in a release.** The release notes list the NDK version used, the SDK version, the Gradle and JDK versions, and a SHA-256 of each native library.
+**What to look for in a release.** The release notes list the NDK version, SDK version, Gradle and JDK versions, and a SHA-256 of each native library. Pine's SHA-256 should match the upstream canyie/pine release — if it doesn't, reject the build.
+
+**Vendored libxposed API.** The `io.github.libxposed.api.*` classes in `XposedHook.dex` are vendored from the upstream libxposed API 102 definitions.
+
+**Per-install cloak key.** `files/cloak-install.p12` is generated on the first cloak and stored in the manager's data directory. It is **not** included in the APK. It is owner-readable, protected by the app's UID sandbox. Every cloaked install has a unique signature; a target app cannot fingerprint one key across installs.
 
 ---
 
@@ -774,32 +796,22 @@ ShizuPosed is built from sources in this repository. The APK is reproducible fro
 
 ### The app
 
-    export ANDROID_HOME=$HOME/Android/Sdk
-    git clone <repo>
-    cd ShizuPosed
-    ./gradlew clean :app:assembleStandardRelease
-    adb install -r app/build/outputs/apk/standard/release/app-standard-release.apk
+```
+export ANDROID_HOME=$HOME/Android/Sdk
+git clone <repo>
+cd ShizuPosed
+gradle clean :app:assembleRelease
+```
 
-To build the stealth APK as well:
-
-    ./gradlew :app:assembleStealthRelease
-    adb install -r app/build/outputs/apk/stealth/release/app-stealth-release.apk
-
-The stealth build's package name is derived from a per-machine seed. To see what this machine will produce:
-
-    ./gradlew printStealthId
-
-The same machine produces the same name on every build. Pass `-PstealthSeed=<anything>` to get a different name for that build.
+The single-flavor release is the only build. `checkNoOldPackageLeak` runs as a `finalizedBy` on `assembleRelease` and fails if `com.shizuposed.manager` appears as a literal in `classes.dex` or `resources.arsc` (a leak into a cloaked install).
 
 ### The native libraries
 
-The five native libraries and `libcallsite.so` build with the Android NDK. On Termux, an ARM64 Android NDK is required. Build for API 29 or higher.
+The six native libraries (`libshizuposed.so`, `libamiru.so`, `libcallsite.so`, `libxstealth.so`, `libxstealth_next.so`, `libxstealth_bridge.so`) and the optional `libsysku.so` build with the Android NDK. Build for API 29 or higher.
 
 ### The build checks
 
-The `app/build.gradle` includes six verification tasks. Skip all six with:
-
-    ./gradlew assembleStandardRelease -PskipNativeCheck=true
+`app/build.gradle` includes seven verification tasks: `checkNativeShim` (required), `checkCallSite`, `checkAmiru`, `checkXStealth`, `checkXStealthNext`, `checkXStealthBridge`, `checkSysku` (all optional, warn-only). Skip all seven with `-PskipNativeCheck=true`.
 
 ### Configuration cache
 
@@ -811,13 +823,13 @@ The build is configuration-cache-compatible with Gradle 9.8.
 
 Every routed launch writes stderr and stdout from `app_process` to `<shell-base>/launch.log`:
 
-    cat /data/user/0/com.android.shell/files/.syscall_cache/launch.log
+```
+cat /data/user/0/com.android.shell/files/.syscall_cache/launch.log
+```
 
-The spawn-tool probe result is logged once at startup. XStealth's native preload happens first. The stub-template capture and verification logs its outcome. Each Binder-hooking class logs its refusals. The two lifecycle bridges log their own install. Each XStealth layer logs its own status.
+`logcat -s PineBackend` shows whether Pine initialized and every hook it installed or declined. `logcat -s ShizuPosedAmiru` shows Amiru's slot activity and layout probe result.
 
-Monitor-triggered launches log through the same path. Each call to `injectProcess` logs which guard it passed, which it failed, and whether the routed launch succeeded. The launch itself is silent in the UI; the Logs tab is where to watch it.
-
-Each bootstrap also writes a marker to `<shell-base>/hooked/<pkg>.json` when it completes, including a marker with an empty `moduleList` when no modules loaded. The marker records which modules ran and which failed.
+Each bootstrap also writes a marker to `<shell-base>/hooked/<pkg>.json` when it completes.
 
 ---
 
@@ -825,87 +837,36 @@ Each bootstrap also writes a marker to `<shell-base>/hooked/<pkg>.json` when it 
 
 These are structural, not bugs to be fixed.
 
-**Reach.** `system_server` isn't hooked. Cross-process hooks aren't possible. XML-level resource replacement isn't supported. No hot-reload. ROMs that block `app_process` can't run the framework.
+**Reach.** `system_server` isn't hooked. Cross-process hooks aren't possible. XML-level resource replacement isn't supported. No hot reload. ROMs that block `app_process` can't run the framework.
 
-**Protected UIDs are unreachable.** The shell UID cannot `setuid` to `SYSTEM_UID` (1000) or the reserved system UID pool (1001–1999). System UI, Settings, Phone, Bluetooth, NFC, Shell, and `system_server` cannot be hooked by any path. The scope editor hides them so they can't be selected. Ordinary apps (`uid >= 10000`), including preinstalled apps with a dedicated UID, are reachable.
+**Protected UIDs are unreachable.** The scope editor hides them.
 
-**Zygote-timing APIs.** Modules that implement `IXposedHookZygoteInit` expect a callback that only fires under a zygote-based framework. ShizuPosed declares the interface for link compatibility but cannot call it. `IXposedHookCmdInit` was removed in 7.2.
+**Zygote-timing APIs.** `initZygote()` fires once per bootstrapped process, not once per zygote fork. `onSystemServerStarting` and `onHotReloading` / `onHotReloaded` are never called.
 
-**Service.onCreate.** Reachable in the process ShizuPosed launched, via the `ApplicationThread` binder interface.
+**The process is not a zygote fork.** After `setuid`, its parent is `app_process`, not `zygote`. XStealth's appearance layer scrubs `getppid()`, the `PPid:` and `Name:` fields in `/proc/self/status`, the comm field in `/proc/self/stat`, `/proc/self/exe`, `/proc/1/comm`, `/proc/self/cmdline`, `/proc/self/mountinfo`, and `/proc/self/cgroup`. The scrub is userspace, not lineage. `Uid:`, SELinux context, and process start time are unchanged.
 
-**Monitor-triggered injection doesn't attach to the detected pid.** Nothing non-root can. When the monitor sees a scoped app start, it can only trigger a spawn-only routed launch, which creates a new process for that package. For apps that cooperate with that, hooks install during bootstrap and the user's own launch routes into the bootstrapped process. For apps that manage their own process lifecycle aggressively, the routed launch may not produce a usable process — the same ceiling as the button-triggered path.
+**The appearance layer is trust-gated.** Framework threads that call `getppid()` see the real parent PID. This is deliberate.
 
-**Monitor-triggered injection never opens the UI.** The monitor path is spawn-only. The user opens the app; the framework does not pop it to the foreground on its own.
+**The appearance layer requires `libxstealth`'s exports.** A build that skips `libxstealth.so` loses the appearance layer entirely.
 
-**Object arguments and object returns on the native backends.** Amiru and Native pass object arguments to Java callbacks as `null`, and don't accept object return values. `thisObject` is also `null` on both. Pine, Instrumentation, and Proxy handle objects correctly.
+**Monitor-triggered injection doesn't attach to the detected pid.** It can only trigger a spawn-only routed launch, and never opens the UI.
 
-**Entry-point shape matching has a ceiling.** The stub's prologue matches what ART emits for the first five or six instructions. A detector that reads past the prologue, or that disassembles the whole stub, still sees the difference.
+**Object arguments on the Native backend.** Native passes object arguments to Java callbacks as `null`, and does not accept object return values. `thisObject` is also `null`. Pine, Amiru (since 1.4.9), Instrumentation, and Proxy handle objects correctly.
 
-**XStealth sanitizes reads, not values.** The underlying value of `development_settings_enabled` in the settings database is unchanged by XStealth.
+**Amiru doesn't support constructors or after-hooks.** Constructor hooks fall through to the next backend; after-hooks are not implemented in the stub.
 
-**XStealth's practical ceiling.** XStealth covers the common detection paths. It doesn't cover hardware attestation, native reads of the settings database through the property shared-memory area, method-list reconstruction, exotic reflection, kernel-level watchers, full-stub disassembly, or signals unrelated to ShizuPosed.
+**Amiru object returns use `System.identityHashCode` as the handle token.** Correct for the vast majority of cases; a hash collision would return the wrong object. A proper JNI local-ref fix is a follow-up.
 
-**Bridge layer caveats.** The bridge library filters `dl_iterate_phdr` process-wide. `getenv` scrubbing only covers the API path.
+**`replaceHook` is not atomic with an in-flight invocation.** The current call finishes on the old hooker; the next call uses the new one.
 
-**Subprocess hiding has a load-order window.** Since 8.6, the native engines load at the top of `XposedHook.main()`, so the window is a few milliseconds.
+**Classic API reports 101.** A module that hardcodes `getXposedVersion() == 100` may fail; the fix is `>= 100`.
 
-**Socket shim is inert by default.** `SocketCheck` installs no hooks unless a daemon is configured.
+**libxposed API reports 102, not 103.**
 
-**Modules that require LSPosed.** Some modules do their work in `system_server`. Others check for LSPosed-specific signals — the LSPosed manager package, `org.lsposed.*` server classes, or coverage that assumes zygote-wide injection — and display "not activated" under any framework whose coverage is narrower. That's a compatibility gap, not a ShizuPosed bug. The module's UI needs to check its own hook or use `isModuleActiveAnywhere`.
+**Native hooks refuse non-relocatable first instructions.** A native hook whose first instruction is PC-relative (`adrp`, `adr`, `b`, `bl`, `ldr`-literal, `add`-from-PC) is refused with `JNI_FALSE` so the dispatcher falls back to another backend. Producing a wrong trampoline would crash.
 
-**The stealth build is a separate install.** It cannot update the standard build, and vice versa. Switching between them means uninstalling one, installing the other, and setting it up again. Its scrambled package name hides the manager from name-based checks; it does not hide the hook from behavior-based ones.
+**CallSite is non-functional.** Every install is refused. The interpreter-table scanner and patch machinery are preserved as scaffolding for a future implementation.
 
-**Amiru-specific:** object arguments arrive as `null`, `thisObject` arrives as `null`, after-hooks aren't dispatched, constructors aren't hookable, ARM64 only.
+**Cloaked managers can't install updates in place.** Unhide → update → re-Hide is the path.
 
-**Native engines:** in-process only, object arguments and `thisObject` arrive as `null`, after-hooks aren't dispatched, ARM64 only.
-
-**Binder-level hiding has structural gaps.** The `BinderProxy.transact` hooks only see calls that go through the Java `IBinder.transact` method in *this process*. They do not see:
-
-  * **Calls from a second process the target spawned.**
-  * **Native code that opens `/dev/binder` directly.**
-  * **Calls made before the hooks install.**
-
-**Banking apps that ship native runtime-integrity SDKs (BioCatch and friends).** Some banking apps come bundled with third-party fraud-detection SDKs that check the app's own runtime state. The one you'll run into most often is **BioCatch** — HSBC Philippines and several other regional banks use it.
-
-XStealth shuts down the file and property channels BioCatch reads through libc, and closes the `IPackageManager` and `IContentProvider` Binder channels for package and settings queries. What it can't shut down:
-
-  * The **USB Binder channel** — BioCatch calls `IUsbManager.getCurrentFunctions()` directly.
-  * The **ART-integrity channel** — shape matching closes the byte-pattern check on the entry point's first instructions; it doesn't close a check that disassembles the whole stub.
-  * **Behavioral signals** — tap timing and swipe pressure aren't reads the framework can intercept.
-
-The only workaround that holds up:
-
-  1. Turn off Developer Options completely.
-  2. Turn off USB debugging.
-  3. Reboot.
-  4. Open the banking app.
-
-If it still flags you after all that, the detection isn't coming from local device state. It's coming from a hardware attestation signal, a server-side fingerprint, or a check on where the app was installed from.
-
-This isn't a ShizuPosed bug. Without root, no framework is going to beat BioCatch's runtime-integrity checks.
-
----
-
-## License
-
-    Copyright 2024-2026 ShizuPosed Contributors
-
-    Licensed under the Apache License, Version 2.0 (the "License");
-    you may not use this file except in compliance with the License.
-    You may obtain a copy of the License at
-
-        http://www.apache.org/licenses/LICENSE-2.0
-
-    Unless required by applicable law or agreed to in writing, software
-    distributed under the License is distributed on an "AS IS" BASIS,
-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    See the License for the specific language governing permissions and
-    limitations under the License.
-
----
-
-## Acknowledgements
-
-Rikka, for Shizuku; the primitive that makes all of this possible. canyie, for Pine, the primary ART hooking engine. LSPosed, for the API generation ShizuPosed targets, and for the design of the module status provider contract.
-
-And every module author who kept the `de.robv.android.xposed.*` API alive long enough for an alternative to matter.
+**No signature verification on the downloaded update APK.** Size and ZIP magic checks catch truncation and HTML-instead-of-APK, not a malicious APK served from a compromised GitHub response.

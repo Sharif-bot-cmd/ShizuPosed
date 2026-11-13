@@ -18,7 +18,7 @@
 #define ALOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define AMIRU_MAX_ARGS 32
-#define AMIRU_VERSION "0.4.0"
+#define AMIRU_VERSION "0.5.0"
 #define MAX_HOOKS 512
 
 extern void __clear_cache(void *start, void *end);
@@ -57,6 +57,22 @@ typedef int (*get_template_info_full_fn)(struct prologue_info *out_info,
 static volatile int g_debug_logging = 0;
 
 /* ─────────────────────────────────────────────────────────────
+ * Thread-local "did the dispatcher set a result?" flag
+ *
+ * The stub calls amiru_dispatch(slot, frame). The dispatcher
+ * may set a result via Java_com_shizuposed_manager_core_
+ * NativeBridge_amiruSetResult (which writes this flag). The
+ * stub then calls amiruHasResult() to decide whether to return
+ * the dispatcher's value or tail-call the original.
+ *
+ * This is the sentinel that fixes object returns: a dispatcher
+ * that returns a real null object (0) is distinguishable from
+ * "the dispatcher did nothing and the original should run."
+ * ───────────────────────────────────────────────────────────── */
+
+static __thread int32_t t_has_result = 0;
+
+/* ─────────────────────────────────────────────────────────────
  * Layout globals
  * ───────────────────────────────────────────────────────────── */
 
@@ -78,31 +94,16 @@ typedef struct {
     int64_t  art_method;              /* +0x00 */
     int64_t  orig_entry;              /* +0x08 */
     void    *stub;                    /* +0x10 */
-    int32_t  arg_count;               /* +0x18 */
-    int32_t  reserved0;               /* +0x1C */
-    jobject  global_self;             /* +0x20 */
-    int32_t  reserved1;               /* +0x28 */
-    int32_t  reserved2;               /* +0x2C */
+    size_t   stub_len;                /* +0x18 */
+    int32_t  arg_count;               /* +0x20 */
+    int32_t  reserved0;               /* +0x24 */
+    jobject  global_self;             /* +0x28 */
     char     arg_sigs[AMIRU_MAX_ARGS];/* +0x30 */
-    int32_t  reserved3;               /* +0x50 */
 } amiru_hook_t;
 
 static amiru_hook_t g_hooks[MAX_HOOKS];
 static volatile uint32_t g_hook_count = 0;
 static pthread_mutex_t g_hook_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* ─────────────────────────────────────────────────────────────
- * Stub pools
- * ───────────────────────────────────────────────────────────── */
-
-typedef struct amiru_pool {
-    void *base;
-    int64_t used;
-    struct amiru_pool *next;
-} amiru_pool_t;
-
-static amiru_pool_t *g_pools = NULL;
-static pthread_mutex_t g_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ─────────────────────────────────────────────────────────────
  * JNI-global state
@@ -212,6 +213,14 @@ static void load_stub_template(void) {
                   "(reg_mask=0x%02x needed=0x%02x) — "
                   "using shipped stub shape",
                   info.reg_mask, REGS_NEEDED_MASK);
+        }
+        return;
+    }
+
+    if (info.save_x30_at < 0 || info.x30_offset < 0) {
+        if (g_debug_logging) {
+            ALOGW("stub template: template doesn't save x30 — "
+                  "using shipped stub shape");
         }
         return;
     }
@@ -336,40 +345,12 @@ static void *alloc_stub(void) {
     long page = sysconf(_SC_PAGESIZE);
     if (page <= 0) page = 4096;
 
-    pthread_mutex_lock(&g_pool_lock);
+    void *slot = mmap(NULL, (size_t) page,
+                      PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (slot == MAP_FAILED) return NULL;
 
-    amiru_pool_t *p = g_pools;
-    while (p != NULL && p->used >= 32) p = p->next;
-
-    if (p == NULL) {
-        void *base = mmap(NULL, 0x1000,
-                          PROT_READ | PROT_WRITE,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (base == MAP_FAILED) {
-            pthread_mutex_unlock(&g_pool_lock);
-            return NULL;
-        }
-        p = calloc(1, sizeof(*p));
-        if (p == NULL) {
-            munmap(base, 0x1000);
-            pthread_mutex_unlock(&g_pool_lock);
-            return NULL;
-        }
-        p->base = base;
-        p->used = 0;
-        p->next = g_pools;
-        g_pools = p;
-    }
-
-    void *slot = (char *) p->base + (p->used * 0x80);
-    p->used++;
-
-    void *page_start = (void *)((uintptr_t)slot & ~(uintptr_t)(page - 1));
-    mprotect(page_start, (size_t)page, PROT_READ | PROT_WRITE);
-
-    memset(slot, 0, 0x80);
-
-    pthread_mutex_unlock(&g_pool_lock);
+    memset(slot, 0, (size_t) page);
     return slot;
 }
 
@@ -389,22 +370,16 @@ static inline uint32_t insn_movz_x(uint32_t rd, uint32_t imm16,
     return 0xd2800000u | (hw << 21) | ((imm16 & 0xffffu) << 5) | rd;
 }
 
-/* ldr Xt, [sp, #off] — 64-bit unsigned offset. off must be a
- * multiple of 8 in [0, 0x7fff8]. */
 static inline uint32_t insn_ldr_sp(uint32_t rt, uint32_t off) {
     uint32_t imm12 = (off / 8) & 0xfffu;
     return 0xf94003e0u | (imm12 << 10) | rt;
 }
 
-/* str Xt, [sp, #off] — 64-bit unsigned offset. off must be a
- * multiple of 8 in [0, 0x7fff8]. */
 static inline uint32_t insn_str_sp(uint32_t rt, uint32_t off) {
     uint32_t imm12 = (off / 8) & 0xfffu;
     return 0xf90003e0u | (imm12 << 10) | rt;
 }
 
-/* ldp Xt, Xt2, [sp, #off] — 64-bit signed offset. off must be a
- * multiple of 8 in [-512, 504]. */
 static inline uint32_t insn_ldp_sp(uint32_t rt, uint32_t rt2,
                                     int32_t off) {
     int32_t imm7 = off / 8;
@@ -423,22 +398,9 @@ static int emit_load64_x9(uint32_t *p, uint64_t value) {
     return 4;
 }
 
-/*
- * emit_restore — restores x0..x7 and x30 from the frame, then
- * deallocates the frame with `add sp, sp, #frame_size`.
- *
- * v0.4.0 note: this function does NOT preserve x0. Whatever was in
- * x0 before the call is overwritten by the first ldp. That is
- * intentional — the caller (emit_stub) stashes the dispatcher's
- * return value on the stack before calling emit_restore, and
- * reloads it into x0 after emit_restore returns.
- *
- * Returns the number of words written.
- */
 static int emit_restore(uint32_t *p, int32_t frame_size) {
     int i = 0;
 
-    /* x0, x1 */
     if (g_template_info.reg_save_off[1] >= 0 &&
         g_template_info.reg_save_off[1] ==
         g_template_info.reg_save_off[0] + 8) {
@@ -451,7 +413,6 @@ static int emit_restore(uint32_t *p, int32_t frame_size) {
         }
     }
 
-    /* x2, x3 */
     if (g_template_info.reg_save_off[3] >= 0 &&
         g_template_info.reg_save_off[3] ==
         g_template_info.reg_save_off[2] + 8) {
@@ -462,7 +423,6 @@ static int emit_restore(uint32_t *p, int32_t frame_size) {
         p[i++] = insn_ldr_sp(3, (uint32_t) g_template_info.reg_save_off[3]);
     }
 
-    /* x4, x5 */
     if (g_template_info.reg_save_off[5] >= 0 &&
         g_template_info.reg_save_off[5] ==
         g_template_info.reg_save_off[4] + 8) {
@@ -473,7 +433,6 @@ static int emit_restore(uint32_t *p, int32_t frame_size) {
         p[i++] = insn_ldr_sp(5, (uint32_t) g_template_info.reg_save_off[5]);
     }
 
-    /* x6, x7 */
     if (g_template_info.reg_save_off[7] >= 0 &&
         g_template_info.reg_save_off[7] ==
         g_template_info.reg_save_off[6] + 8) {
@@ -484,13 +443,8 @@ static int emit_restore(uint32_t *p, int32_t frame_size) {
         p[i++] = insn_ldr_sp(7, (uint32_t) g_template_info.reg_save_off[7]);
     }
 
-    /* x30, if the template saved it. */
-    if (g_template_info.save_x30_at >= 0 &&
-        g_template_info.x30_offset >= 0) {
-        p[i++] = insn_ldr_sp(30, (uint32_t) g_template_info.x30_offset);
-    }
+    p[i++] = insn_ldr_sp(30, (uint32_t) g_template_info.x30_offset);
 
-    /* add sp, sp, #frame_size */
     p[i++] = 0x910003ffu | ((uint32_t) frame_size << 10);
 
     return i;
@@ -511,6 +465,7 @@ static int emit_restore_shipped(uint32_t *p) {
 static void emit_stub(void *stub,
                       int64_t slot_index,
                       int64_t dispatch_addr,
+                      int64_t has_result_addr,
                       int64_t orig_entry) {
     uint32_t *p = (uint32_t *) stub;
     int i = 0;
@@ -523,13 +478,19 @@ static void emit_stub(void *stub,
             && g_template_info.save_words > 0
             && g_stub_template_len >=
                 (uint32_t) (g_template_info.save_words * 4)
-            && g_template_info.frame_size > 0) {
+            && g_template_info.frame_size > 0
+            && g_template_info.save_x30_at >= 0
+            && g_template_info.x30_offset >= 0) {
         frame_size = g_template_info.frame_size;
         use_template = 1;
     }
 
     int32_t stash_off = frame_size - 8;
-    if (stash_off < 0) stash_off = 0;
+    if (stash_off <= g_template_info.x30_offset) {
+        use_template = 0;
+        frame_size = 0x80;
+        stash_off = 0x78;
+    }
 
     /* ── Prologue ─────────────────────────────────────────── */
 
@@ -565,35 +526,31 @@ static void emit_stub(void *stub,
     i += emit_load64_x9(&p[i], (uint64_t) dispatch_addr);
     p[i++] = INSN_BLR_X9;
 
-    /* ── Stash the dispatcher's return value ──────────────── */
-
+    /* Stash the dispatcher's return value in unused frame space. */
     p[i++] = insn_str_sp(0, (uint32_t) stash_off);
 
-    /* cbz x0, <skip> — if the dispatcher returned 0, tail-call
-     * the original. The branch target is patched once the return
-     * path is fully emitted. */
+    /* ── Has-result check ─────────────────────────────────── */
+
+    /* blr has_result() — x0 = 1 if dispatcher set a result. */
+    i += emit_load64_x9(&p[i], (uint64_t) has_result_addr);
+    p[i++] = INSN_BLR_X9;
+
+    /* cbz x0, <skip> — if x0 == 0, no result, tail-call original. */
     int cbz_idx = i;
     p[i++] = 0xb4000000u;
     int after_cbz = i;
 
-    /* Restore x0..x7 (without add sp). */
+    /* ── Return-value path ────────────────────────────────── */
+
     if (use_template) {
-        /* Reuse emit_restore's body but strip the trailing add sp.
-         * Rather than refactor emit_restore, we temporarily write
-         * it into the buffer, note where the add sp landed, and
-         * overwrite it with the ldr/ret sequence. */
         uint32_t scratch[16];
         int n = emit_restore(scratch, frame_size);
-        /* The last instruction of emit_restore is the add sp. We
-         * want: <rest of restore>, ldr x0, [sp, #stash_off],
-         * add sp, sp, #frame_size, ret. */
         for (int k = 0; k < n - 1; k++) {
             p[i++] = scratch[k];
         }
         p[i++] = insn_ldr_sp(0, (uint32_t) stash_off);
-        p[i++] = scratch[n - 1];   /* the add sp */
+        p[i++] = scratch[n - 1];
     } else {
-        /* Shipped restore without the add sp. */
         p[i++] = 0xa94007e0u;    /* ldp x0, x1, [sp, #0x00] */
         p[i++] = 0xa9410fe2u;    /* ldp x2, x3, [sp, #0x10] */
         p[i++] = 0xa94217e4u;    /* ldp x4, x5, [sp, #0x20] */
@@ -705,6 +662,31 @@ static jobject make_boxed_arg(JNIEnv *env,
     }
 }
 
+/*
+ * Box an argument into a Java object.
+ *
+ * For primitives, wrap the raw bits in the corresponding wrapper.
+ * For objects (L...; and [), the raw register value IS the
+ * jobject handle. Pass it through as-is. A null handle (0) is a
+ * legitimate null argument and must be preserved.
+ */
+static jobject box_arg(JNIEnv *env, char sig, int64_t raw) {
+    switch (sig) {
+        case 'L':
+        case '[':
+            return (jobject) raw;
+        case 'Z': case 'B': case 'C': case 'S':
+        case 'I': case 'J': case 'F': case 'D': {
+            jvalue v;
+            memset(&v, 0, sizeof(v));
+            v.j = raw;
+            return make_boxed_arg(env, sig, v);
+        }
+        default:
+            return NULL;
+    }
+}
+
 /* ─────────────────────────────────────────────────────────────
  * Dispatcher entry (native side)
  * ───────────────────────────────────────────────────────────── */
@@ -752,14 +734,15 @@ int64_t amiru_dispatch(int64_t slot_index, int64_t reg_frame) {
         char sig = h->arg_sigs[i];
         int64_t raw = ((int64_t *) reg_frame)[i + 1];
 
-        jvalue v;
-        memset(&v, 0, sizeof(v));
-        v.j = raw;
-
-        jobject boxed = make_boxed_arg(env, sig, v);
+        jobject boxed = box_arg(env, sig, raw);
         if (boxed != NULL) {
             (*env)->SetObjectArrayElement(env, args, i, boxed);
-            (*env)->DeleteLocalRef(env, boxed);
+            /* Only delete if it's a box we created. For object
+             * args, boxed is the caller's jobject and must not
+             * be deleted here. */
+            if (sig != 'L' && sig != '[') {
+                (*env)->DeleteLocalRef(env, boxed);
+            }
         }
     }
 
@@ -792,9 +775,21 @@ JNIEXPORT jint JNICALL
 Java_com_shizuposed_manager_core_NativeBridge_amiruSetResult(
         JNIEnv *env, jclass clazz, jint slot, jboolean skip,
         jboolean has_value, jlong value) {
-    (void) clazz; (void) slot; (void) skip;
-    (void) has_value; (void) value; (void) env;
+    (void) clazz; (void) slot; (void) env;
+    if (skip || has_value) {
+        t_has_result = 1;
+    }
+    (void) value;
     return 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_shizuposed_manager_core_NativeBridge_amiruHasResult(
+        JNIEnv *env, jclass clazz) {
+    (void) env; (void) clazz;
+    int32_t r = t_has_result;
+    t_has_result = 0;
+    return r;
 }
 
 JNIEXPORT void JNICALL
@@ -880,6 +875,7 @@ Java_com_shizuposed_manager_core_NativeBridge_amiruHookMethod(
     int64_t orig_entry =
         *(int64_t *) ((char *) art_method + g_layout.entry_offset);
     if (orig_entry == 0) {
+        munmap(stub, (size_t) sysconf(_SC_PAGESIZE));
         pthread_mutex_unlock(&g_hook_lock);
         ALOGE("amiruHookMethod: null original entry");
         return -1;
@@ -890,6 +886,7 @@ Java_com_shizuposed_manager_core_NativeBridge_amiruHookMethod(
     h->art_method   = art_method;
     h->orig_entry   = orig_entry;
     h->stub         = stub;
+    h->stub_len     = (size_t) sysconf(_SC_PAGESIZE);
     h->arg_count    = arg_count;
     h->global_self  = arg_types
         ? (*env)->NewGlobalRef(env, arg_types)
@@ -913,14 +910,23 @@ Java_com_shizuposed_manager_core_NativeBridge_amiruHookMethod(
 
     emit_stub(stub, (int64_t) slot,
               (int64_t) &amiru_dispatch,
+              (int64_t) &Java_com_shizuposed_manager_core_NativeBridge_amiruHasResult,
               orig_entry);
 
     seal_stub_page(stub);
 
+    void *page = (void *) (((int64_t) art_method + g_layout.entry_offset)
+                           & ~0xfffULL);
+    if (mprotect(page, 0x1000, PROT_READ | PROT_WRITE) != 0) {
+        munmap(stub, h->stub_len);
+        pthread_mutex_unlock(&g_hook_lock);
+        return -1;
+    }
     *(int64_t *) ((char *) art_method + g_layout.entry_offset) =
         (int64_t) stub;
     __clear_cache((char *) art_method + g_layout.entry_offset,
                   (char *) art_method + g_layout.entry_offset + 8);
+    mprotect(page, 0x1000, PROT_READ);
 
     g_hook_count++;
 
@@ -951,6 +957,10 @@ Java_com_shizuposed_manager_core_NativeBridge_amiruUnhook(
     if (h->global_self != NULL && env != NULL) {
         (*env)->DeleteGlobalRef(env, h->global_self);
         h->global_self = NULL;
+    }
+    if (h->stub != NULL) {
+        munmap(h->stub, h->stub_len);
+        h->stub = NULL;
     }
     h->art_method = 0;
     return 0;

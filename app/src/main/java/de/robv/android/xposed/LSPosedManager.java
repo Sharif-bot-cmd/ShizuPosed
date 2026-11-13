@@ -7,99 +7,119 @@ import android.net.Uri;
 import android.util.Log;
 
 /**
- * LSPosed-compatible manager API shim.
+ * LSPosedManager
  *
- * Modules written for LSPosed call these methods to discover which
- * framework they're running under and to query per-module state. By
- * providing the same class name and method signatures, ShizuPosed
- * makes those modules behave as if they were running under LSPosed.
+ * Classic-API compatibility shim. The framework identity that a
+ * classic Xposed module sees when it asks "who is hooking me?"
  *
- * All answers are backed by ShizuPosed's ModuleStatusProvider. The
- * authority the provider is registered under is build-specific: the
- * standard build uses "com.shizuposed.manager.status", the stealth
- * build uses "com.<x>.<y>.status". The authority is read from the
- * "shizuposed.status.authority" system property at runtime, which
- * ShizuPosedService passes to every spawned app_process.
+ * TWO API VERSIONS
+ * ---------------
+ * ShizuPosed speaks two API surfaces:
  *
- * Two distinct questions modules ask:
- *   • isModuleEnabled(pkg) — did the user turn this module on?
- *   • isModuleActive(pkg)  — has the module actually loaded into at
- *                            least one target process at least once?
+ *   • Classic Xposed API — reported by
+ *     XposedBridge.getXposedVersion() and mirrored here as
+ *     API_VERSION. Reports 101. The classic surface is
+ *     93/94/95/96/97/98/99/100/101. There is no classic 102.
  *
- * SEMANTICS UNDER LSPosed vs ShizuPosed
- * -------------------------------------
- * Under LSPosed, isModuleActive(pkg) often functions as "am I
- * loaded anywhere" because LSPosed injects into every process — the
- * module's own UI included. Modules that scope themselves to a
- * target app and then call isModuleActive(getPackageName()) see
- * true as soon as the framework has loaded them into any process.
+ *   • libxposed API — reported by
+ *     ShizuPosedXposedInterface.getApiVersion(). Reports 102.
+ *     The libxposed surface is 101 and 102.
  *
- * ShizuPosed's coverage is narrower. Only processes that ShizuPosed
- * bootstrapped have hooks, so the honest answer to "am I loaded
- * into target T" is false until the user has launched T under
- * ShizuPosed. That's correct for the question being asked, but it
- * breaks the LSPosed idiom.
+ * A classic module that checks getXposedVersion() >= 102 gets
+ * false, which is correct: there is no classic 102. A module
+ * that wants to know whether the framework supports libxposed
+ * 102 should call getLibxposedApiVersion() below, not
+ * getXposedVersion().
  *
- * To bridge that gap without changing what isModuleActive(pkg)
- * means, ShizuPosed provides isModuleActiveAnywhere(pkg). That
- * answers the LSPosed-style question directly: true if the module
- * is listed in any marker, regardless of which target the marker
- * belongs to.
- *
- * A module UI that wants to show "Activated" under both frameworks
- * can check its own hook first (the pure self-hook pattern), then
- * fall back to isModuleActive(getPackageName()), then
- * isModuleActiveAnywhere(getPackageName()).
- *
- * NO-ARG OVERLOADS
- * ----------------
- * LSPosed declares isModuleActive() and isModuleEnabled() with no
- * arguments. Module UIs call these forms because they run in their
- * own process and mean "am I — this module — active?" ShizuPosed
- * cannot inject a "current module" flag into the module's process
- * the way a zygote-level framework can, so the calling package is
- * derived from the stack.
- *
- * CONTEXT RESOLUTION
- * ------------------
- * ActivityThread.currentApplication() reliably returns the
- * Application only on the main thread. Module UIs frequently call
- * isModuleActive() from background threads, WorkManager workers,
- * ContentProvider.onCreate, etc., where it can return null.
- *
- * This class therefore tries three sources in order:
- *   1. ActivityThread.currentApplication()
- *   2. ActivityThread.currentActivityThread().getSystemContext()
- *   3. A static fallback context registered via setFallbackContext()
- *
- * The static fallback is populated automatically by XposedBridge.log()
- * on first use, since log() runs in a context where the caller usually
- * has a valid Application.
+ * WHY NOT BUMP CLASSIC TO 102
+ * ---------------------------
+ * A classic module compiled against upstream Xposed checks
+ * getXposedVersion() to decide which features exist. If the
+ * framework reports 102 but the classic surface is still 101,
+ * the module takes the 102 branch and calls methods that don't
+ * exist — NoSuchMethodError at the first call. The version
+ * number is a promise about what's callable. It stays 101.
  */
 public final class LSPosedManager {
 
     /** Framework name reported to modules. */
-    public static final String FRAMEWORK_NAME = "1.2.6";
-
-    /** Reported API version. Matches XposedBridge.XPOSED_BRIDGE_VERSION. */
-    public static final int API_VERSION = 100;
+    public static final String FRAMEWORK_NAME = "ShizuPosed";
 
     /**
-     * Status provider authority for the running build.
+     * Reported classic Xposed API version. Matches
+     * XposedBridge.XPOSED_BRIDGE_VERSION.
      *
-     * The stealth flavor uses a scrambled authority declared in
-     * its manifest. The authority is passed to every spawned
-     * app_process via -Dshizuposed.status.authority=..., so the
-     * module's process knows which authority to query.
+     * Stays 101. See the class javadoc for why.
+     */
+    public static final int API_VERSION = 101;
+
+    /**
+     * The libxposed API version this framework implements.
      *
-     * Fallback: the standard authority, for the case where the
-     * system property is missing (older builds, or a launch that
-     * didn't pass the property).
+     * A classic module that needs to know whether the framework
+     * supports a libxposed 102 feature should check this, not
+     * getVersionCode() or getXposedVersion().
+     */
+    public static final int LIBXPOSED_API_VERSION = 102;
+
+    /**
+     * The libxposed API version the framework supports, exposed
+     * to classic modules.
+     *
+     * Returns the libxposed API level this framework reports via
+     * ShizuPosedXposedInterface.getApiVersion(). Classic modules
+     * cannot call that interface directly (they're compiled
+     * against the classic API), so this accessor is the bridge.
+     *
+     * Returns 102 on current builds. A future framework that
+     * implements libxposed 103 would return 103 here without
+     * touching the classic API_VERSION.
+     */
+    public static int getLibxposedApiVersion() {
+        return LIBXPOSED_API_VERSION;
+    }
+
+    /**
+     * True if this framework implements the given libxposed API
+     * level. Symmetric with getLibxposedApiVersion().
+     */
+    public static boolean supportsLibxposedApi(int api) {
+        return api >= 101 && api <= LIBXPOSED_API_VERSION;
+    }
+
+    /**
+     * The version name the framework reports to modules. This is
+     * the app's own version, not a spoofed LSPosed version.
+     */
+    public static final String FRAMEWORK_VERSION_NAME = "1.4.9";
+
+    /**
+     * Resolve the status provider authority at runtime.
+     *
+     * Order:
+     *   1. shizuposed.status.authority system property (set by
+     *      the spawn so a cloaked process sees the cloaked
+     *      authority)
+     *   2. getPackageName() + ".status"
+     *   3. Canonical literal, pre-init only
      */
     private static String providerAuthority() {
         String prop = System.getProperty("shizuposed.status.authority");
         if (prop != null && !prop.isEmpty()) return prop;
+        String pkg = currentPackageName();
+        if (pkg != null) return pkg + ".status";
         return "com.shizuposed.manager.status";
+    }
+
+    private static String currentPackageName() {
+        try {
+            com.shizuposed.manager.ShizuPosedManagerApp app =
+                com.shizuposed.manager.ShizuPosedManagerApp.getInstance();
+            if (app != null) return app.getPackageName();
+        } catch (Throwable ignored) {}
+        Context ctx = sFallbackContext;
+        if (ctx != null) return ctx.getPackageName();
+        return null;
     }
 
     private static final String LOG_TAG = "ShizuPosed";
@@ -133,7 +153,8 @@ public final class LSPosedManager {
     }
 
     public static boolean isManagerHidden() {
-        return false;
+        String current = currentPackageName();
+        return current != null && !current.equals("com.shizuposed.manager");
     }
 
     public static String getFrameworkName() {
@@ -149,12 +170,14 @@ public final class LSPosedManager {
     }
 
     public static String getVersionName() {
-        return "(5430)";
+        return FRAMEWORK_VERSION_NAME;
     }
 
     public static String getManagerPackageName() {
         String prop = System.getProperty("shizuposed.manager.package");
         if (prop != null && !prop.isEmpty()) return prop;
+        String pkg = currentPackageName();
+        if (pkg != null) return pkg;
         return "com.shizuposed.manager";
     }
 
