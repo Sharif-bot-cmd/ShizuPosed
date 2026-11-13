@@ -6,100 +6,55 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.util.Log;
 
-/**
- * LSPosed-compatible manager API shim.
- *
- * Modules written for LSPosed call these methods to discover which
- * framework they're running under and to query per-module state. By
- * providing the same class name and method signatures, ShizuPosed
- * makes those modules behave as if they were running under LSPosed.
- *
- * All answers are backed by ShizuPosed's ModuleStatusProvider. The
- * authority the provider is registered under is build-specific: the
- * standard build uses "com.shizuposed.manager.status", the stealth
- * build uses "com.<x>.<y>.status". The authority is read from the
- * "shizuposed.status.authority" system property at runtime, which
- * ShizuPosedService passes to every spawned app_process.
- *
- * Two distinct questions modules ask:
- *   • isModuleEnabled(pkg) — did the user turn this module on?
- *   • isModuleActive(pkg)  — has the module actually loaded into at
- *                            least one target process at least once?
- *
- * SEMANTICS UNDER LSPosed vs ShizuPosed
- * -------------------------------------
- * Under LSPosed, isModuleActive(pkg) often functions as "am I
- * loaded anywhere" because LSPosed injects into every process — the
- * module's own UI included. Modules that scope themselves to a
- * target app and then call isModuleActive(getPackageName()) see
- * true as soon as the framework has loaded them into any process.
- *
- * ShizuPosed's coverage is narrower. Only processes that ShizuPosed
- * bootstrapped have hooks, so the honest answer to "am I loaded
- * into target T" is false until the user has launched T under
- * ShizuPosed. That's correct for the question being asked, but it
- * breaks the LSPosed idiom.
- *
- * To bridge that gap without changing what isModuleActive(pkg)
- * means, ShizuPosed provides isModuleActiveAnywhere(pkg). That
- * answers the LSPosed-style question directly: true if the module
- * is listed in any marker, regardless of which target the marker
- * belongs to.
- *
- * A module UI that wants to show "Activated" under both frameworks
- * can check its own hook first (the pure self-hook pattern), then
- * fall back to isModuleActive(getPackageName()), then
- * isModuleActiveAnywhere(getPackageName()).
- *
- * NO-ARG OVERLOADS
- * ----------------
- * LSPosed declares isModuleActive() and isModuleEnabled() with no
- * arguments. Module UIs call these forms because they run in their
- * own process and mean "am I — this module — active?" ShizuPosed
- * cannot inject a "current module" flag into the module's process
- * the way a zygote-level framework can, so the calling package is
- * derived from the stack.
- *
- * CONTEXT RESOLUTION
- * ------------------
- * ActivityThread.currentApplication() reliably returns the
- * Application only on the main thread. Module UIs frequently call
- * isModuleActive() from background threads, WorkManager workers,
- * ContentProvider.onCreate, etc., where it can return null.
- *
- * This class therefore tries three sources in order:
- *   1. ActivityThread.currentApplication()
- *   2. ActivityThread.currentActivityThread().getSystemContext()
- *   3. A static fallback context registered via setFallbackContext()
- *
- * The static fallback is populated automatically by XposedBridge.log()
- * on first use, since log() runs in a context where the caller usually
- * has a valid Application.
- */
 public final class LSPosedManager {
 
     /** Framework name reported to modules. */
-    public static final String FRAMEWORK_NAME = "1.2.6";
+    public static final String FRAMEWORK_NAME = "ShizuPosed";
 
     /** Reported API version. Matches XposedBridge.XPOSED_BRIDGE_VERSION. */
-    public static final int API_VERSION = 100;
+    public static final int API_VERSION = 101;
 
     /**
-     * Status provider authority for the running build.
+     * The version name the framework reports to modules. This is
+     * the app's own version, not a spoofed LSPosed version.
      *
-     * The stealth flavor uses a scrambled authority declared in
-     * its manifest. The authority is passed to every spawned
-     * app_process via -Dshizuposed.status.authority=..., so the
-     * module's process knows which authority to query.
+     * The previous value was "(5740)" — an LSPosed version code
+     * wrapped in parentheses. No module expects parentheses in a
+     * version name; a module that parses it will misbehave. If a
+     * module needs an LSPosed-compatible version code, it can use
+     * getVersionCode(), which returns 101 (the API level).
+     */
+    public static final String FRAMEWORK_VERSION_NAME = "1.4.7";
+
+    /**
+     * Resolve the status provider authority at runtime.
      *
-     * Fallback: the standard authority, for the case where the
-     * system property is missing (older builds, or a launch that
-     * didn't pass the property).
+     * Order:
+     *   1. shizuposed.status.authority system property. The cloak
+     *      flow passes this when it spawns app_process, so a
+     *      module running in a cloaked process sees the cloaked
+     *      authority.
+     *   2. getPackageName() + ".status", via the app instance or
+     *      a fallback context.
+     *   3. The canonical literal, ONLY as a pre-init fallback.
      */
     private static String providerAuthority() {
         String prop = System.getProperty("shizuposed.status.authority");
         if (prop != null && !prop.isEmpty()) return prop;
+        String pkg = currentPackageName();
+        if (pkg != null) return pkg + ".status";
         return "com.shizuposed.manager.status";
+    }
+
+    private static String currentPackageName() {
+        try {
+            com.shizuposed.manager.ShizuPosedManagerApp app =
+                com.shizuposed.manager.ShizuPosedManagerApp.getInstance();
+            if (app != null) return app.getPackageName();
+        } catch (Throwable ignored) {}
+        Context ctx = sFallbackContext;
+        if (ctx != null) return ctx.getPackageName();
+        return null;
     }
 
     private static final String LOG_TAG = "ShizuPosed";
@@ -133,7 +88,11 @@ public final class LSPosedManager {
     }
 
     public static boolean isManagerHidden() {
-        return false;
+        // True when the manager runs under a package name other
+        // than the canonical one. A module that hides its own UI
+        // based on this should use the runtime answer.
+        String current = currentPackageName();
+        return current != null && !current.equals("com.shizuposed.manager");
     }
 
     public static String getFrameworkName() {
@@ -149,12 +108,14 @@ public final class LSPosedManager {
     }
 
     public static String getVersionName() {
-        return "(5430)";
+        return FRAMEWORK_VERSION_NAME;
     }
 
     public static String getManagerPackageName() {
         String prop = System.getProperty("shizuposed.manager.package");
         if (prop != null && !prop.isEmpty()) return prop;
+        String pkg = currentPackageName();
+        if (pkg != null) return pkg;
         return "com.shizuposed.manager";
     }
 
@@ -368,7 +329,7 @@ public final class LSPosedManager {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // CALLING PACKAGE RESOLUTION
+    // CALLING PACKAGE RESOLUTION (unchanged)
     // ═════════════════════════════════════════════════════════════
 
     private static String getCallingPackage() {
@@ -405,7 +366,7 @@ public final class LSPosedManager {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // CONTEXT RESOLUTION
+    // CONTEXT RESOLUTION (unchanged)
     // ═════════════════════════════════════════════════════════════
 
     private static Context currentApplication() {

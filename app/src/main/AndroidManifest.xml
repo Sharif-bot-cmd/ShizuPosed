@@ -11,6 +11,15 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!--
+        Required so ShizuPosedManagerApp.promptForBatteryWhitelist()
+        can start Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS.
+        Without it, the intent throws SecurityException and the
+        prompt never appears.
+    -->
+    <uses-permission
+        android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
 
     <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
@@ -22,18 +31,72 @@
 
     <uses-permission
         android:name="android.permission.QUERY_ALL_PACKAGES"
-        tools:ignore="QueryAllPackagesPermission" />
+        tools:ignore="QueryAllPackagesPermissions" />
 
+    <!--
+        <queries> — package visibility (Android 11+).
+
+        Three groups of entries:
+
+        1. Shizuku packages. ShizuPosedManagerApp's
+           isShizukuManagerInstalled() calls
+           PackageManager.getPackageInfo() on both of these. On
+           Android 11+ that call returns NameNotFoundException
+           for any package the app can't see, so without these
+           entries the "Shizuku Manager not installed" log fires
+           even when Shizuku is running.
+
+        2. The status provider authority. Used by
+           XposedBridge.isModuleActive() from module UIs. The
+           authority is rewritten at build time to
+           com.shizuposed.manager.status, and again by the cloak
+           flow's AXML patcher when the manager is rebuilt under
+           a new package name. A module that queries the provider
+           after a cloak needs the cloaked authority in its own
+           <queries> block — that's a module-side change, not
+           the manager's. The manager's own query uses the
+           runtime-resolved authority (see
+           XposedBridge.providerAuthority()), not this literal.
+
+        3. The scope editors. AppSelectionAdapter and
+           SmartForegroundScopeSheet both call
+           queryIntentActivities() with ACTION_MAIN +
+           CATEGORY_LAUNCHER (and CATEGORY_HOME, defensively) to
+           decide whether a package has a user-facing UI.
+           Without these intents, the query returns an empty
+           list on Android 11+ for every package the manager
+           cannot see — which would make every package look like
+           "no UI" and cause the filters to drop far more than
+           intended.
+    -->
     <queries>
-        <provider android:authorities="${statusAuthority}" />
+        <!-- Shizuku: standard and Next -->
+        <package android:name="moe.shizuku.privileged.api" />
+        <package android:name="moe.shizuku.manager" />
+
+        <!--
+            Status provider authority at build time. The cloak
+            flow rewrites this string in place along with the
+            package attribute; the manager's own runtime query
+            uses the authority it actually owns, not this
+            literal.
+        -->
+        <provider android:authorities="com.shizuposed.manager.status" />
+
+        <!-- Scope editor UI detection -->
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
+
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.HOME" />
+        </intent>
     </queries>
 
     <application
-        android:name=".ShizuPosedManagerApp"
+        android:name="com.shizuposed.manager.ShizuPosedManagerApp"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -49,28 +112,28 @@
 
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
-            android:authorities="${shizukuAuthority}"
+            android:authorities="com.shizuposed.manager.shizuku"
             android:enabled="true"
             android:exported="true"
             android:multiprocess="false"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
         <provider
-            android:name=".status.ModuleStatusProvider"
-            android:authorities="${statusAuthority}"
+            android:name="com.shizuposed.manager.status.ModuleStatusProvider"
+            android:authorities="com.shizuposed.manager.status"
             android:enabled="true"
             android:exported="true"
             android:multiprocess="false"
             android:grantUriPermissions="true" />
 
         <provider
-            android:name=".watcher.ShizukuBinderWatcher"
-            android:authorities="${watcherAuthority}"
+            android:name="com.shizuposed.manager.watcher.ShizukuBinderWatcher"
+            android:authorities="com.shizuposed.manager.shizuku-watcher"
             android:enabled="true"
             android:exported="false" />
 
         <activity
-            android:name=".MainActivity"
+            android:name="com.shizuposed.manager.MainActivity"
             android:exported="true"
             android:theme="@style/Theme.ShizuPosedManager"
             android:windowSoftInputMode="adjustResize"
@@ -83,7 +146,7 @@
         </activity>
 
         <service
-            android:name=".service.ShizuPosedService"
+            android:name="com.shizuposed.manager.service.ShizuPosedService"
             android:enabled="true"
             android:exported="false"
             android:foregroundServiceType="specialUse">
@@ -93,7 +156,7 @@
         </service>
 
         <receiver
-            android:name=".receiver.BootReceiver"
+            android:name="com.shizuposed.manager.receiver.BootReceiver"
             android:enabled="false"
             android:exported="true">
             <intent-filter>
@@ -104,7 +167,7 @@
 
         <provider
             android:name="androidx.core.content.FileProvider"
-            android:authorities="${fileProviderAuthority}"
+            android:authorities="com.shizuposed.manager.fileprovider"
             android:exported="false"
             android:grantUriPermissions="true">
             <meta-data
