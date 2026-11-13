@@ -63,6 +63,9 @@
 -keep class com.shizuposed.manager.updates.UpdateChecker { *; }
 -keep class com.shizuposed.manager.monitor.ForegroundMonitor { *; }
 
+-keep class org.bouncycastle.** { *; }
+-dontwarn org.bouncycastle.**
+
 # ── Runtime timing preferences ──────────────────────────────
 #
 # RuntimePrefs stores scan interval and hook delay. Read from

@@ -4,6 +4,7 @@ import android.app.Application;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Handler;
@@ -23,8 +24,31 @@ public class ShizuPosedManagerApp extends Application {
     private static final String CHANNEL_ID = "shizuposed_channel";
     private static final String CHANNEL_NAME = "ShizuPosed Manager";
 
-    public static final String ACTION_SHIZUKU_AUTHORIZED =
-        "com.shizuposed.manager.ACTION_SHIZUKU_AUTHORIZED";
+    /**
+     * The prefs file that carries original_package_name across a
+     * cloak. ManagerMigrate packages this file, so the seed
+     * survives both Hide and Unhide.
+     */
+    private static final String PREFS_SETTINGS = "shizuposed_settings";
+    private static final String KEY_ORIGINAL_PACKAGE = "original_package_name";
+
+    /**
+     * Broadcast action used to tell the service that Shizuku is
+     * authorized.
+     *
+     * NOT a constant. The old form used
+     * BuildConfig.APPLICATION_ID, which is a compile-time
+     * constant inlined into classes.dex — it stays
+     * "com.shizuposed.manager" after a cloak, because the cloak
+     * patches AndroidManifest.xml, not the dex. A target app
+     * inspecting broadcasts would see the original name. Use
+     * getPackageName() at call time instead.
+     */
+    public static String actionShizukuAuthorized() {
+        ShizuPosedManagerApp app = getInstance();
+        String pkg = app != null ? app.getPackageName() : "com.shizuposed.manager";
+        return pkg + ".ACTION_SHIZUKU_AUTHORIZED";
+    }
 
     private Logger logger;
     private volatile boolean isShizukuAvailable = false;
@@ -45,7 +69,7 @@ public class ShizuPosedManagerApp extends Application {
         @Override
         public void onBinderReceived() {
             isShizukuAvailable = true;
-            logger.i("Shizuku binder received");
+            if (logger != null) logger.i("Shizuku binder received");
             new Handler(Looper.getMainLooper()).post(
                 ShizuPosedManagerApp.this::checkShizukuPermission);
         }
@@ -59,25 +83,10 @@ public class ShizuPosedManagerApp extends Application {
             isShizukuAuthorized = false;
             serviceAutoStarted = false;
             notifiedAuthorized.set(false);
-
-            // Do NOT stop ShizuPosedService here. The service has
-            // work that doesn't depend on Shizuku — ForegroundMonitor
-            // and the direct Settings.Global writes the
-            // smart-foreground feature uses. Stopping the service on
-            // binder death tears those down mid-session and can
-            // strand a smart-fg disable (adb_enabled = 0) with no
-            // restore path until the next boot.
-            //
-            // Shizuku-backed operations in the service already check
-            // isAuthorized() before every call and return early when
-            // the binder is gone. When the binder returns,
-            // ShizukuBinderWatcher sends ACTION_ENSURE_RUNNING and
-            // the service re-deploys. No stop is needed.
-            logger.w("Shizuku binder dead — service left running, "
-                + "Shizuku-backed ops will defer until reconnected");
-
-            // Re-arm the service's onShizukuAuthorized() gate so the
-            // next grant re-triggers a full dex/module deploy.
+            if (logger != null) {
+                logger.w("Shizuku binder dead — service left running, "
+                    + "Shizuku-backed ops will defer until reconnected");
+            }
             try {
                 if (shizuPosedService != null) {
                     shizuPosedService.resetAuthorizedDispatch();
@@ -94,9 +103,12 @@ public class ShizuPosedManagerApp extends Application {
 
             if (grantResult == PackageManager.PERMISSION_GRANTED) {
                 isShizukuAuthorized = true;
-                logger.i("✅ Shizuku permission GRANTED by user!");
+                if (logger != null) {
+                    logger.i("✅ Shizuku permission GRANTED by user!");
+                }
                 new Handler(Looper.getMainLooper()).post(() -> {
                     autoStartService();
+                    notifyServiceShizukuAuthorized();
                 });
                 if (instance != null && instance.getMainActivity() != null) {
                     instance.getMainActivity().onShizukuPermissionGranted();
@@ -105,15 +117,10 @@ public class ShizuPosedManagerApp extends Application {
                 isShizukuAuthorized = false;
                 notifiedAuthorized.set(false);
                 serviceAutoStarted = false;
-                logger.w("❌ Shizuku permission DENIED by user — "
-                    + "service left running");
-
-                // Do NOT stop the service on permission denial either.
-                // The service doesn't need the Shizuku grant to keep
-                // ForegroundMonitor running or to write
-                // Settings.Global directly. If the user later grants
-                // the permission, autoStartService() + onShizukuAuthorized()
-                // resume the deploy path without a restart.
+                if (logger != null) {
+                    logger.w("❌ Shizuku permission DENIED by user — "
+                        + "service left running");
+                }
             }
         }
     };
@@ -123,27 +130,91 @@ public class ShizuPosedManagerApp extends Application {
         super.onCreate();
         instance = this;
 
-        logger = Logger.getInstance(this);
-        logger.i("ShizuPosed Manager starting...");
-        logger.i("Using Shizuku API: rikka.shizuku (v13+)");
+        try {
+            logger = Logger.getInstance(this);
+        } catch (Throwable t) {
+            logger = Logger.getNoOp();
+        }
+        if (logger != null) {
+            logger.i("ShizuPosed Manager starting...");
+            logger.i("Using Shizuku API: rikka.shizuku");
+        }
 
         createDirectories();
         setupNotificationChannel();
+        seedOriginalPackageName();
 
-        // Check GitHub Releases for a newer version. Runs on a
-        // background thread; throttled to once per 12 hours; fails
-        // silently if offline. Never blocks startup.
         try {
             String currentVersion = getPackageManager()
                 .getPackageInfo(getPackageName(), 0).versionName;
             UpdateChecker.checkAsync(this, currentVersion);
         } catch (Throwable t) {
-            logger.d("Update check skipped: " + t.getMessage());
+            if (logger != null) logger.d("Update check skipped: " + t.getMessage());
         }
+
+        registerShizukuListeners();
 
         new Handler(Looper.getMainLooper()).post(this::deferredShizukuSetup);
 
-        logger.i("ShizuPosed Manager initialized");
+        try {
+            com.shizuposed.manager.cloak.ManagerMigrate.importIfNeeded(this);
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.w("ManagerMigrate.importIfNeeded failed: "
+                    + t.getMessage());
+            }
+        }
+
+        if (logger != null) logger.i("ShizuPosed Manager initialized");
+    }
+
+    /**
+     * Record the current package name as the "original" one, so
+     * Unhide knows what to restore to.
+     *
+     * On a fresh standard install, this is
+     * "com.shizuposed.manager". On a cloaked install, the seed
+     * arrives via ManagerMigrate (it was in shizuposed_settings
+     * before the cloak), so this method sees it already present
+     * and leaves it alone.
+     *
+     * If the seed is missing entirely — e.g. data was cleared
+     * between the cloak and the first launch — the only safe
+     * thing to do is refuse to set it, because we cannot know
+     * whether we are standard or cloaked. ManagerCloakFlow's
+     * Unhide path already refuses when the seed is missing; this
+     * method must not invent one.
+     */
+    private void seedOriginalPackageName() {
+        try {
+            SharedPreferences prefs = getSharedPreferences(
+                PREFS_SETTINGS, MODE_PRIVATE);
+            if (prefs.contains(KEY_ORIGINAL_PACKAGE)) return;
+
+            // Only seed when we are the known original. If the
+            // current package already differs from the canonical
+            // original, we are already cloaked and have no seed —
+            // don't fabricate one.
+            String current = getPackageName();
+            String canonicalOriginal = "com.shizuposed.manager";
+            if (!current.equals(canonicalOriginal)) {
+                if (logger != null) {
+                    logger.w("No original_package_name seed and current "
+                        + "package is " + current + "; refusing to seed.");
+                }
+                return;
+            }
+            prefs.edit()
+                .putString(KEY_ORIGINAL_PACKAGE, current)
+                .apply();
+            if (logger != null) {
+                logger.i("Seeded original_package_name=" + current);
+            }
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.w("seedOriginalPackageName failed: " + t.getMessage());
+            }
+        }
     }
 
     private void promptForBatteryWhitelist() {
@@ -153,14 +224,17 @@ public class ShizuPosedManagerApp extends Application {
             if (pm == null) return;
             String pkg = getPackageName();
             if (pm.isIgnoringBatteryOptimizations(pkg)) {
-                logger.i("Battery optimization already ignored — FGS "
-                    + "should survive");
+                if (logger != null) {
+                    logger.i("Battery optimization already ignored");
+                }
                 return;
             }
             if (!shouldAskForWhitelist()) return;
             markWhitelistAsked();
 
-            logger.i("Requesting battery-optimization whitelist");
+            if (logger != null) {
+                logger.i("Requesting battery-optimization whitelist");
+            }
             Intent intent = new Intent(
                 android.provider.Settings
                     .ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
@@ -168,7 +242,9 @@ public class ShizuPosedManagerApp extends Application {
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             startActivity(intent);
         } catch (Throwable t) {
-            logger.w("Battery whitelist prompt failed: " + t.getMessage());
+            if (logger != null) {
+                logger.w("Battery whitelist prompt failed: " + t.getMessage());
+            }
         }
     }
 
@@ -195,14 +271,14 @@ public class ShizuPosedManagerApp extends Application {
 
     private void deferredShizukuSetup() {
         try {
-            registerShizukuListeners();
-
             try {
                 ShizukuHelper.getInstance(this).addPermissionListener(
                     new ShizukuHelper.PermissionListener() {
                         @Override
                         public void onPermissionGranted() {
-                            logger.i("ShizukuHelper reports permission granted");
+                            if (logger != null) {
+                                logger.i("ShizukuHelper: granted");
+                            }
                             isShizukuAuthorized = true;
                             new Handler(Looper.getMainLooper()).post(() -> {
                                 autoStartService();
@@ -213,11 +289,16 @@ public class ShizuPosedManagerApp extends Application {
                         public void onPermissionDenied() {
                             isShizukuAuthorized = false;
                             notifiedAuthorized.set(false);
-                            logger.w("ShizukuHelper reports permission denied");
+                            if (logger != null) {
+                                logger.w("ShizukuHelper: denied");
+                            }
                         }
                     });
             } catch (Throwable t) {
-                logger.e("Failed to register ShizukuHelper permission listener: " + t.getMessage());
+                if (logger != null) {
+                    logger.e("Failed to register ShizukuHelper "
+                        + "permission listener: " + t.getMessage());
+                }
             }
 
             checkShizukuPermission();
@@ -226,7 +307,9 @@ public class ShizuPosedManagerApp extends Application {
                 this::promptForBatteryWhitelist, 3000L);
 
         } catch (Throwable t) {
-            logger.e("deferredShizukuSetup failed: " + t.getMessage());
+            if (logger != null) {
+                logger.e("deferredShizukuSetup failed: " + t.getMessage());
+            }
         }
     }
 
@@ -236,9 +319,14 @@ public class ShizuPosedManagerApp extends Application {
             Shizuku.addBinderReceivedListenerSticky(binderListener);
             Shizuku.addBinderDeadListener(binderDeadListener);
             Shizuku.addRequestPermissionResultListener(permissionResultListener);
-            logger.d("ShizuPosedManagerApp Shizuku listeners registered");
+            if (logger != null) {
+                logger.d("ShizuPosedManagerApp Shizuku listeners registered");
+            }
         } catch (Throwable t) {
-            logger.e("Failed to register Shizuku listeners: " + t.getMessage());
+            if (logger != null) {
+                logger.e("Failed to register Shizuku listeners: "
+                    + t.getMessage());
+            }
             listenersRegistered.set(false);
         }
     }
@@ -247,10 +335,13 @@ public class ShizuPosedManagerApp extends Application {
 
     public void setShizuPosedService(ShizuPosedService service) {
         this.shizuPosedService = service;
-        if (service != null && isShizukuAuthorized) {
-            logger.i("Service bound while Shizuku already authorized - deploying now");
+        if (service != null && isShizukuAuthorized
+                && notifiedAuthorized.compareAndSet(false, true)) {
+            if (logger != null) {
+                logger.i("Service bound while Shizuku already "
+                    + "authorized — deploying now");
+            }
             service.onShizukuAuthorized();
-            notifiedAuthorized.set(true);
         }
     }
 
@@ -260,35 +351,40 @@ public class ShizuPosedManagerApp extends Application {
 
     private void notifyServiceShizukuAuthorized() {
         if (!notifiedAuthorized.compareAndSet(false, true)) {
-            logger.d("Already notified service about authorization — skipping");
+            if (logger != null) {
+                logger.d("Already notified service about "
+                    + "authorization — skipping");
+            }
             return;
         }
 
         ShizuPosedService svc = shizuPosedService;
-        if (svc != null) {
-            logger.i("Notifying ShizuPosedService (direct) that Shizuku is authorized");
-            svc.onShizukuAuthorized();
-            return;
+        if (svc == null) {
+            try {
+                svc = com.shizuposed.manager.core.ProcessMonitor
+                    .getInstance(this).getShizuPosedService();
+            } catch (Throwable ignored) {}
         }
-
-        try {
-            svc = com.shizuposed.manager.core.ProcessMonitor
-                .getInstance(this).getShizuPosedService();
-        } catch (Throwable ignored) {}
-
         if (svc != null) {
-            logger.i("Notifying ShizuPosedService (via ProcessMonitor) that Shizuku is authorized");
+            if (logger != null) {
+                logger.i("Notifying ShizuPosedService (direct) that "
+                    + "Shizuku is authorized");
+            }
             svc.onShizukuAuthorized();
             return;
         }
 
         boolean alreadyRunning = false;
-        try { alreadyRunning = ShizuPosedService.isServiceRunning(); } catch (Throwable ignored) {}
+        try {
+            alreadyRunning = ShizuPosedService.isServiceRunning();
+        } catch (Throwable ignored) {}
 
-        logger.i("Sending ACTION_SHIZUKU_AUTHORIZED intent to ShizuPosedService "
-            + "(running=" + alreadyRunning + ")");
+        if (logger != null) {
+            logger.i("Sending ACTION_SHIZUKU_AUTHORIZED intent "
+                + "(running=" + alreadyRunning + ")");
+        }
         Intent i = new Intent(this, ShizuPosedService.class);
-        i.setAction(ACTION_SHIZUKU_AUTHORIZED);
+        i.setAction(actionShizukuAuthorized());
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(i);
@@ -296,7 +392,10 @@ public class ShizuPosedManagerApp extends Application {
                 startService(i);
             }
         } catch (Exception e) {
-            logger.e("Failed to send ACTION_SHIZUKU_AUTHORIZED: " + e.getMessage());
+            if (logger != null) {
+                logger.e("Failed to send ACTION_SHIZUKU_AUTHORIZED: "
+                    + e.getMessage());
+            }
             notifiedAuthorized.set(false);
         }
     }
@@ -304,58 +403,72 @@ public class ShizuPosedManagerApp extends Application {
     public void onServiceDestroyed() {
         serviceAutoStarted = false;
         notifiedAuthorized.set(false);
-        logger.d("Service destroyed — auto-start re-armed");
+        shizuPosedService = null;
+        if (logger != null) {
+            logger.d("Service destroyed — auto-start re-armed");
+        }
+    }
+
+    public void resetAutoStart() {
+        serviceAutoStarted = false;
+        notifiedAuthorized.set(false);
+        if (logger != null) logger.d("Auto-start reset");
     }
 
     // ─── Shizuku state ─────────────────────────────────────────
 
     private boolean isShizukuManagerInstalled() {
-        try {
-            getPackageManager().getPackageInfo("moe.shizuku.privileged.api", 0);
-            return true;
-        } catch (PackageManager.NameNotFoundException e) { return false; }
+        String[] candidates = {
+            "moe.shizuku.privileged.api",
+            "moe.shizuku.manager",
+        };
+        for (String pkg : candidates) {
+            try {
+                getPackageManager().getPackageInfo(pkg, 0);
+                return true;
+            } catch (PackageManager.NameNotFoundException ignored) {}
+        }
+        return false;
     }
 
     private void checkShizukuPermission() {
         if (!isShizukuManagerInstalled()) {
-            logger.w("Shizuku Manager not installed");
-            logger.i("Please install Shizuku from: https://github.com/thedjchi/Shizuku");
+            if (logger != null) {
+                logger.w("Shizuku Manager not installed");
+                logger.i("Install Shizuku: "
+                    + "https://github.com/thedjchi/Shizuku");
+            }
             return;
         }
-        logger.i("Shizuku Manager installed (moe.shizuku.manager)");
+        if (logger != null) {
+            logger.i("Shizuku Manager installed");
+        }
 
         try {
             if (!Shizuku.pingBinder()) {
                 isShizukuAvailable = false;
-                logger.w("Shizuku is not running");
+                if (logger != null) logger.w("Shizuku is not running");
                 return;
             }
-
             isShizukuAvailable = true;
             shizukuVersion = Shizuku.getVersion();
-            logger.i("Shizuku v" + shizukuVersion + " available");
+            if (logger != null) {
+                logger.i("Shizuku v" + shizukuVersion + " available");
+            }
 
             int result = Shizuku.checkSelfPermission();
             if (result == PackageManager.PERMISSION_GRANTED) {
-                boolean wasAuthorized = isShizukuAuthorized;
                 isShizukuAuthorized = true;
-                logger.i("✅ Shizuku permission GRANTED");
-                if (!wasAuthorized) {
-                    new Handler(Looper.getMainLooper()).post(() -> {
-                        autoStartService();
-                        notifyServiceShizukuAuthorized();
-                    });
-                }
+                if (logger != null) logger.i("✅ Shizuku permission GRANTED");
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    autoStartService();
+                    notifyServiceShizukuAuthorized();
+                });
             } else {
                 isShizukuAuthorized = false;
-                logger.w("⚠️ Shizuku permission NOT GRANTED");
-
-                // Do NOT stop the service just because the grant is
-                // missing. The service doesn't need it for
-                // ForegroundMonitor or for direct Settings.Global
-                // writes. Leave it running; the next grant re-arms
-                // the Shizuku-backed operations.
-
+                if (logger != null) {
+                    logger.w("⚠️ Shizuku permission NOT GRANTED");
+                }
                 if (!permissionRequested) {
                     permissionRequested = true;
                     new Handler(Looper.getMainLooper()).postDelayed(
@@ -363,24 +476,31 @@ public class ShizuPosedManagerApp extends Application {
                 }
             }
         } catch (Throwable t) {
-            logger.e("Failed to check Shizuku permission: " + t.getMessage());
+            if (logger != null) {
+                logger.e("Failed to check Shizuku permission: "
+                    + t.getMessage());
+            }
         }
     }
 
     public void requestShizukuPermission() {
         if (!isShizukuAvailable) {
-            logger.w("Cannot request permission: Shizuku not available");
+            if (logger != null) {
+                logger.w("Cannot request permission: Shizuku not available");
+            }
             return;
         }
         if (isShizukuAuthorized) {
-            logger.i("Shizuku already authorized");
+            if (logger != null) logger.i("Shizuku already authorized");
             return;
         }
-
         try {
             ShizukuHelper.getInstance(this).requestPermission();
         } catch (Exception e) {
-            logger.e("Failed to request Shizuku permission: " + e.getMessage());
+            if (logger != null) {
+                logger.e("Failed to request Shizuku permission: "
+                    + e.getMessage());
+            }
         }
     }
 
@@ -388,27 +508,31 @@ public class ShizuPosedManagerApp extends Application {
 
     public void autoStartService() {
         if (serviceAutoStarted) {
-            logger.d("Service already auto-started");
+            if (logger != null) logger.d("Service already auto-started");
             return;
         }
-
-        // ── Authorization gate (BEFORE claiming the flag) ──────
         if (!isShizukuAuthorized) {
-            logger.d("Cannot auto-start: not authorized yet");
+            if (logger != null) logger.d("Cannot auto-start: not authorized");
             return;
         }
-
         if (!inAutoStart.compareAndSet(false, true)) return;
         try {
             boolean alreadyRunning = false;
-            try { alreadyRunning = ShizuPosedService.isServiceRunning(); } catch (Throwable ignored) {}
+            try {
+                alreadyRunning = ShizuPosedService.isServiceRunning();
+            } catch (Throwable ignored) {}
 
             Intent serviceIntent = new Intent(this, ShizuPosedService.class);
             if (alreadyRunning) {
-                logger.i("Service already running — sending ACTION_SHIZUKU_AUTHORIZED only");
-                serviceIntent.setAction(ACTION_SHIZUKU_AUTHORIZED);
+                serviceIntent.setAction(actionShizukuAuthorized());
+                if (logger != null) {
+                    logger.i("Service already running — sending "
+                        + "ACTION_SHIZUKU_AUTHORIZED only");
+                }
             } else {
-                logger.i("🚀 Auto-starting ShizuPosedService...");
+                if (logger != null) {
+                    logger.i("🚀 Auto-starting ShizuPosedService...");
+                }
             }
 
             serviceAutoStarted = true;
@@ -419,25 +543,27 @@ public class ShizuPosedManagerApp extends Application {
                 } else {
                     startService(serviceIntent);
                 }
-                logger.i("✅ Service auto-start dispatched");
+                if (logger != null) {
+                    logger.i("✅ Service auto-start dispatched");
+                }
                 if (mainActivity != null) mainActivity.onServiceAutoStarted();
             } catch (Exception e) {
                 serviceAutoStarted = false;
-                logger.e("Failed to auto-start service: " + e.getMessage());
+                if (logger != null) {
+                    logger.e("Failed to auto-start service: "
+                        + e.getMessage());
+                }
             }
         } finally {
             inAutoStart.set(false);
         }
     }
 
-    /**
-     * Manual start path. Now gated by authorization, matching the
-     * automatic path. If Shizuku isn't authorized, this is a no-op
-     * with a log — the grant path will start it later.
-     */
     public void startServiceManually() {
         if (!isShizukuAuthorized) {
-            logger.w("startServiceManually refused: not authorized yet");
+            if (logger != null) {
+                logger.w("startServiceManually refused: not authorized yet");
+            }
             return;
         }
         try {
@@ -448,9 +574,11 @@ public class ShizuPosedManagerApp extends Application {
                 startService(serviceIntent);
             }
             serviceAutoStarted = true;
-            logger.i("Service started manually");
+            if (logger != null) logger.i("Service started manually");
         } catch (Exception e) {
-            logger.e("Failed to start service: " + e.getMessage());
+            if (logger != null) {
+                logger.e("Failed to start service: " + e.getMessage());
+            }
         }
     }
 
@@ -487,8 +615,11 @@ public class ShizuPosedManagerApp extends Application {
                 CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW);
             channel.setDescription("ShizuPosed Manager service notifications");
             channel.setShowBadge(false);
-            NotificationManager manager = getSystemService(NotificationManager.class);
-            if (manager != null) manager.createNotificationChannel(channel);
+            NotificationManager manager =
+                getSystemService(NotificationManager.class);
+            if (manager != null) {
+                manager.createNotificationChannel(channel);
+            }
         }
     }
 
@@ -496,6 +627,8 @@ public class ShizuPosedManagerApp extends Application {
     public Logger getLogger() { return logger; }
 
     private MainActivity mainActivity;
-    public void setMainActivity(MainActivity activity) { this.mainActivity = activity; }
+    public void setMainActivity(MainActivity activity) {
+        this.mainActivity = activity;
+    }
     public MainActivity getMainActivity() { return mainActivity; }
 }

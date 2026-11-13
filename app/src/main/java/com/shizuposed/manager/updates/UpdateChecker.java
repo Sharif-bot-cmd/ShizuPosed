@@ -15,6 +15,7 @@ import androidx.core.app.NotificationCompat;
 import com.shizuposed.manager.R;
 import com.shizuposed.manager.utils.Logger;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
@@ -24,25 +25,23 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 
 /**
- * Checks GitHub Releases for a newer ShizuPosed version and posts
- * a notification when one exists.
+ * Checks GitHub Releases for a newer ShizuPosed version, caches
+ * the update metadata, and (when an update exists) posts a
+ * notification with an "Install update" action.
  *
- * Single HTTP call to the public GitHub API. No push infrastructure,
- * no FCM, no server. Runs on a background thread; never blocks the
- * UI. Fails silently on any error — an offline device, a rate-limit,
- * a malformed response, all just mean "no notification this launch."
+ * Single HTTP call to the public GitHub API. No push
+ * infrastructure, no FCM, no server. Runs on a background
+ * thread; never blocks the UI. Fails silently on any error.
  *
- * The check is throttled to once per UPDATE_CHECK_INTERVAL_MS so
- * the manager can call it on every resume without spamming GitHub.
+ * The check is throttled to once per UPDATE_CHECK_INTERVAL_MS
+ * so the manager can call it on every resume without spamming
+ * GitHub.
  */
 public final class UpdateChecker {
 
     private static final String TAG = "UpdateChecker";
 
-    /** Owner/repo of the releases. Adjust if the repo moves. */
     private static final String REPO = "Sharif-bot-cmd/ShizuPosed";
-
-    /** The releases API endpoint for the latest release. */
     private static final String RELEASES_API =
         "https://api.github.com/repos/" + REPO + "/releases/latest";
 
@@ -54,42 +53,88 @@ public final class UpdateChecker {
     private static final String KEY_LAST_CHECK = "last_check_ms";
     private static final String KEY_LAST_NOTIFIED_TAG = "last_notified_tag";
 
-    /** Don't hit the API more than once per 12 hours. */
-    private static final long UPDATE_CHECK_INTERVAL_MS = 12L * 60L * 60L * 1000L;
+    private static final long UPDATE_CHECK_INTERVAL_MS =
+        12L * 60L * 60L * 1000L;
+
+    public interface CheckResult {
+        void onNoUpdate(String currentVersion);
+        void onUpdateFound(String tag, String apkUrl);
+        void onError(String message);
+    }
 
     private UpdateChecker() {}
 
-    /**
-     * Check for an update in the background. Safe to call on every
-     * app start; the internal throttle suppresses redundant calls.
-     *
-     * @param currentVersion the version string the app is running,
-     *                       typically BuildConfig.VERSION_NAME
-     */
+    /** Background check, throttled. Posts a notification if an
+     *  update is found. Safe to call on every app start. */
     public static void checkAsync(Context context, String currentVersion) {
         if (context == null || currentVersion == null) return;
-
         final Context app = context.getApplicationContext();
         new Thread(() -> {
             try {
                 checkBlocking(app, currentVersion);
             } catch (Throwable t) {
                 Logger l = Logger.getInstance(app);
-                if (l != null) l.d("UpdateChecker: check failed: " + t.getMessage());
+                if (l != null) l.d("UpdateChecker: check failed: "
+                    + t.getMessage());
             }
         }, "ShizuPosed-update-check").start();
     }
 
+    /** Manual check, unthrottled, with a result callback. Use for
+     *  the Settings "Check for updates" button. */
+    public static void checkNowAsync(Context context,
+                                     String currentVersion,
+                                     CheckResult callback) {
+        if (context == null || currentVersion == null) return;
+        final Context app = context.getApplicationContext();
+        new Thread(() -> {
+            try {
+                SharedPreferences prefs = app.getSharedPreferences(
+                    PREFS, Context.MODE_PRIVATE);
+                prefs.edit().putLong(KEY_LAST_CHECK, 0L).apply();
+                prefs.edit().remove(KEY_LAST_NOTIFIED_TAG).apply();
+
+                String json = httpGet(RELEASES_API);
+                if (json == null) {
+                    callback.onError("No response from GitHub");
+                    return;
+                }
+
+                ReleaseInfo r = parseRelease(json);
+                if (r.tag == null || r.tag.isEmpty()) {
+                    callback.onError("No release found");
+                    return;
+                }
+
+                prefs.edit()
+                    .putLong(KEY_LAST_CHECK, System.currentTimeMillis())
+                    .apply();
+
+                if (!isNewer(r.tag, currentVersion)) {
+                    callback.onNoUpdate(currentVersion);
+                    return;
+                }
+
+                UpdateInfo.save(app,
+                    new UpdateInfo(r.tag, r.htmlUrl, r.apkUrl, r.apkSize));
+                callback.onUpdateFound(r.tag, r.apkUrl);
+            } catch (Throwable t) {
+                callback.onError(t.getMessage() != null
+                    ? t.getMessage() : "unknown");
+            }
+        }, "ShizuPosed-update-check-manual").start();
+    }
+
     private static void checkBlocking(Context context, String currentVersion) {
         Logger logger = Logger.getInstance(context);
-        SharedPreferences prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        SharedPreferences prefs = context.getSharedPreferences(
+            PREFS, Context.MODE_PRIVATE);
 
-        // Throttle.
         long lastCheck = prefs.getLong(KEY_LAST_CHECK, 0L);
         long now = System.currentTimeMillis();
         if (now - lastCheck < UPDATE_CHECK_INTERVAL_MS) {
             if (logger != null) {
-                logger.d("UpdateChecker: throttled (" 
+                logger.d("UpdateChecker: throttled ("
                     + ((now - lastCheck) / 1000 / 60) + " min since last check)");
             }
             return;
@@ -103,54 +148,76 @@ public final class UpdateChecker {
             return;
         }
 
-        String tag = null;
-        String htmlUrl = null;
+        ReleaseInfo r;
         try {
-            JSONObject obj = new JSONObject(json);
-            tag = obj.optString("tag_name", null);
-            htmlUrl = obj.optString("html_url", null);
+            r = parseRelease(json);
         } catch (Throwable t) {
-            if (logger != null) logger.w("UpdateChecker: parse failed: " + t.getMessage());
+            if (logger != null) logger.w("UpdateChecker: parse failed: "
+                + t.getMessage());
             return;
         }
 
-        // Record the check regardless of outcome, so a failed parse
-        // doesn't retry on every app start.
         prefs.edit().putLong(KEY_LAST_CHECK, now).apply();
 
-        if (tag == null || tag.isEmpty()) {
+        if (r.tag == null || r.tag.isEmpty()) {
             if (logger != null) logger.d("UpdateChecker: no tag in response");
             return;
         }
 
-        if (logger != null) logger.i("UpdateChecker: latest=" + tag
-            + " current=" + currentVersion);
+        if (logger != null) {
+            logger.i("UpdateChecker: latest=" + r.tag
+                + " current=" + currentVersion
+                + " apk=" + r.apkUrl);
+        }
 
-        if (!isNewer(tag, currentVersion)) {
+        if (!isNewer(r.tag, currentVersion)) {
             if (logger != null) logger.d("UpdateChecker: up to date");
             return;
         }
 
-        // Avoid re-notifying for the same tag over and over.
         String lastNotified = prefs.getString(KEY_LAST_NOTIFIED_TAG, null);
-        if (tag.equals(lastNotified)) {
+        if (r.tag.equals(lastNotified)) {
             if (logger != null) logger.d("UpdateChecker: already notified for "
-                + tag);
+                + r.tag);
             return;
         }
 
-        postNotification(context, tag, htmlUrl);
-        prefs.edit().putString(KEY_LAST_NOTIFIED_TAG, tag).apply();
-        if (logger != null) logger.i("UpdateChecker: notified for " + tag);
+        UpdateInfo.save(context,
+            new UpdateInfo(r.tag, r.htmlUrl, r.apkUrl, r.apkSize));
+
+        postNotification(context, r.tag, r.htmlUrl, r.apkUrl);
+        prefs.edit().putString(KEY_LAST_NOTIFIED_TAG, r.tag).apply();
+        if (logger != null) logger.i("UpdateChecker: notified for " + r.tag);
     }
 
-    /**
-     * True if `remote` is a newer version than `local`.
-     *
-     * Strips a leading 'v' from both, splits on '.', compares each
-     * numeric segment. Falls back to a plain inequality test if
-     * either side isn't parseable — safer than missing an update.
-     */
+    private static final class ReleaseInfo {
+        String tag;
+        String htmlUrl;
+        String apkUrl;
+        long apkSize;
+    }
+
+    private static ReleaseInfo parseRelease(String json) throws Exception {
+        ReleaseInfo r = new ReleaseInfo();
+        JSONObject obj = new JSONObject(json);
+        r.tag = obj.optString("tag_name", null);
+        r.htmlUrl = obj.optString("html_url", null);
+
+        JSONArray assets = obj.optJSONArray("assets");
+        if (assets != null) {
+            for (int i = 0; i < assets.length(); i++) {
+                JSONObject a = assets.optJSONObject(i);
+                if (a == null) continue;
+                String name = a.optString("name", "");
+                if (name == null || !name.endsWith(".apk")) continue;
+                r.apkUrl = a.optString("browser_download_url", null);
+                r.apkSize = a.optLong("size", 0L);
+                break;
+            }
+        }
+        return r;
+    }
+
     private static boolean isNewer(String remote, String local) {
         try {
             String r = remote.startsWith("v") || remote.startsWith("V")
@@ -175,7 +242,6 @@ public final class UpdateChecker {
 
     private static int parseIntSafe(String s) {
         try {
-            // Strip any non-digit suffix (e.g. "1-beta" -> 1).
             StringBuilder sb = new StringBuilder();
             for (int i = 0; i < s.length(); i++) {
                 char c = s.charAt(i);
@@ -188,10 +254,6 @@ public final class UpdateChecker {
         }
     }
 
-    /**
-     * Minimal HTTP GET. Returns the body as a string, or null on
-     * any error. Uses HttpURLConnection — no OkHttp dependency.
-     */
     private static String httpGet(String urlStr) {
         HttpURLConnection conn = null;
         try {
@@ -221,34 +283,11 @@ public final class UpdateChecker {
         }
     }
 
-    public static void checkNowAsync(Context context,
-                                     String currentVersion,
-                                     boolean forceNotify) {
-        if (context == null || currentVersion == null) return;
-
-        final Context app = context.getApplicationContext();
-        new Thread(() -> {
-            try {
-                SharedPreferences prefs = app.getSharedPreferences(
-                    PREFS, Context.MODE_PRIVATE);
-                // Clear the throttle so the check runs.
-                prefs.edit().putLong(KEY_LAST_CHECK, 0L).apply();
-                if (forceNotify) {
-                    prefs.edit().remove(KEY_LAST_NOTIFIED_TAG).apply();
-                }
-                checkBlocking(app, currentVersion);
-            } catch (Throwable t) {
-                Logger l = Logger.getInstance(app);
-                if (l != null) l.d("checkNowAsync: failed: " + t.getMessage());
-            }
-        }, "ShizuPosed-update-check-manual").start();
-    }
-
     private static void postNotification(Context context,
                                           String tag,
-                                          String htmlUrl) {
+                                          String htmlUrl,
+                                          String apkUrl) {
         try {
-            // Ensure channel exists.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 NotificationManager nm = context.getSystemService(
                     NotificationManager.class);
@@ -262,35 +301,42 @@ public final class UpdateChecker {
                 }
             }
 
-            // Tap opens the release page in a browser.
-            Intent open = new Intent(Intent.ACTION_VIEW);
-            if (htmlUrl != null && !htmlUrl.isEmpty()) {
-                open.setData(Uri.parse(htmlUrl));
-            } else {
-                open.setData(Uri.parse(
-                    "https://github.com/" + REPO + "/releases"));
-            }
-            open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-
-            PendingIntent pi = PendingIntent.getActivity(
+            PendingIntent openPi = PendingIntent.getActivity(
                 context,
                 NOTIFICATION_ID,
-                open,
+                new Intent(Intent.ACTION_VIEW).setData(Uri.parse(
+                    htmlUrl != null && !htmlUrl.isEmpty()
+                        ? htmlUrl
+                        : "https://github.com/" + REPO + "/releases"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                 PendingIntent.FLAG_UPDATE_CURRENT
                     | PendingIntent.FLAG_IMMUTABLE);
 
-            Notification n = new NotificationCompat.Builder(context, CHANNEL_ID)
-                .setContentTitle("ShizuPosed " + tag + " is available")
-                .setContentText("Tap to open the release page")
-                .setSmallIcon(R.drawable.ic_notification)
-                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-                .setAutoCancel(true)
-                .setContentIntent(pi)
-                .build();
+            NotificationCompat.Builder builder =
+                new NotificationCompat.Builder(context, CHANNEL_ID)
+                    .setContentTitle("ShizuPosed " + tag + " is available")
+                    .setContentText("Tap to download and install")
+                    .setSmallIcon(R.drawable.ic_notification)
+                    .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                    .setAutoCancel(true)
+                    .setContentIntent(openPi);
+
+            if (apkUrl != null && !apkUrl.isEmpty()) {
+                Intent installIntent = new Intent(
+                    context, UpdateInstallActivity.class);
+                installIntent.putExtra(UpdateInstallActivity.EXTRA_TAG, tag);
+                PendingIntent installPi = PendingIntent.getActivity(
+                    context,
+                    NOTIFICATION_ID + 1,
+                    installIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT
+                        | PendingIntent.FLAG_IMMUTABLE);
+                builder.addAction(0, "Install update", installPi);
+            }
 
             NotificationManager nm = (NotificationManager)
                 context.getSystemService(Context.NOTIFICATION_SERVICE);
-            if (nm != null) nm.notify(NOTIFICATION_ID, n);
+            if (nm != null) nm.notify(NOTIFICATION_ID, builder.build());
         } catch (Throwable t) {
             Logger l = Logger.getInstance(context);
             if (l != null) l.w("UpdateChecker: postNotification failed: "

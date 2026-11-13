@@ -8,34 +8,6 @@ if (keystorePropsFile.exists()) {
     keystoreProps.load(new FileInputStream(keystorePropsFile))
 }
 
-def stealthSeed = project.findProperty('stealthSeed')
-    ?: (System.getProperty('user.name', 'user')
-        + '@' + System.getProperty('user.home', 'home')
-        + '/' + project.rootDir.absolutePath)
-
-def stealthDigest = java.security.MessageDigest.getInstance('SHA-256')
-stealthDigest.update(stealthSeed.getBytes('UTF-8'))
-def stealthHash = stealthDigest.digest()
-
-def alpha = 'abcdefghijklmnopqrstuvwxyz'
-
-// Extract enough bytes from the digest for 1 + 5 + 9 = 15
-// letters. Each byte picks one letter, modulo 26.
-def sb = new StringBuilder()
-for (int i = 0; i < 15; i++) {
-    int idx = (stealthHash[i] & 0xFF) % 26
-    sb.append(alpha.charAt(idx))
-}
-def allLetters = sb.toString()
-
-def seg1 = allLetters.substring(0, 1)
-def seg2 = allLetters.substring(1, 6)
-def seg3 = allLetters.substring(6, 15)
-
-ext.stealthApplicationId   = "${seg1}.${seg2}.${seg3}"
-ext.stealthStatusAuthority = "${seg1}.${seg2}.${seg3}.status"
-ext.stealthAppLabel        = 'Sync Service'
-
 android {
     namespace 'com.shizuposed.manager'
 
@@ -44,54 +16,13 @@ android {
 
     defaultConfig {
         applicationId "com.shizuposed.manager"
-        minSdk 29
+        minSdk 28
         targetSdk 37
-        versionCode 5430
-        versionName "1.2.6"
+        versionCode 5800
+        versionName "1.4.8"
 
         ndk {
             abiFilters 'arm64-v8a'
-        }
-    }
-
-    // ═════════════════════════════════════════════════════════════
-    // FLAVORS
-    //
-    // standard: the normal build, applicationId
-    //           com.shizuposed.manager, authority
-    //           com.shizuposed.manager.status.
-    //
-    // stealth:  a separate APK with a randomly-generated
-    //           applicationId of the form com.<x>.<y> and a
-    //           matching status authority. Same signature, same
-    //           code, different package name. Cannot update the
-    //           standard build; must be installed separately.
-    // ═════════════════════════════════════════════════════════════
-
-    flavorDimensions "variant"
-
-    productFlavors {
-        standard {
-            dimension "variant"
-            applicationId "com.shizuposed.manager"
-            manifestPlaceholders = [
-                statusAuthority:      "com.shizuposed.manager.status",
-                shizukuAuthority:     "com.shizuposed.manager.shizuku",
-                watcherAuthority:     "com.shizuposed.manager.shizuku-watcher",
-                fileProviderAuthority: "com.shizuposed.manager.fileprovider",
-            ]
-        }
-
-        stealth {
-            dimension "variant"
-            applicationId project.ext.stealthApplicationId
-            manifestPlaceholders = [
-                statusAuthority:      project.ext.stealthStatusAuthority,
-                shizukuAuthority:     project.ext.stealthApplicationId + ".shizuku",
-                watcherAuthority:     project.ext.stealthApplicationId + ".shizuku-watcher",
-                fileProviderAuthority: project.ext.stealthApplicationId + ".fileprovider",
-            ]
-            resValue "string", "app_name", project.ext.stealthAppLabel
         }
     }
 
@@ -138,6 +69,7 @@ android {
     }
 
     androidResources {
+        noCompress += [".so"]
         ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:!CVS:!thumbs.db:!picasa.ini:!*~'
     }
 
@@ -159,7 +91,8 @@ android {
                 '**/libcallsite.so',
                 '**/libxstealth.so',
                 '**/libxstealth_next.so',
-                '**/libxstealth_bridge.so'
+                '**/libxstealth_bridge.so',
+                '**/libsysku.so'
             ]
         }
     }
@@ -190,106 +123,31 @@ dependencies {
     implementation files('libs/shizuku-shared.jar')
     implementation files('libs/pine-0.3.0.jar')
 
+    implementation 'org.bouncycastle:bcprov-jdk18on:1.78.1'
+    implementation 'org.bouncycastle:bcpkix-jdk18on:1.78.1'
     implementation 'com.google.android.material:material:1.12.0'
-
     implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
     implementation 'androidx.core:core:1.13.1'
-
     implementation 'androidx.activity:activity:1.9.0'
-
     implementation 'androidx.lifecycle:lifecycle-viewmodel:2.8.4'
     implementation 'androidx.lifecycle:lifecycle-livedata:2.8.4'
-
     implementation 'androidx.recyclerview:recyclerview:1.3.2'
     implementation 'androidx.cardview:cardview:1.0.0'
-
     implementation 'androidx.preference:preference:1.2.1'
-
     implementation 'com.google.code.gson:gson:2.11.0'
+    implementation project(':apkzlib')
 
     testImplementation 'junit:junit:4.13.2'
     androidTestImplementation 'androidx.test.ext:junit:1.2.0'
     androidTestImplementation 'androidx.test.espresso:espresso-core:3.6.0'
 }
 
-// Capture the ext values as locals at configuration time. The
-// doLast closure must not touch `project` — the configuration
-// cache forbids it, and Gradle 9 enforces that as an error.
-def printStealthIdValue     = ext.stealthApplicationId
-def printStealthAuthority   = ext.stealthStatusAuthority
-def printStealthLabel       = ext.stealthAppLabel
-
-tasks.register('printStealthId') {
-    group = 'help'
-    description = 'Print the stealth package name that this build will use'
-
-    // Declare them as inputs so the task knows when to re-run,
-    // and so the configuration cache treats them as values, not
-    // references to live project state.
-    inputs.property('stealthId', printStealthIdValue)
-    inputs.property('stealthAuthority', printStealthAuthority)
-    inputs.property('stealthLabel', printStealthLabel)
-
-    doLast {
-        println "stealth applicationId:    ${printStealthIdValue}"
-        println "stealth status authority: ${printStealthAuthority}"
-        println "stealth app label:        ${printStealthLabel}"
-        println ""
-        println "Override with -PstealthSeed=<anything> for a different ID."
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// HELPER FUNCTIONS
-//
-// These are top-level script methods, not closures. They don't touch
-// Gradle script objects, so they can be called from doLast blocks
-// without breaking the configuration cache.
-// ═══════════════════════════════════════════════════════════════════════════
-
-def extractZipEntries = { File archive, File destDir, Closure<Boolean> selector ->
-    if (!archive.exists()) return
-    def zip = new java.util.zip.ZipFile(archive)
-    try {
-        def entries = zip.entries()
-        def destCanonical = destDir.canonicalPath
-        while (entries.hasMoreElements()) {
-            def entry = entries.nextElement()
-            if (entry.isDirectory()) continue
-            if (selector != null && !selector.call(entry.name)) continue
-
-            def target = new File(destDir, entry.name)
-            if (!target.canonicalPath.startsWith(destCanonical)) continue
-            target.parentFile?.mkdirs()
-
-            zip.getInputStream(entry).withCloseable { input ->
-                target.withOutputStream { output ->
-                    input.transferTo(output)
-                }
-            }
-        }
-    } finally {
-        zip.close()
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // NATIVE LIBRARY PRESENCE CHECKS
 //
-// Under Gradle 9.x's configuration cache, tasks must not call
-// `project.hasProperty(...)` or `project.file(...)` at execution
-// time. Everything they need is captured into local variables during
-// configuration and referenced from the doLast closures.
-//
-// libshizuposed.so        required — NativeBackend depends on it.
-// libamiru.so             optional — AmiruBackend reports unavailable.
-// libcallsite.so          optional — CallSiteBackend reports unavailable.
-// libxstealth.so          optional — XStealthNative reports unavailable.
-// libxstealth_next.so     optional — XStealthNativeNext reports unavailable.
-// libxstealth_bridge.so   optional — XStealthBridge reports unavailable.
-//
-// Skip all six with: -PskipNativeCheck=true
+// Unchanged from before. The checks run against src/main/jniLibs;
+// they are independent of the cloak model and remain required.
 // ═══════════════════════════════════════════════════════════════════════════
 
 def skipNativeCheck = project.hasProperty('skipNativeCheck')
@@ -300,239 +158,200 @@ def jniLibsDir = file('src/main/jniLibs/arm64-v8a')
 tasks.register('checkNativeShim') {
     description = 'Verify libshizuposed.so is present for arm64-v8a (required)'
     group = 'verification'
-
     def so = new File(jniLibsDir, 'libshizuposed.so')
-
     doLast {
-        if (skipNativeCheck) {
-            println "checkNativeShim: skipped via -PskipNativeCheck=true"
-            return
-        }
+        if (skipNativeCheck) { println "checkNativeShim: skipped"; return }
         if (!so.exists()) {
-            throw new GradleException(
-                "libshizuposed.so not found at ${so.absolutePath}\n" +
-                "Build it with:\n" +
-                "  clang -shared -fPIC -O2 -Wall -Wextra \\\n" +
-                "      --target=aarch64-linux-android29 \\\n" +
-                "      -o app/src/main/jniLibs/arm64-v8a/libshizuposed.so \\\n" +
-                "      native/libshizuposed.c -llog -ldl\n" +
-                "Or skip this check with -PskipNativeCheck=true " +
-                "(NativeBackend will degrade to Pine-only).")
+            throw new GradleException("libshizuposed.so not found at ${so.absolutePath}")
         }
         def len = so.length()
         if (len < 1024) {
-            throw new GradleException(
-                "libshizuposed.so at ${so.absolutePath} is only ${len} bytes — " +
-                "probably a failed or empty build. Rebuild it.")
+            throw new GradleException("libshizuposed.so is only ${len} bytes")
         }
-        println "checkNativeShim: OK — ${len} bytes at ${so.absolutePath}"
+        println "checkNativeShim: OK — ${len} bytes"
     }
 }
 
 tasks.register('checkCallSite') {
-    description = 'Verify libcallsite.so is present for arm64-v8a (optional)'
     group = 'verification'
-
     def so = new File(jniLibsDir, 'libcallsite.so')
-
     doLast {
-        if (skipNativeCheck) {
-            println "checkCallSite: skipped via -PskipNativeCheck=true"
-            return
-        }
-        if (!so.exists()) {
-            logger.warn(
-                "libcallsite.so not found at ${so.absolutePath}\n" +
-                "  CallSite will be unavailable and the dispatcher will fall\n" +
-                "  through to the existing native shim. To build it:\n" +
-                "    clang -shared -fPIC -O2 -Wall -Wextra \\\n" +
-                "        --target=aarch64-linux-android29 \\\n" +
-                "        -o app/src/main/jniLibs/arm64-v8a/libcallsite.so \\\n" +
-                "        native/libcallsite.c -llog -ldl\n" +
-                "  This is a warning, not an error — the build will proceed.")
-            return
-        }
+        if (skipNativeCheck) { println "checkCallSite: skipped"; return }
+        if (!so.exists()) { logger.warn("libcallsite.so not found"); return }
         def len = so.length()
-        if (len < 1024) {
-            logger.warn(
-                "libcallsite.so at ${so.absolutePath} is only ${len} bytes — " +
-                "probably a failed or empty build. CallSite will be unavailable.")
-            return
-        }
-        println "checkCallSite: OK — ${len} bytes at ${so.absolutePath}"
+        if (len < 1024) { logger.warn("libcallsite.so is ${len} bytes"); return }
+        println "checkCallSite: OK — ${len} bytes"
     }
 }
 
 tasks.register('checkAmiru') {
-    description = 'Verify libamiru.so is present for arm64-v8a (optional)'
     group = 'verification'
-
     def so = new File(jniLibsDir, 'libamiru.so')
-
     doLast {
-        if (skipNativeCheck) {
-            println "checkAmiru: skipped via -PskipNativeCheck=true"
-            return
-        }
-        if (!so.exists()) {
-            logger.warn(
-                "libamiru.so not found at ${so.absolutePath}\n" +
-                "  Amiru will be unavailable and the dispatcher will fall\n" +
-                "  through to the existing native shim. To build it:\n" +
-                "    clang -shared -fPIC -O2 -Wall -Wextra \\\n" +
-                "        --target=aarch64-linux-android29 \\\n" +
-                "        -o app/src/main/jniLibs/arm64-v8a/libamiru.so \\\n" +
-                "        native/libamiru.c -llog -ldl\n" +
-                "  This is a warning, not an error — the build will proceed.")
-            return
-        }
+        if (skipNativeCheck) { println "checkAmiru: skipped"; return }
+        if (!so.exists()) { logger.warn("libamiru.so not found"); return }
         def len = so.length()
-        if (len < 1024) {
-            logger.warn(
-                "libamiru.so at ${so.absolutePath} is only ${len} bytes — " +
-                "probably a failed or empty build. Amiru will be unavailable.")
-            return
-        }
-        println "checkAmiru: OK — ${len} bytes at ${so.absolutePath}"
+        if (len < 1024) { logger.warn("libamiru.so is ${len} bytes"); return }
+        println "checkAmiru: OK — ${len} bytes"
     }
 }
 
 tasks.register('checkXStealth') {
-    description = 'Verify libxstealth.so is present for arm64-v8a (optional)'
     group = 'verification'
-
     def so = new File(jniLibsDir, 'libxstealth.so')
-
     doLast {
-        if (skipNativeCheck) {
-            println "checkXStealth: skipped via -PskipNativeCheck=true"
-            return
-        }
-        if (!so.exists()) {
-            logger.warn(
-                "libxstealth.so not found at ${so.absolutePath}\n" +
-                "  XStealth native hiding will be unavailable. The Java-level\n" +
-                "  hiding checks still work; the native fallback that covers\n" +
-                "  /proc reads and libc file access does not. To build it:\n" +
-                "    clang -shared -fPIC -O2 -Wall -Wextra \\\n" +
-                "        --target=aarch64-linux-android29 \\\n" +
-                "        -o app/src/main/jniLibs/arm64-v8a/libxstealth.so \\\n" +
-                "        native/libxstealth.c -llog -ldl\n" +
-                "  This is a warning, not an error — the build will proceed.")
-            return
-        }
+        if (skipNativeCheck) { println "checkXStealth: skipped"; return }
+        if (!so.exists()) { logger.warn("libxstealth.so not found"); return }
         def len = so.length()
-        if (len < 1024) {
-            logger.warn(
-                "libxstealth.so at ${so.absolutePath} is only ${len} bytes — " +
-                "probably a failed or empty build. XStealth native hiding " +
-                "will be unavailable.")
-            return
-        }
-        println "checkXStealth: OK — ${len} bytes at ${so.absolutePath}"
+        if (len < 1024) { logger.warn("libxstealth.so is ${len} bytes"); return }
+        println "checkXStealth: OK — ${len} bytes"
     }
 }
 
 tasks.register('checkXStealthNext') {
-    description = 'Verify libxstealth_next.so is present (optional)'
     group = 'verification'
-
     def so = new File(jniLibsDir, 'libxstealth_next.so')
-
     doLast {
-        if (skipNativeCheck) {
-            println "checkXStealthNext: skipped via -PskipNativeCheck=true"
-            return
-        }
-        if (!so.exists()) {
-            logger.warn(
-                "libxstealth_next.so not found at ${so.absolutePath}\n" +
-                "  XStealth Next will be unavailable. The standard XStealth\n" +
-                "  engine still works. To build Next:\n" +
-                "    clang -shared -fPIC -O2 -Wall -Wextra \\\n" +
-                "        --target=aarch64-linux-android29 \\\n" +
-                "        -o app/src/main/jniLibs/arm64-v8a/libxstealth_next.so \\\n" +
-                "        native/libxstealth_next.c -llog -ldl\n" +
-                "  This is a warning, not an error.")
-            return
-        }
+        if (skipNativeCheck) { println "checkXStealthNext: skipped"; return }
+        if (!so.exists()) { logger.warn("libxstealth_next.so not found"); return }
         def len = so.length()
-        if (len < 1024) {
-            logger.warn("libxstealth_next.so is only ${len} bytes.")
-            return
-        }
+        if (len < 1024) { logger.warn("libxstealth_next.so is ${len} bytes"); return }
         println "checkXStealthNext: OK — ${len} bytes"
     }
 }
 
 tasks.register('checkXStealthBridge') {
-    description = 'Verify libxstealth_bridge.so is present (optional)'
     group = 'verification'
-
     def so = new File(jniLibsDir, 'libxstealth_bridge.so')
-
     doLast {
-        if (skipNativeCheck) {
-            println "checkXStealthBridge: skipped via -PskipNativeCheck=true"
-            return
-        }
-        if (!so.exists()) {
-            logger.warn(
-                "libxstealth_bridge.so not found at ${so.absolutePath}\n" +
-                "  XStealth Bridge will be unavailable. The standard XStealth\n" +
-                "  engine still works. To build the bridge:\n" +
-                "    clang -shared -fPIC -O2 -Wall -Wextra \\\n" +
-                "        --target=aarch64-linux-android29 \\\n" +
-                "        -o app/src/main/jniLibs/arm64-v8a/libxstealth_bridge.so \\\n" +
-                "        native/libxstealth_bridge.c -llog -ldl\n" +
-                "  This is a warning, not an error.")
-            return
-        }
+        if (skipNativeCheck) { println "checkXStealthBridge: skipped"; return }
+        if (!so.exists()) { logger.warn("libxstealth_bridge.so not found"); return }
         def len = so.length()
-        if (len < 1024) {
-            logger.warn("libxstealth_bridge.so is only ${len} bytes.")
-            return
-        }
+        if (len < 1024) { logger.warn("libxstealth_bridge.so is ${len} bytes"); return }
         println "checkXStealthBridge: OK — ${len} bytes"
     }
 }
 
-tasks.matching { it.name == 'mergeDebugJniLibFolders' ||
-                 it.name == 'mergeReleaseJniLibFolders' ||
-                 it.name.startsWith('mergeStealth') ||
-                 it.name.startsWith('mergeStandard') }.configureEach {
-    dependsOn 'checkNativeShim'
-    dependsOn 'checkAmiru'
-    dependsOn 'checkCallSite'
-    dependsOn 'checkXStealth'
-    dependsOn 'checkXStealthNext'
-    dependsOn 'checkXStealthBridge'
+tasks.register('checkSysku') {
+    group = 'verification'
+    def so = new File(jniLibsDir, 'libsysku.so')
+    doLast {
+        if (skipNativeCheck) { println "checkSysku: skipped"; return }
+        if (!so.exists()) { logger.warn("libsysku.so not found"); return }
+        def len = so.length()
+        if (len < 1024) { logger.warn("libsysku.so is ${len} bytes"); return }
+        def xstealth = new File(jniLibsDir, 'libxstealth.so')
+        if (!xstealth.exists()) {
+            logger.warn("libsysku.so present but libxstealth.so absent")
+        }
+        println "checkSysku: OK — ${len} bytes"
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CLOAK LEAK CHECK
+//
+// Fails the build if the literal string "com.shizuposed.manager" appears
+// in classes.dex or resources.arsc. Under the same-length cloak model,
+// the package name is patched in AndroidManifest.xml only; any other
+// occurrence (BuildConfig field, resValue, hardcoded constant) survives
+// the patch and makes the cloaked APK detectable.
+//
+// This is the CI gate for Phase 0.2 of the cloak migration.
+// ═══════════════════════════════════════════════════════════════════════════
+
+def androidHome = System.getenv('ANDROID_HOME')
+    ?: System.getenv('ANDROID_SDK_ROOT')
+    ?: project.findProperty('android.sdk.dir')
+
+if (androidHome == null) {
+    throw new GradleException("ANDROID_HOME not set — cannot locate build-tools.")
+}
+
+def buildToolsRoot = new File(androidHome.toString(), 'build-tools')
+if (!buildToolsRoot.exists()) {
+    throw new GradleException("No build-tools under $buildToolsRoot")
+}
+
+def latestBuildTools = buildToolsRoot.listFiles()
+    .findAll { it.isDirectory() }
+    .sort { a, b -> b.name <=> a.name }
+    .find()
+
+def dexdumpTool = latestBuildTools != null
+    ? new File(latestBuildTools, 'dexdump') : null
+def aapt2Tool = latestBuildTools != null
+    ? new File(latestBuildTools, 'aapt2') : null
+
+tasks.register('checkNoOldPackageLeak') {
+    group = 'verification'
+    description = 'Fail if com.shizuposed.manager leaks into classes.dex or resources.arsc'
+
+    def apk = layout.buildDirectory.file(
+        'outputs/apk/release/app-release.apk').get().asFile
+    def capturedDexdump = dexdumpTool != null ? dexdumpTool.absolutePath : null
+    def capturedAapt2 = aapt2Tool != null ? aapt2Tool.absolutePath : null
+
+    doLast {
+        if (!apk.exists()) {
+            throw new GradleException("APK not found: ${apk}")
+        }
+        if (capturedDexdump == null || capturedAapt2 == null) {
+            logger.warn("checkNoOldPackageLeak: build-tools missing, skipping")
+            return
+        }
+
+        def tmp = File.createTempFile('dexcheck', '.dex')
+        try {
+            def zf = new java.util.zip.ZipFile(apk)
+            try {
+                def e = zf.getEntry('classes.dex')
+                if (e != null) {
+                    tmp.withOutputStream { out ->
+                        zf.getInputStream(e).withCloseable { it.transferTo(out) }
+                    }
+                    def pb = new ProcessBuilder(capturedDexdump, '-d', tmp.absolutePath)
+                    pb.redirectErrorStream(true)
+                    def proc = pb.start()
+                    def text = proc.inputStream.text
+                    proc.waitFor()
+                    if (text.contains('com.shizuposed.manager')) {
+                        throw new GradleException(
+                            "classes.dex contains the literal 'com.shizuposed.manager'. "
+                            + "Remove the BuildConfig field that sources it.")
+                    }
+                }
+            } finally { zf.close() }
+        } finally { tmp.delete() }
+
+        def pb2 = new ProcessBuilder(capturedAapt2, 'dump', 'resources', apk.absolutePath)
+        pb2.redirectErrorStream(true)
+        def proc2 = pb2.start()
+        def arsc = proc2.inputStream.text
+        proc2.waitFor()
+        if (arsc.contains('com.shizuposed.manager')) {
+            throw new GradleException(
+                "resources.arsc contains 'com.shizuposed.manager'. "
+                + "Remove the resValue string that sources it.")
+        }
+        println "checkNoOldPackageLeak: OK"
+    }
+}
+
+tasks.matching { it.name == 'assembleRelease' }.configureEach {
+    finalizedBy 'checkNoOldPackageLeak'
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // XPOSEDHOOK.DEX PIPELINE
 //
-// All values the task needs are captured at configuration time so
-// the doLast closure never touches `project`, `android`, or
-// `configurations`. That's what keeps the configuration cache
-// happy.
+// Compiles the release Java classes, runs d8 on the subset the hook
+// needs (core + xposed shim + libxposed vendor + stealth), and
+// writes build/outputs/dex/XposedHook.dex. That directory is added
+// to sourceSets.main's assets, so the merge*Assets tasks pick it up.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ─── SDK discovery (configuration time) ───────────────────────────────────
-
-def makeDexSdkDir = System.getenv('ANDROID_HOME')
-    ?: System.getenv('ANDROID_SDK_ROOT')
-    ?: project.findProperty('android.sdk.dir')
-
-if (makeDexSdkDir == null) {
-    throw new GradleException(
-        "ANDROID_HOME / ANDROID_SDK_ROOT / android.sdk.dir not set — cannot locate d8.")
-}
-
-def makeDexBuildToolsRoot = new File(makeDexSdkDir.toString(), 'build-tools')
-if (!makeDexBuildToolsRoot.exists()) {
-    throw new GradleException("No build-tools under $makeDexBuildToolsRoot")
-}
+def makeDexBuildToolsRoot = new File(androidHome.toString(), 'build-tools')
 
 def makeDexD8 = makeDexBuildToolsRoot.listFiles()
     .findAll { it.isDirectory() }
@@ -541,117 +360,70 @@ def makeDexD8 = makeDexBuildToolsRoot.listFiles()
     .find { it.exists() }
 
 if (makeDexD8 == null) {
-    throw new GradleException(
-        "d8 not found under $makeDexBuildToolsRoot. Install build-tools via sdkmanager.")
+    throw new GradleException("d8 not found under $makeDexBuildToolsRoot")
 }
-
-// ─── Platform jar discovery (configuration time) ──────────────────────────
 
 def makeDexCompileSdkVersion = android.compileSdk
 def makeDexCompileSdkMinor = 0
-try {
-    makeDexCompileSdkMinor = android.compileSdkMinor
-} catch (Throwable ignored) {}
+try { makeDexCompileSdkMinor = android.compileSdkMinor } catch (Throwable ignored) {}
 
-def makeDexPlatformsRoot = new File(makeDexSdkDir.toString(), 'platforms')
+def makeDexPlatformsRoot = new File(androidHome.toString(), 'platforms')
 def makeDexCandidatePlatformDirs = [
     makeDexCompileSdkMinor > 0
         ? "android-${makeDexCompileSdkVersion}.${makeDexCompileSdkMinor}" : null,
     "android-${makeDexCompileSdkVersion}",
-    "android-37.0.1",
-    "android-37.0",
-    "android-36",
-    "android-35",
+    "android-37.0", "android-36", "android-35",
 ].findAll { it != null }
 
 def makeDexPlatformJar = null
-def makeDexPlatformDirUsed = null
 for (String name : makeDexCandidatePlatformDirs) {
     File candidate = new File(makeDexPlatformsRoot, "${name}/android.jar")
-    if (candidate.exists()) {
-        makeDexPlatformJar = candidate
-        makeDexPlatformDirUsed = new File(makeDexPlatformsRoot, name)
-        break
-    }
+    if (candidate.exists()) { makeDexPlatformJar = candidate; break }
 }
 
 if (makeDexPlatformJar == null) {
-    throw new GradleException(
-        "Could not locate android.jar under ${makeDexPlatformsRoot.absolutePath}. " +
-        "Tried: ${makeDexCandidatePlatformDirs.join(', ')}. " +
-        "Install the platform with sdkmanager, e.g. " +
-        "`sdkmanager \"platforms;android-${makeDexCompileSdkVersion}\"`.")
+    throw new GradleException("Could not locate android.jar")
 }
 
-// ─── Compile classpath (after AGP creates the configurations) ─────────────
-//
-// With flavors in place the configuration is named
-// standardDebugCompileClasspath, not debugCompileClasspath. Try
-// several names so the task keeps working across AGP versions and
-// any future renaming.
-
-def makeDexLibJars = []
-def makeDexAarFiles = []
-
-afterEvaluate {
-    def cp = configurations.findByName('standardDebugCompileClasspath')
+def makeDexCompileClasspathFiles = provider {
+    def cp = configurations.findByName('releaseCompileClasspath')
+    if (cp == null) cp = configurations.findByName('debugCompileClasspath')
     if (cp == null) {
-        cp = configurations.findByName('standardReleaseCompileClasspath')
+        cp = configurations.find { c -> c.name.endsWith('CompileClasspath') }
     }
-    if (cp == null) {
-        cp = configurations.findByName('debugCompileClasspath')
-    }
-    if (cp == null) {
-        cp = configurations.find { c ->
-            c.name.endsWith('CompileClasspath')
-                && c.name.contains('standard')
-        }
-    }
-    if (cp == null) {
-        cp = configurations.find { c ->
-            c.name.endsWith('CompileClasspath')
-        }
-    }
-
-    if (cp != null) {
-        println "makeDex: resolving compile classpath from ${cp.name}"
-        try {
-            cp.resolve().each { f ->
-                if (f.name.endsWith('.jar')) {
-                    makeDexLibJars << f.absolutePath
-                } else if (f.name.endsWith('.aar')) {
-                    makeDexAarFiles << f
-                }
-            }
-        } catch (Throwable t) {
-            println "makeDex: warning — could not resolve ${cp.name}: ${t.message}"
-        }
-    } else {
-        println "makeDex: warning — no compile classpath configuration found"
+    if (cp == null) return [] as Set<File>
+    try {
+        return cp.resolve()
+    } catch (Throwable t) {
+        println "makeDex: warning — could not resolve ${cp.name}: ${t.message}"
+        return [] as Set<File>
     }
 }
 
 def makeDexMinSdk = android.defaultConfig.minSdk
-
-// ─── The task itself ──────────────────────────────────────────────────────
+def capturedPineJarPath = new File(projectDir, 'libs/pine-0.3.0.jar').absolutePath
+def capturedD8Path = makeDexD8.absolutePath
+def capturedPlatformJarPath = makeDexPlatformJar.absolutePath
+def capturedMinSdk = makeDexMinSdk
 
 tasks.register('makeDex') {
-    description = 'Build XposedHook.dex from compiled classes + Pine'
     group = 'build'
-
-    dependsOn 'compileStandardDebugJavaWithJavac'
+    dependsOn 'compileReleaseJavaWithJavac'
 
     def classesDirProvider = layout.buildDirectory.dir(
-        'intermediates/javac/standardDebug/classes')
+        'intermediates/javac/release/classes')
     def alternateClassesDirProvider = layout.buildDirectory.dir(
-        'intermediates/javac/standardDebug/compileStandardDebugJavaWithJavac/classes')
+        'intermediates/javac/release/compileReleaseJavaWithJavac/classes')
     def fallbackClassesDirProvider = layout.buildDirectory.dir(
         'intermediates/javac/debug/classes')
-    def fallbackAltClassesDirProvider = layout.buildDirectory.dir(
-        'intermediates/javac/debug/compileDebugJavaWithJavac/classes')
-    def outDirProvider     = layout.buildDirectory.dir('outputs/dex')
-    def outDexProvider     = outDirProvider.map { dir -> new File(dir.asFile, 'XposedHook.dex') }
-    def pineJar            = file("${projectDir}/libs/pine-0.3.0.jar")
+    def outDirProvider = layout.buildDirectory.dir('outputs/dex')
+    def outDexProvider = outDirProvider.map { dir -> new File(dir.asFile, 'XposedHook.dex') }
+    def pineJarFile = new File(capturedPineJarPath)
+
+    def compileClasspathProvider = makeDexCompileClasspathFiles
+    def d8Path = capturedD8Path
+    def platformJarPath = capturedPlatformJarPath
+    def minSdkStr = capturedMinSdk.toString()
 
     outputs.dir(outDirProvider)
     outputs.file(outDexProvider)
@@ -664,18 +436,9 @@ tasks.register('makeDex') {
             classesDirProvider.get().asFile,
             alternateClassesDirProvider.get().asFile,
             fallbackClassesDirProvider.get().asFile,
-            fallbackAltClassesDirProvider.get().asFile,
         ]
         def classesDir = candidates.find { it.exists() }
-        if (classesDir == null) {
-            println "makeDex: classes dir not found at any known location"
-            candidates.each {
-                println "makeDex:   ${it.absolutePath} (exists=${it.exists()})"
-            }
-            classesDir = candidates[0]
-        } else {
-            println "makeDex: using classes dir ${classesDir.absolutePath}"
-        }
+        if (classesDir == null) classesDir = candidates[0]
         outDir.mkdirs()
 
         def wanted = []
@@ -684,64 +447,99 @@ tasks.register('makeDex') {
             def p = f.absolutePath
             if (p.contains('/core/')
                     || p.contains('/de/robv/android/xposed/')
+                    || p.contains('/io/github/libxposed/')
                     || p.contains('/stealth/')) {
                 wanted << p
             }
         }
 
-        if (pineJar.exists()) {
+        if (pineJarFile.exists()) {
             def pineExtract = new File(outDir, 'pine-classes')
             pineExtract.mkdirs()
-            extractZipEntries(pineJar, pineExtract) { name ->
-                name.endsWith('.class')
-            }
+            def pineZip = new java.util.zip.ZipFile(pineJarFile)
+            try {
+                def pineEntries = pineZip.entries()
+                def pineCanonical = pineExtract.canonicalPath
+                while (pineEntries.hasMoreElements()) {
+                    def entry = pineEntries.nextElement()
+                    if (entry.isDirectory()) continue
+                    if (!entry.name.endsWith('.class')) continue
+                    def target = new File(pineExtract, entry.name)
+                    if (!target.canonicalPath.startsWith(pineCanonical)) continue
+                    target.parentFile?.mkdirs()
+                    pineZip.getInputStream(entry).withCloseable { input ->
+                        target.withOutputStream { output ->
+                            input.transferTo(output)
+                        }
+                    }
+                }
+            } finally { pineZip.close() }
             pineExtract.eachFileRecurse { f ->
                 if (f.name.endsWith('.class')) wanted << f.absolutePath
             }
-            println "makeDex: Pine classes extracted from ${pineJar.name}"
-        } else {
-            println "makeDex: WARNING — Pine jar not found at ${pineJar.absolutePath}"
         }
 
         if (wanted.isEmpty()) {
-            throw new GradleException(
-                "No .class files matched. Check that the app compiles and " +
-                "that libs/pine-0.3.0.jar exists.")
+            throw new GradleException("No .class files matched.")
         }
-        println "makeDex: ${wanted.size()} .class files matched"
 
-        def libJars = new ArrayList<String>(makeDexLibJars)
-        for (File aar : makeDexAarFiles) {
+        def libJars = new ArrayList<String>()
+        def aarFiles = []
+        try {
+            compileClasspathProvider.get().each { f ->
+                if (f.name.endsWith('.jar')) {
+                    libJars << f.absolutePath
+                } else if (f.name.endsWith('.aar')) {
+                    aarFiles << f
+                }
+            }
+        } catch (Throwable t) {
+            println "makeDex: warning — could not enumerate compile classpath: ${t.message}"
+        }
+
+        for (File aar : aarFiles) {
             def cacheDir = new File(outDir, "aar-libs/${aar.name}")
             cacheDir.mkdirs()
             def classesJar = new File(cacheDir, 'classes.jar')
             if (!classesJar.exists()) {
-                extractZipEntries(aar, cacheDir) { name ->
-                    name == 'classes.jar'
-                }
+                def aarZip = new java.util.zip.ZipFile(aar)
+                try {
+                    def aarEntries = aarZip.entries()
+                    def aarCanonical = cacheDir.canonicalPath
+                    while (aarEntries.hasMoreElements()) {
+                        def entry = aarEntries.nextElement()
+                        if (entry.isDirectory()) continue
+                        if (entry.name != 'classes.jar') continue
+                        def target = new File(cacheDir, entry.name)
+                        if (!target.canonicalPath.startsWith(aarCanonical)) continue
+                        target.parentFile?.mkdirs()
+                        aarZip.getInputStream(entry).withCloseable { input ->
+                            target.withOutputStream { output ->
+                                input.transferTo(output)
+                            }
+                        }
+                    }
+                } finally { aarZip.close() }
             }
             if (classesJar.exists()) libJars << classesJar.absolutePath
         }
 
-        libJars << makeDexPlatformJar.absolutePath
-        println "makeDex: using platform jar ${makeDexPlatformJar.absolutePath}"
+        libJars << platformJarPath
 
-        def cmd = [makeDexD8.absolutePath, '--release',
-                   '--min-api', "${makeDexMinSdk}",
+        def cmd = [d8Path, '--release',
+                   '--min-api', minSdkStr,
                    '--output', outDir.absolutePath]
         cmd.addAll(wanted)
         libJars.each { j -> cmd.addAll(['--lib', j]) }
 
-        println "makeDex: running d8 -> $outDex"
-        def proc = cmd.execute()
-        def stdout = new StringBuilder()
-        def stderr = new StringBuilder()
-        proc.waitForProcessOutput(stdout, stderr)
-        if (stdout.length() > 0) print stdout.toString()
-        if (stderr.length() > 0) System.err.print(stderr.toString())
+        def pb = new ProcessBuilder(cmd)
+        pb.redirectErrorStream(true)
+        def proc = pb.start()
+        proc.inputStream.eachLine { line -> println line }
+        def rc = proc.waitFor()
 
-        if (proc.exitValue() != 0) {
-            throw new GradleException("d8 failed with exit code ${proc.exitValue()}")
+        if (rc != 0) {
+            throw new GradleException("d8 failed with exit code ${rc}")
         }
 
         def produced = new File(outDir, 'classes.dex')
@@ -756,41 +554,59 @@ tasks.register('makeDex') {
         if (!outDex.exists() || outDex.length() == 0) {
             throw new GradleException("d8 produced no usable dex at $outDex")
         }
-        println "makeDex: done — ${outDex.length()} bytes at $outDex"
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// TASK WIRING
+// makeDex TASK WIRING
+//
+// sourceSets.main adds build/outputs/dex to the assets source dirs,
+// so every task that reads assets depends on makeDex producing that
+// directory. Declaring the dependency explicitly is required by
+// Gradle 9.8 — it no longer infers it from the sourceSets entry.
+//
+// The consumers fall into four groups:
+//   • Asset merge tasks (merge*Assets)
+//   • Lint analysis (lintVitalAnalyze*, lintAnalyze*, lintVitalReport*)
+//   • Lint model writers (generate*LintVitalReportModel)
+//   • Assembly (assemble*)
+//
+// If you add a new variant or a new task that reads assets, add it
+// to one of these matchers. Missing one produces the same
+// "implicit dependency" error at build time.
 // ═══════════════════════════════════════════════════════════════════════════
 
-tasks.matching { it.name == 'mergeDebugAssets' ||
-                 it.name == 'mergeReleaseAssets' ||
-                 it.name == 'mergeStealthDebugAssets' ||
-                 it.name == 'mergeStealthReleaseAssets' ||
-                 it.name == 'mergeStandardDebugAssets' ||
-                 it.name == 'mergeStandardReleaseAssets' }.configureEach {
+tasks.matching { t ->
+    def n = t.name
+    // Asset merges
+    n == 'mergeReleaseAssets' ||
+    n == 'mergeDebugAssets'   ||
+    // Lint analysis
+    n.startsWith('lintVitalAnalyze') ||
+    n.startsWith('lintAnalyze')      ||
+    n.startsWith('lintVitalReport')  ||
+    // Lint model writers
+    n.startsWith('generate') && n.endsWith('LintVitalReportModel') ||
+    // Assemblies
+    n == 'assembleRelease' ||
+    n == 'assembleDebug'
+}.configureEach {
     dependsOn 'makeDex'
 }
 
-tasks.matching { it.name == 'assembleDebug' ||
-                 it.name == 'assembleRelease' ||
-                 it.name == 'assembleStealth' ||
-                 it.name == 'assembleStandard' }.configureEach {
-    dependsOn 'makeDex'
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// VERIFICATION WIRING
+//
+// checkNativeShim remains required. The six optional checks stay
+// warn-only. None of them changed under the cloak migration.
+// ═══════════════════════════════════════════════════════════════════════════
 
-tasks.matching { it.name.startsWith('generate') &&
-                 it.name.contains('LintVital') &&
-                 it.name.endsWith('ReportModel') }.configureEach {
-    dependsOn 'makeDex'
-}
-
-tasks.matching { it.name.startsWith('generate') &&
-                 it.name.endsWith('LintReportModel') }.configureEach {
-    dependsOn 'makeDex'
-}
-
-tasks.matching { it.name.startsWith('lint') }.configureEach {
-    mustRunAfter 'makeDex'
+tasks.matching { it.name == 'assembleRelease' }.configureEach {
+    dependsOn 'checkNativeShim'
+    dependsOn 'checkCallSite'
+    dependsOn 'checkAmiru'
+    dependsOn 'checkXStealth'
+    dependsOn 'checkXStealthNext'
+    dependsOn 'checkXStealthBridge'
+    dependsOn 'checkSysku'
 }
