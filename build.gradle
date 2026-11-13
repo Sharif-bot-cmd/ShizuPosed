@@ -1,13 +1,15 @@
 // build.gradle (project-level)
 //
 // Toolchain:
-//   Gradle  9.8.0
-//   JDK     25
+//   Gradle  9.8.2
+//   JDK     21
 //   AGP     9.4.1
 //
-// The JDK 25 toolchain means source/target compatibility is 25.
-// AGP 9.4.0 is the first AGP that officially supports JDK 25 as
-// the running JVM, so that pairing is required.
+// Gradle is running on JDK 21 (Termux's java-21-openjdk), so
+// source/target compatibility is pinned to 21 everywhere.
+// apkzlib also targets 21 — it doesn't use any Java 25
+// language features, and pinning everything to the same
+// version means no toolchain download is required.
 
 buildscript {
     repositories {
@@ -17,22 +19,43 @@ buildscript {
         maven { url 'https://maven.rikka.dev/releases' }
     }
     dependencies {
-        // Android Gradle Plugin 9.4.1 — minimum AGP for Gradle 9.8
-        // and JDK 25. Older AGP versions reject JDK 25 at startup.
+        // Android Gradle Plugin 9.4.1 — minimum AGP for Gradle 9.8.
         classpath 'com.android.tools.build:gradle:9.4.1'
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Cross-project properties consumed by the vendored apkzlib subproject.
+//
+// apkzlib/build.gradle.kts reads these via `by rootProject.extra`.
+// LSPatch defines them in its own root build.gradle.kts; ShizuPosed
+// must define them here so the configuration phase succeeds when
+// `include ':apkzlib'` pulls the subproject into the build.
+//
+// Pinned to VERSION_21 to match the JDK 21 toolchain and the
+// source/target compatibility set in the `subprojects { }` block
+// below. If you change one, change the other.
+// ═══════════════════════════════════════════════════════════════════════════
+ext {
+    androidSourceCompatibility = JavaVersion.VERSION_21
+    androidTargetCompatibility = JavaVersion.VERSION_21
+}
+
 // Set Java version for all subprojects.
 //
-// Using JavaVersion.VERSION_25 pins both source and target to 25,
-// which matches the JDK 25 toolchain. If a subproject needs a
-// different level (e.g., a library that must run on older
-// Android), override it in that subproject's build.gradle.
+// Using JavaVersion.VERSION_21 pins both source and target to 21,
+// which matches the JDK 21 toolchain. If a subproject needs a
+// different level, override it in that subproject's build.gradle.
 subprojects {
+    // apkzlib declares its own toolchain and target (Java 21).
+    // Skipping it here avoids the root's source/target override
+    // colliding with apkzlib's own java { } block.
+    if (project.name == 'apkzlib') {
+        return
+    }
     tasks.withType(JavaCompile).configureEach {
-        sourceCompatibility = JavaVersion.VERSION_25
-        targetCompatibility = JavaVersion.VERSION_25
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
         options.compilerArgs << '-Xlint:unchecked' << '-Xlint:deprecation'
         options.encoding = 'UTF-8'
     }

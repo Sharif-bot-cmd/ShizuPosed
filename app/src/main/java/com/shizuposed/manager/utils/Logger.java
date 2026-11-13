@@ -24,12 +24,23 @@ public class Logger {
     private static final int MAX_LOG_FILE_SIZE = 5 * 1024 * 1024; // 5MB
 
     private static Logger instance;
+    private static volatile Logger noOpInstance;
+
     private Context context;
     private File logFile;
     private ConcurrentLinkedQueue<LogEntry> logQueue = new ConcurrentLinkedQueue<>();
     private boolean isDebug = false;
     private boolean logToFile = true;
     private SharedPreferences prefs;
+
+    /**
+     * When true, this instance is a no-op fallback created by
+     * getNoOp(). It logs to android.util.Log only — no file, no
+     * prefs, no queue. Used when getInstance() fails (e.g.,
+     * file I/O error during initialization) so callers don't NPE
+     * on every log call.
+     */
+    private final boolean isNoOp;
 
     // Tracks whether we're still inside the constructor. If so, setters
     // don't write markers — we're just reading the persisted state.
@@ -39,6 +50,7 @@ public class Logger {
     private static final String PREFS_NAME = "shizuposed_settings";
 
     private Logger(Context context) {
+        this.isNoOp = false;
         this.context = context.getApplicationContext();
         this.prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
 
@@ -55,6 +67,15 @@ public class Logger {
         Log.i(TAG, "Logger initialized - logToFile: " + logToFile + ", debug: " + isDebug);
     }
 
+    /**
+     * Private constructor for the no-op fallback. Logs to
+     * android.util.Log only; never touches the filesystem or
+     * SharedPreferences.
+     */
+    private Logger(boolean noOp) {
+        this.isNoOp = noOp;
+    }
+
     public static synchronized Logger getInstance(Context context) {
         if (instance == null) {
             instance = new Logger(context);
@@ -62,10 +83,34 @@ public class Logger {
         return instance;
     }
 
+    /**
+     * Return a Logger whose methods all log to android.util.Log
+     * only. Safe to call from a caller that can't guarantee a
+     * Context (e.g., an early-return path in Application.onCreate)
+     * or from ShizuPosedManagerApp when getInstance() throws.
+     *
+     * The returned instance is a process-wide singleton, so
+     * repeated calls are cheap.
+     */
+    public static Logger getNoOp() {
+        Logger local = noOpInstance;
+        if (local == null) {
+            synchronized (Logger.class) {
+                local = noOpInstance;
+                if (local == null) {
+                    local = new Logger(true);
+                    noOpInstance = local;
+                }
+            }
+        }
+        return local;
+    }
+
     // ============================================================
     // SET LOG TO FILE — idempotent: only writes a marker on change
     // ============================================================
     public void setLogToFile(boolean enabled) {
+        if (isNoOp) return;
         if (this.logToFile == enabled) {
             // Value unchanged — nothing to do, no marker, no prefs write
             return;
@@ -94,6 +139,10 @@ public class Logger {
     // SET DEBUG MODE — idempotent
     // ============================================================
     public void setDebug(boolean debug) {
+        if (isNoOp) {
+            this.isDebug = debug;
+            return;
+        }
         if (this.isDebug == debug) {
             return;
         }
@@ -134,6 +183,18 @@ public class Logger {
     // ============================================================
 
     private void log(String level, String tag, String message) {
+        // No-op fallback: log to android.util.Log only.
+        if (isNoOp) {
+            switch (level) {
+                case "VERBOSE": Log.v(tag, message); break;
+                case "DEBUG":   Log.d(tag, message); break;
+                case "INFO":    Log.i(tag, message); break;
+                case "WARN":    Log.w(tag, message); break;
+                case "ERROR":   Log.e(tag, message); break;
+            }
+            return;
+        }
+
         LogEntry entry = new LogEntry(level, tag, message);
         logQueue.add(entry);
 
@@ -155,6 +216,7 @@ public class Logger {
     }
 
     private synchronized void writeToFile(LogEntry entry) {
+        if (isNoOp || logFile == null) return;
         try {
             if (logFile.exists() && logFile.length() > MAX_LOG_FILE_SIZE) {
                 rotateLogFile();
@@ -169,6 +231,7 @@ public class Logger {
     }
 
     private void rotateLogFile() {
+        if (isNoOp || logFile == null) return;
         try {
             File backup = new File(logFile.getParent(), "shizuposed.log.old");
             if (backup.exists()) backup.delete();
@@ -187,6 +250,10 @@ public class Logger {
 
     public List<LogEntry> getLogEntries() {
         List<LogEntry> entries = new ArrayList<>();
+
+        if (isNoOp || logFile == null) {
+            return entries;
+        }
 
         try {
             if (logFile.exists()) {
@@ -243,7 +310,7 @@ public class Logger {
             sb.append(entry.toString()).append("\n");
         }
 
-        if (!logQueue.isEmpty()) {
+        if (!isNoOp && !logQueue.isEmpty()) {
             sb.append("\n=== Recent Memory Logs ===\n");
             for (LogEntry entry : logQueue) {
                 sb.append(entry.toString()).append("\n");
@@ -254,6 +321,7 @@ public class Logger {
     }
 
     public void clearLogs() {
+        if (isNoOp) return;
         try {
             if (logFile.exists()) {
                 logFile.delete();
@@ -269,6 +337,7 @@ public class Logger {
     public File getLogFile() { return logFile; }
 
     public long getLogFileSize() {
+        if (isNoOp || logFile == null) return 0;
         if (logFile.exists()) return logFile.length();
         return 0;
     }
