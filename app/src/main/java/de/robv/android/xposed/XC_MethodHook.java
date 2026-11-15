@@ -19,14 +19,6 @@ public abstract class XC_MethodHook {
 
     // ═════════════════════════════════════════════════════════════
     // UNHOOK HANDLE (API 94+)
-    //
-    // Returned as the element type of Set<Unhook> from
-    // XposedBridge.hookAllMethods and hookAllConstructors. API 94
-    // introduced returning these handles so modules can unhook an
-    // entire set at once.
-    //
-    // Functionally equivalent to IXUnhook<XC_MethodHook>, but
-    // declared as a nested class to match the LSPosed shape.
     // ═════════════════════════════════════════════════════════════
 
     public static class Unhook {
@@ -70,6 +62,23 @@ public abstract class XC_MethodHook {
     public static final class MethodHookParam {
         public Object thisObject;
         public Object[] args;
+
+        /**
+         * The Method or Constructor being hooked.
+         *
+         * Set by the framework's dispatch path before
+         * beforeHookedMethod is called. Mirrors upstream Xposed's
+         * MethodHookParam.method. Null if the dispatcher didn't
+         * populate it — a hook that reads it must null-check.
+         *
+         * Consumers:
+         *   • LibXposedHookerAdapter.ChainImpl.getExecutable()
+         *     returns this for libxposed hooks.
+         *   • Modules that want to identify the hooked member
+         *     without capturing it at hook time.
+         */
+        public java.lang.reflect.Member method;
+
         private Object result;
         private Throwable throwable;
         public boolean hasResult;
@@ -99,10 +108,6 @@ public abstract class XC_MethodHook {
 
         /**
          * API 96: "was the result explicitly set, even to null?"
-         *
-         * Distinct from getResult() != null because setting the
-         * result to null is a legitimate early return and modules
-         * rely on the distinction.
          */
         public boolean isReturnEarly() {
             return hasResult;

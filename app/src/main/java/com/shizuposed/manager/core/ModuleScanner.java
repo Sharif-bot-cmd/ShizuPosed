@@ -27,38 +27,48 @@ import java.util.zip.ZipFile;
  * ModuleScanner
  *
  * Enumerates every installed package and checks whether its APK
- * looks like an Xposed module. Modules found this way are registered
- * with ModuleLoader so they appear in the Modules tab without the
- * user having to add them manually.
+ * ships one of the canonical Xposed module markers. Modules found
+ * this way are registered with ModuleLoader so they appear in the
+ * Modules tab without the user having to add them manually.
  *
- * DETECTION MARKERS
- * -----------------
- * assets/xposed_init is the canonical marker. The scanner also
- * accepts assets/xposed_module, META-INF/xposed/module.prop, and
- * a bare assets/native_init as weaker signals.
+ * DETECTION
+ * ---------
+ * Only three markers are checked, all static, all inside the APK
+ * zip:
  *
- * MANUAL ADD PROTECTION (R-6.5+)
- * ------------------------------
+ *   • assets/xposed_init        — the canonical marker
+ *   • assets/xposed_module      — older convention
+ *   • META-INF/xposed/module.prop — EdXposed-era
+ *
+ * A package that ships any of these is a module. A package that
+ * ships none of them is not. No heuristics, no class loading, no
+ * dex enumeration, no application-class scanning.
+ *
+ * This matches LSPosed's detection model: LSPosed does not guess.
+ * A module declares itself by shipping one of these markers, and
+ * a package that doesn't ship one isn't a module — even if its
+ * application class happens to implement a hook interface, or if
+ * its manifest happens to have xposedminversion meta-data.
+ *
+ * System packages are NOT filtered. If a system-installed app
+ * genuinely ships a marker, it is a module, and the user should
+ * see it. Some OEM builds pre-install Xposed-compatible hooks;
+ * hiding those from the Modules tab would be wrong.
+ *
+ * MANUAL ADD PROTECTION
+ * ---------------------
  * The purge pass skips any module whose ModuleInfo.manuallyAdded
- * flag is set. Users who add a module by hand via the Add Module
- * dialog are never subject to automatic cleanup — that intent
- * takes precedence over the apkExists / packageInstalled checks.
+ * flag is set. A module the user added by hand is never subject
+ * to automatic cleanup.
  *
- * "NEWLY REGISTERED" IS PERSISTENT (8.0+)
- * --------------------------------------
+ * "NEWLY REGISTERED" IS PERSISTENT
+ * --------------------------------
  * The scanner tracks which module packages it has ever reported in
  * a SharedPreferences file, so a cold-start scan does not treat
  * every installed module as newly discovered. Without this, the
  * UI showed "N new modules detected" every time the app was
  * opened, because the in-memory "already registered" set was
  * empty at process start.
- *
- * The persisted set is a union: each scan adds the packages it
- * found to the set. A module that was uninstalled and reinstalled
- * counts as new again only if it was removed from the set between
- * the two scans. The manager's "clean all caches" action calls
- * resetSeenPackages() to clear the set when the user explicitly
- * asks for a full reset.
  */
 public final class ModuleScanner {
 
@@ -70,9 +80,13 @@ public final class ModuleScanner {
 
     private static final long PURGE_GRACE_PERIOD_MS = 60_000L;
 
-    /** SharedPreferences file for scan state. */
     private static final String PREFS_NAME = "module_scanner_state";
     private static final String KEY_SEEN_PACKAGES = "seen_packages";
+
+    /** Detection source labels, recorded on ModuleInfo.detectedVia. */
+    public static final String DETECTED_XPOSED_INIT   = "assets/xposed_init";
+    public static final String DETECTED_XPOSED_MODULE = "assets/xposed_module";
+    public static final String DETECTED_MODULE_PROP   = "META-INF/xposed/module.prop";
 
     private static final ConcurrentHashMap<String, Integer> missedCounts =
         new ConcurrentHashMap<>();
@@ -86,8 +100,6 @@ public final class ModuleScanner {
         public int purgedCount = 0;
         public int refreshedPaths = 0;
         public int purgeDeferred = 0;
-
-        /** Packages already known before this scan. Diagnostic only. */
         public int alreadyKnown = 0;
 
         public final List<String> newlyRegisteredPackages = new ArrayList<>();
@@ -99,10 +111,6 @@ public final class ModuleScanner {
     // SEEN-PACKAGE PERSISTENCE
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Load the set of module packages that previous scans have
-     * already reported. Returns an empty set on first run.
-     */
     private static Set<String> loadSeenPackages(Context context) {
         try {
             SharedPreferences prefs = context.getApplicationContext()
@@ -115,11 +123,6 @@ public final class ModuleScanner {
         }
     }
 
-    /**
-     * Persist the union of the previous seen set and the packages
-     * found in this scan. Uses commit() so the write survives a
-     * process kill immediately after the scan.
-     */
     private static void saveSeenPackages(Context context, Set<String> updated) {
         try {
             SharedPreferences prefs = context.getApplicationContext()
@@ -130,12 +133,6 @@ public final class ModuleScanner {
         } catch (Throwable ignored) {}
     }
 
-    /**
-     * Clear the persisted seen-package set. Called by the manager's
-     * "clean all caches" action so that the next scan treats every
-     * module as newly discovered again (which is what a full cache
-     * reset should look like).
-     */
     public static void resetSeenPackages(Context context) {
         if (context == null) return;
         try {
@@ -172,17 +169,6 @@ public final class ModuleScanner {
             return result;
         }
 
-        // Two independent notions of "already known":
-        //
-        //   • alreadyRegistered — what ModuleLoader currently has in
-        //     its cache. Used to decide whether to re-register or
-        //     refresh a module's apkPath.
-        //
-        //   • seenPackages — what we've ever reported as newly
-        //     registered, persisted across process restarts. Used to
-        //     decide whether to *report* a module as new. Without
-        //     this, a cold-start scan reports every module as new
-        //     because alreadyRegistered starts empty.
         Set<String> alreadyRegistered = new HashSet<>();
         for (ModuleInfo m : loader.getCachedModules()) {
             if (m != null && m.packageName != null) {
@@ -235,8 +221,8 @@ public final class ModuleScanner {
                         + " is registered but missing from the loader cache");
                 }
 
-                String entry = detectModuleEntry(apkPath);
-                if (entry == null) continue;
+                Detection det = detectModule(apkPath);
+                if (det == null) continue;
 
                 result.xposedModulesFound++;
                 presentThisScan.add(ai.packageName);
@@ -247,29 +233,28 @@ public final class ModuleScanner {
                 module.packageName = ai.packageName;
                 module.name = ai.loadLabel(pm).toString();
                 module.version = readVersion(pm, ai.packageName);
-                module.xposedInit = entry.isEmpty() ? null : entry;
+                module.xposedInit = det.entryClass;
                 module.apkPath = apkPath;
                 module.enabled = existingOrEnabled(loader, ai.packageName);
                 module.hookedApps = preserveScope(loader, ai.packageName);
                 module.recommendedApps = preserveRecommended(loader, ai.packageName);
                 module.hasUi = hasLauncherActivity(context, ai.packageName);
                 module.manuallyAdded = existingManuallyAdded(loader, ai.packageName);
+                module.detectedVia = det.source;
 
                 boolean ok = loader.installModule(module);
                 if (ok) {
                     if (isFirstTimeReporting) {
-                        // First time we've reported this package. Count
-                        // it as newly registered.
                         result.newlyRegistered++;
                         result.newlyRegisteredPackages.add(ai.packageName);
                         logger.i("[" + TAG + "] Auto-detected module: "
                             + ai.packageName
-                            + " (entry=" + (entry.isEmpty()
-                                ? "<auto-detect>" : entry)
+                            + " (source=" + det.source
+                            + ", entry=" + (det.entryClass == null
+                                ? "<auto-detect>" : det.entryClass)
                             + ", hasUi=" + module.hasUi
                             + ", recommended=" + module.getRecommendedAppCount() + ")");
                     } else {
-                        // Seen before, still present. Not news.
                         result.alreadyKnown++;
                         logger.d("[" + TAG + "] Module still present: "
                             + ai.packageName);
@@ -282,9 +267,6 @@ public final class ModuleScanner {
             }
         }
 
-        // Persist the union. This runs even if the scan found no new
-        // modules, so the persisted set catches up with the device's
-        // current package list.
         Set<String> updatedSeen = new HashSet<>(seenPackages);
         updatedSeen.addAll(presentThisScan);
         if (!updatedSeen.equals(seenPackages)) {
@@ -318,6 +300,66 @@ public final class ModuleScanner {
         return result;
     }
 
+    // ═════════════════════════════════════════════════════════════
+    // DETECTION
+    // ═════════════════════════════════════════════════════════════
+
+    private static final class Detection {
+        final String source;
+        final String entryClass;
+
+        Detection(String source, String entryClass) {
+            this.source = source;
+            this.entryClass = entryClass;
+        }
+    }
+
+    /**
+     * Check whether the APK ships one of the canonical Xposed
+     * module markers.
+     *
+     * The three markers, in order:
+     *   • assets/xposed_init         — canonical
+     *   • assets/xposed_module       — older convention
+     *   • META-INF/xposed/module.prop — EdXposed-era
+     *
+     * If none is present, the package is not a module. No
+     * fallback heuristics, no class loading, no dex enumeration.
+     *
+     * The entry class is read from the first marker that exists.
+     * If the marker exists but the entry is empty (e.g.,
+     * assets/native_init-style marker with no class), the
+     * detection still succeeds — the module will be registered
+     * with entryClass == null, and the module's own code will
+     * self-identify at load time.
+     */
+    private static Detection detectModule(String apkPath) {
+        try (ZipFile zip = new ZipFile(apkPath)) {
+            String entry = readFirstMeaningfulLine(zip, "assets/xposed_init");
+            if (entry != null && !entry.isEmpty()) {
+                return new Detection(DETECTED_XPOSED_INIT, entry);
+            }
+
+            entry = readFirstMeaningfulLine(zip, "assets/xposed_module");
+            if (entry != null && !entry.isEmpty()) {
+                return new Detection(DETECTED_XPOSED_MODULE, entry);
+            }
+
+            String propEntry = readModulePropEntry(zip);
+            if (propEntry != null && !propEntry.isEmpty()) {
+                return new Detection(DETECTED_MODULE_PROP, propEntry);
+            }
+        } catch (Throwable t) {
+            // ZipFile can fail on a corrupt or permission-denied
+            // APK. Not a module.
+        }
+        return null;
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // HELPERS
+    // ═════════════════════════════════════════════════════════════
+
     private static void resetMissedCount(String pkg) {
         if (pkg == null) return;
         missedCounts.remove(pkg);
@@ -349,6 +391,10 @@ public final class ModuleScanner {
             return false;
         }
     }
+
+    // ═════════════════════════════════════════════════════════════
+    // PURGE
+    // ═════════════════════════════════════════════════════════════
 
     public static int purgeUninstalledModules(Context context,
                                               List<String> purgedOut) {
@@ -450,26 +496,9 @@ public final class ModuleScanner {
         return removed;
     }
 
-    private static String detectModuleEntry(String apkPath) {
-        if (apkPath == null) return null;
-        try (ZipFile zip = new ZipFile(apkPath)) {
-
-            String entry = readFirstMeaningfulLine(zip, "assets/xposed_init");
-            if (entry != null && !entry.isEmpty()) return entry;
-
-            entry = readFirstMeaningfulLine(zip, "assets/xposed_module");
-            if (entry != null && !entry.isEmpty()) return entry;
-
-            entry = readModulePropEntry(zip);
-            if (entry != null && !entry.isEmpty()) return entry;
-
-            if (zip.getEntry("assets/native_init") != null) {
-                return "";
-            }
-
-        } catch (Throwable ignored) {}
-        return null;
-    }
+    // ═════════════════════════════════════════════════════════════
+    // STATIC MARKER READERS
+    // ═════════════════════════════════════════════════════════════
 
     private static String readFirstMeaningfulLine(ZipFile zip, String entryName) {
         try {
@@ -527,6 +556,10 @@ public final class ModuleScanner {
             return null;
         }
     }
+
+    // ═════════════════════════════════════════════════════════════
+    // MODULE INFO HELPERS
+    // ═════════════════════════════════════════════════════════════
 
     private static String readVersion(PackageManager pm, String pkg) {
         try {

@@ -35,9 +35,16 @@ import java.util.List;
  * installed) is done from the detail sheet's "Open module app"
  * button.
  *
- * XStealth's row still has no enable switch. Its toggle lives in
- * the detail sheet. Tapping the row opens the detail sheet for it,
- * not the scope editor.
+ * API VERSION BADGE
+ * -----------------
+ * Each normal module row shows an "API N" pill when the module
+ * declared an Xposed API version in its manifest or module.prop.
+ * Modules declaring an API above ShizuPosed's ceiling (100) get
+ * "(unsupported)" appended so the user can see at a glance why
+ * activation fails.
+ *
+ * XStealth's row shows no API badge (it's built-in, not a
+ * third-party Xposed module).
  */
 public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleViewHolder> {
 
@@ -50,11 +57,6 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
     public interface OnModuleActionListener {
         void onToggle(ModuleInfo module, boolean enable);
         void onDetail(ModuleInfo module);
-        /**
-         * Row body tapped. For normal modules this should open the
-         * scope editor. For XStealth it should open the detail
-         * sheet.
-         */
         void onEditScope(ModuleInfo module);
     }
 
@@ -101,6 +103,7 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
 
     /**
      * Normal module row:
+     *   • API version badge (if declared).
      *   • Enable switch visible.
      *   • Scope summary visible.
      *   • Chevron visible (hint: tap to edit scope).
@@ -113,6 +116,9 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
                 : R.drawable.status_indicator_disabled
         );
 
+        // ── API version badge ─────────────────────────────────
+        bindApiBadge(holder, module);
+
         // Enable switch
         if (holder.swEnabled != null) {
             holder.swEnabled.setVisibility(View.VISIBLE);
@@ -121,7 +127,6 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
             holder.swEnabled.setOnCheckedChangeListener((buttonView, isChecked) -> {
                 long now = System.currentTimeMillis();
                 if (now - lastToggleTime < TOGGLE_DEBOUNCE) {
-                    // Revert the visual state — the toggle was debounced.
                     holder.swEnabled.setOnCheckedChangeListener(null);
                     holder.swEnabled.setChecked(!isChecked);
                     holder.swEnabled.setOnCheckedChangeListener((bv, c) -> {});
@@ -165,13 +170,11 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
             holder.ivChevron.setVisibility(View.VISIBLE);
         }
 
-        // Row tap → scope editor (or XStealth detail via the caller)
+        // Row tap → scope editor
         holder.itemView.setOnClickListener(v -> {
             if (listener != null) listener.onEditScope(module);
         });
 
-        // Long-press disabled — launching the module UI is done from
-        // the detail sheet's "Open module app" button instead.
         holder.itemView.setOnLongClickListener(null);
 
         // Icon tap → detail sheet
@@ -182,12 +185,43 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
         }
     }
 
+    private void bindApiBadge(ModuleViewHolder holder, ModuleInfo module) {
+        if (holder.layoutApiBadge == null) return;
+
+        int primary = -1;
+        if (module.apiVersion > 0) primary = module.apiVersion;
+        else if (module.xposedMinVersion > 0) primary = module.xposedMinVersion;
+        else if (module.targetApiVersion > 0) primary = module.targetApiVersion;
+
+        if (primary <= 0) {
+            holder.layoutApiBadge.setVisibility(View.GONE);
+            return;
+        }
+
+        holder.layoutApiBadge.setVisibility(View.VISIBLE);
+
+        if (holder.tvApiVersion != null) {
+            holder.tvApiVersion.setText("API " + primary);
+        }   // ← missing closing brace was here
+
+        if (holder.tvTargetApi != null) {
+            // Only show the target suffix when it's different from
+            // the primary number — otherwise it's redundant noise.
+            if (module.targetApiVersion > 0
+                    && module.targetApiVersion != primary) {
+                holder.tvTargetApi.setText("· target " + module.targetApiVersion);
+                holder.tvTargetApi.setVisibility(View.VISIBLE);
+            } else {
+                holder.tvTargetApi.setVisibility(View.GONE);
+            }
+        }
+    }
+
     /**
      * XStealth row:
-     *   • No enable switch (its toggle lives in the detail sheet).
+     *   • No enable switch.
+     *   • No API badge (built-in).
      *   • Scope summary hidden.
-     *   • Chevron visible but its semantics are "open detail", not
-     *     "edit scope".
      *   • Row tap opens the detail sheet.
      */
     private void bindXStealthRow(ModuleViewHolder holder, ModuleInfo module) {
@@ -197,6 +231,11 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
                 ? R.drawable.status_indicator_enabled
                 : R.drawable.status_indicator_disabled
         );
+
+        // Hide the API badge for XStealth.
+        if (holder.layoutApiBadge != null) {
+            holder.layoutApiBadge.setVisibility(View.GONE);
+        }
 
         if (holder.swEnabled != null) {
             holder.swEnabled.setOnCheckedChangeListener(null);
@@ -220,12 +259,10 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
             holder.ivChevron.setVisibility(View.VISIBLE);
         }
 
-        // Row tap → detail sheet (for XStealth, scope isn't editable)
         holder.itemView.setOnClickListener(v -> {
             if (listener != null) listener.onDetail(module);
         });
 
-        // Long-press disabled.
         holder.itemView.setOnLongClickListener(null);
 
         if (holder.ivIcon != null) {
@@ -249,6 +286,8 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
         View indicatorStatus;
         ImageView ivIcon;
         TextView tvName, tvPackage, tvEnabledLabel, tvScopeSummary, tvRecommended;
+        View layoutApiBadge;                 // ← new
+        TextView tvApiVersion, tvTargetApi;  // ← new
         ImageView ivChevron;
         MaterialSwitch swEnabled;
 
@@ -261,6 +300,9 @@ public class ModuleAdapter extends RecyclerView.Adapter<ModuleAdapter.ModuleView
             tvEnabledLabel = itemView.findViewById(R.id.tvEnabledLabel);
             tvScopeSummary = itemView.findViewById(R.id.tvScopeSummary);
             tvRecommended = itemView.findViewById(R.id.tvRecommended);
+            layoutApiBadge = itemView.findViewById(R.id.layoutApiBadge);
+            tvApiVersion = itemView.findViewById(R.id.tvApiVersion);
+            tvTargetApi = itemView.findViewById(R.id.tvTargetApi);
             ivChevron = itemView.findViewById(R.id.ivChevron);
             swEnabled = itemView.findViewById(R.id.swEnabled);
         }

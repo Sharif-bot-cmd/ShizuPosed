@@ -11,34 +11,27 @@ import de.robv.android.xposed.XC_MethodHook;
 /**
  * Java side of libshizuposed.so and libamiru.so.
  *
- * Two native engines are exposed through this one bridge:
+ * NAMING CONVENTION
+ * -----------------
+ * The JNI export in libamiru.c is named
+ * Java_com_shizuposed_manager_core_NativeBridge_amiruProbeLayout,
+ * which means the Java method must be `amiruProbeLayout` for the
+ * JNI lookup to find the C function. That method has to be the
+ * *native* — not a Java wrapper of the same name, because Java
+ * doesn't allow two methods with the same signature.
  *
- *   • libshizuposed.so — the original shared-dispatcher engine.
- *     One C entry point (szp_dispatch_entry) serves all hooks, and
- *     the Java side reports per-call results through a thread-local
- *     setDispatchResult(...) channel.
+ * So the public methods that were previously `amiruProbeLayout`
+ * and friends are renamed to `probeAmiruLayout` and friends, and
+ * the `amiru*` names are the private natives. The rename keeps
+ * the public API stable for callers (which call `probeAmiruLayout`,
+ * `describeAmiruLayout`, `unhookAmiru`, `setAmiruResult`), and the
+ * natives are called only by the wrappers inside this class.
  *
- *   • libamiru.so — the Amiru per-method stub engine. Each hooked
- *     method gets its own ARM64 stub allocated from a native pool.
- *     The stub saves the incoming registers, calls a shared C
- *     dispatcher (amiru_dispatch), and either returns a replacement
- *     value or tail-branches to the original entry.
- *
- * Both libraries are loaded once per process. If either fails to
- * load (wrong ABI, missing symbol, ROM block), every method that
- * depends on it returns null/false and the dispatcher chain falls
- * through to the next backend.
- *
- * Slot bookkeeping: for libamiru, the C side allocates a slot per
- * hooked method and reports it back to the Java side. The Java side
- * keeps a parallel map from slot -> (Method, XC_MethodHook), so the
- * dispatcher can resolve an incoming slot to the callback it needs
- * to run. Both maps are updated under the class lock, so a slot is
- * never visible to the dispatcher before its callback is registered.
- *
- * Scope: in-process only. Native hooking cannot reach apps that
- * ShizuPosed did not launch. See NativeBackend and AmiruBackend
- * for the dispatcher integration.
+ * If you'd rather have the public API be `amiruProbeLayout` etc.,
+ * the fix is the other direction: drop the wrapper, make the
+ * public method the native, and move the logging into the native
+ * or into the call sites. The wrapper's `try/catch` blocks are
+ * the only reason it exists, so that's a bigger change.
  */
 public final class NativeBridge {
 
@@ -57,12 +50,6 @@ public final class NativeBridge {
     private static volatile String  amiruLayoutDescription = "not probed";
 
     // ─── libamiru slot registry ────────────────────────────────────
-    //
-    // The native side allocates a slot for each hooked method. We
-    // mirror the slot -> callback association here so that
-    // AmiruDispatcher.dispatch(slot, ...) can look up the hook to
-    // run. The Method reference is kept alongside so the dispatcher
-    // can populate MethodHookParam.method without a second lookup.
     private static final ConcurrentHashMap<Integer, XC_MethodHook> amiruCallbacks =
             new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<Integer, Method> amiruMethods =
@@ -85,8 +72,6 @@ public final class NativeBridge {
             amiruLoaded = true;
             CompatLog.d(TAG, "libamiru.so loaded");
         } catch (Throwable t) {
-            // Amiru is optional. The framework runs without it. Any
-            // device that is not ARM64 will land here.
             CompatLog.w(TAG, "libamiru.so not loadable (optional)", t);
             amiruLoaded = false;
         }
@@ -119,10 +104,6 @@ public final class NativeBridge {
         }
     }
 
-    /**
-     * Resolve the shared C dispatcher entry once. Returns 0 if the
-     * symbol is not exported (should not happen on a correct build).
-     */
     public static long dispatchStubAddress() {
         if (dispatchStubResolved) return dispatchStub;
         synchronized (NativeBridge.class) {
@@ -155,14 +136,6 @@ public final class NativeBridge {
     // RAW ART HOOK — libshizuposed
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Patch a Java method's ArtMethod entry point to `replacement`.
-     * `replacement` must be a native function pointer to an
-     * extern "C" function with the target's exact signature.
-     *
-     * Returns the trampoline address (call this to reach the
-     * original), or 0 on failure.
-     */
     public static long hookArtMethod(Method method, long replacement) {
         if (!isAvailable() || method == null || replacement == 0) return 0L;
         long[] out = new long[1];
@@ -190,14 +163,6 @@ public final class NativeBridge {
     // ROUTED CALLBACK API — libshizuposed
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Register a Java XC_MethodHook with the C-side router. Returns
-     * the address of a per-method C stub. Pass that stub to
-     * hookArtMethod() to complete the hook.
-     *
-     * Returns 0 on failure (native side full, duplicate registration,
-     * or native bridge unavailable).
-     */
     public static long registerCallback(Method method, XC_MethodHook callback) {
         if (!isAvailable() || method == null || callback == null) return 0L;
         try {
@@ -208,11 +173,6 @@ public final class NativeBridge {
         }
     }
 
-    /**
-     * Remove a callback registered by registerCallback(). Also frees
-     * the per-method C stub. Does not unhook the ArtMethod entry; call
-     * unhookArtMethod() for that first.
-     */
     public static boolean unregisterCallback(Method method) {
         if (!isAvailable() || method == null) return false;
         try {
@@ -223,11 +183,6 @@ public final class NativeBridge {
         }
     }
 
-    /**
-     * Convenience: register + hook in one call. Returns the trampoline
-     * address on success, or 0. On failure the registration is rolled
-     * back so the C-side table is not left dirty.
-     */
     public static long hookArtMethodRouted(Method method, XC_MethodHook callback) {
         if (!isAvailable() || method == null || callback == null) return 0L;
         long stub = registerCallback(method, callback);
@@ -240,10 +195,6 @@ public final class NativeBridge {
         return trampoline;
     }
 
-    /**
-     * Convenience: unhook + unregister in one call. Safe to call on a
-     * method that was never hooked (returns false).
-     */
     public static boolean unhookArtMethodRouted(Method method) {
         if (!isAvailable() || method == null) return false;
         boolean unhooked = unhookArtMethod(method);
@@ -255,17 +206,6 @@ public final class NativeBridge {
     // DISPATCH RESULT CHANNEL — libshizuposed
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Report the result of a hook dispatch to the C side.
-     *
-     * @param hasResult true if the callback supplied a replacement
-     *                  return value; false to fall through to the
-     *                  original method.
-     * @param isWide    true if the replacement value is a 64-bit
-     *                  primitive (long / double); false otherwise.
-     * @param value     raw bits of the replacement value. Ignored
-     *                  when hasResult is false.
-     */
     public static void setDispatchResult(boolean hasResult,
                                          boolean isWide,
                                          long value) {
@@ -277,18 +217,10 @@ public final class NativeBridge {
         }
     }
 
-    /** Convenience: tell the C side to fall through to the original. */
     public static void setDispatchNoResult() {
         setDispatchResult(false, false, 0L);
     }
 
-    /**
-     * Convenience for primitive callbacks: encode `result` per the
-     * declared return type and push it. Handles boolean, byte, char,
-     * short, int, long, float, double. Returns true if the value was
-     * encoded and pushed; false if the type is unsupported (in which
-     * case the caller should fall through).
-     */
     public static boolean setDispatchPrimitiveResult(Object result,
                                                      Class<?> returnType) {
         if (returnType == null || returnType == void.class) {
@@ -342,11 +274,6 @@ public final class NativeBridge {
     // NATIVE SYMBOL HOOK — libshizuposed
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Inline-hook a native symbol. `target` is an address returned by
-     * dlsym(); `replacement` is a native function pointer. Returns the
-     * trampoline address, or 0.
-     */
     public static long hookNative(long target, long replacement) {
         if (!isAvailable() || target == 0 || replacement == 0) return 0L;
         long[] out = new long[1];
@@ -378,20 +305,8 @@ public final class NativeBridge {
     // AMIRU — LIBRARY + PROBE
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Whether libamiru.so was loaded successfully in this process.
-     * Independent of whether the layout probe succeeded.
-     */
     public static boolean isAmiruLoaded() { return amiruLoaded; }
 
-    /**
-     * Load libamiru.so on demand and return true if it is now
-     * loaded. The static block already tried; this exists so that
-     * AmiruBackend can retry after a delayed load path (e.g. after
-     * a Shizuku grant when the app_process is freshly spawned).
-     *
-     * Idempotent. Safe to call from any thread.
-     */
     public static synchronized boolean amiruLoadLibrary() {
         if (amiruLoaded) return true;
         try {
@@ -405,34 +320,34 @@ public final class NativeBridge {
         }
     }
 
-    /**
-     * Whether Amiru's layout probe has succeeded and hook
-     * installation can proceed. The result is cached after the
-     * first successful probe.
-     */
     public static boolean isAmiruAvailable() {
         if (!amiruLoaded) return false;
         if (amiruAvailable) return true;
-        return amiruProbeLayout();
+        return probeAmiruLayout();
     }
 
     /**
      * Run the native layout probe. Returns true if a valid layout
      * was found. Safe to call multiple times; the native side
      * caches the result.
+     *
+     * The public method is `probeAmiruLayout` (not `amiruProbeLayout`)
+     * because the latter name is the private native, and Java
+     * doesn't allow two methods with the same signature. See the
+     * class javadoc for the naming convention.
      */
-    public static boolean amiruProbeLayout() {
+    public static boolean probeAmiruLayout() {
         if (!amiruLoaded) return false;
         if (amiruAvailable) return true;
         synchronized (NativeBridge.class) {
             if (amiruAvailable) return true;
             try {
-                boolean ok = nAmiruProbeLayout();
+                boolean ok = amiruProbeLayout();   // native
                 if (ok) {
                     amiruAvailable = true;
                     amiruProbed = true;
                     try {
-                        amiruLayoutDescription = nAmiruDescribeLayout();
+                        amiruLayoutDescription = amiruDescribeLayout();   // native
                     } catch (Throwable t) {
                         amiruLayoutDescription = "described:error";
                     }
@@ -443,7 +358,7 @@ public final class NativeBridge {
                 }
                 return ok;
             } catch (Throwable t) {
-                CompatLog.w(TAG, "amiruProbeLayout threw", t);
+                CompatLog.w(TAG, "probeAmiruLayout threw", t);
                 amiruProbed = true;
                 amiruLayoutDescription = "probe threw: " + t.getMessage();
                 return false;
@@ -453,13 +368,16 @@ public final class NativeBridge {
 
     /**
      * Human-readable description of the probed layout, or a status
-     * string explaining why the probe is not available. Safe to call
-     * before the probe runs.
+     * string explaining why the probe is not available. Safe to
+     * call before the probe runs.
+     *
+     * Public name is `describeAmiruLayout` (not `amiruDescribeLayout`,
+     * which is the native).
      */
-    public static String amiruDescribeLayout() {
+    public static String describeAmiruLayout() {
         if (!amiruLoaded) return "library not loaded";
         if (!amiruProbed) {
-            amiruProbeLayout();
+            probeAmiruLayout();
         }
         return amiruLayoutDescription;
     }
@@ -470,17 +388,6 @@ public final class NativeBridge {
 
     /**
      * Install an Amiru native hook on a java.lang.reflect.Method.
-     *
-     * The native side allocates a slot, builds the stub, patches the
-     * ArtMethod entry point, and returns the slot index. On success,
-     * the callback and method are registered in the Java-side slot
-     * maps so the dispatcher can resolve them later.
-     *
-     * @param method       the target Method (must be static in v0.1)
-     * @param paramShorts  JNI shorty string, one char per parameter
-     * @param isStatic     true if the method is static
-     * @param callback     the XC_MethodHook to associate with the slot
-     * @return slot index on success, or -1 on failure
      */
     public static int amiruHookMethod(Method method,
                                       String paramShorts,
@@ -492,33 +399,33 @@ public final class NativeBridge {
         Class<?>[] params = method.getParameterTypes();
         Object[] shorties = new Object[params.length];
         for (int i = 0; i < params.length; i++) {
-            shorties[i] = paramShorts.length() > i
-                    ? String.valueOf(paramShorts.charAt(i))
-                    : "L";
+            String s;
+            if (paramShorts.length() > i) {
+                s = String.valueOf(paramShorts.charAt(i));
+            } else {
+                Class<?> t = params[i];
+                if (t == int.class) s = "I";
+                else if (t == long.class) s = "J";
+                else if (t == boolean.class) s = "Z";
+                else if (t == byte.class) s = "B";
+                else if (t == char.class) s = "C";
+                else if (t == short.class) s = "S";
+                else if (t == float.class) s = "F";
+                else if (t == double.class) s = "D";
+                else if (t.isArray()) s = "[";
+                else s = "L";
+            }
+            shorties[i] = s;
         }
 
         try {
-            int slot = amiruHookMethod(method,
-                                       method.getName(),
-                                       params.length,
-                                       shorties,
-                                       0);
+            int slot = amiruHookMethodNative(method,
+                                             method.getName(),
+                                             params.length,
+                                             shorties,
+                                             0);
             if (slot < 0) return -1;
 
-            // Register the callback and method after the native side
-            // has confirmed the slot. Order matters: the native side
-            // cannot dispatch on this slot until the ArtMethod entry
-            // is patched, which happened inside the native call above.
-            // But by the time the native call returns, the patched
-            // entry is live, so we must register before any other
-            // thread can invoke the hooked method. To make that safe,
-            // registration is guarded by the class lock and the
-            // native call itself is the only thing that publishes the
-            // slot. If a hooked invocation arrives on another thread
-            // before we finish registering, the dispatcher sees a
-            // null callback and returns 0 (fall-through to original),
-            // which is correct behavior for a hook that hasn't
-            // finished installing.
             synchronized (NativeBridge.class) {
                 amiruCallbacks.put(slot, callback);
                 amiruMethods.put(slot, method);
@@ -533,11 +440,14 @@ public final class NativeBridge {
     /**
      * Remove a previously installed Amiru hook by slot.
      * Returns 0 on success, -1 on failure.
+     *
+     * Public name is `unhookAmiru` (not `amiruUnhook`, which is the
+     * native).
      */
-    public static int amiruUnhook(int slot) {
+    public static int unhookAmiru(int slot) {
         if (!amiruLoaded) return -1;
         try {
-            int rc = nAmiruUnhook(slot);
+            int rc = amiruUnhook(slot);   // native
             if (rc == 0) {
                 synchronized (NativeBridge.class) {
                     amiruCallbacks.remove(slot);
@@ -546,52 +456,45 @@ public final class NativeBridge {
             }
             return rc;
         } catch (Throwable t) {
-            CompatLog.w(TAG, "nAmiruUnhook threw", t);
+            CompatLog.w(TAG, "unhookAmiru threw", t);
             return -1;
         }
     }
 
     /**
-     * Look up the XC_MethodHook registered for a slot. Called by
-     * AmiruDispatcher when the native side fires a dispatch.
-     * Returns null if no callback is registered for the slot.
+     * Report a dispatcher result to the native side.
+     *
+     * Public name is `setAmiruResult` (not `amiruSetResult`, which
+     * is the native). See the class javadoc for the naming
+     * convention.
      */
+    public static void setAmiruResult(int slot,
+                                      boolean skip,
+                                      boolean hasValue,
+                                      long value) {
+        if (!amiruLoaded) return;
+        try {
+            amiruSetResult(slot, skip, hasValue, value);   // native
+        } catch (Throwable t) {
+            CompatLog.d(TAG, "setAmiruResult threw: " + t.getMessage());
+        }
+    }
+
     public static XC_MethodHook amiruGetCallback(int slot) {
         return amiruCallbacks.get(slot);
     }
 
-    /**
-     * Look up the Method registered for a slot. Called by
-     * AmiruDispatcher so MethodHookParam.method can be populated.
-     * Returns null if no method is registered for the slot.
-     */
     public static Method amiruGetMethod(int slot) {
         return amiruMethods.get(slot);
     }
 
-    /**
-     * Number of live Amiru hooks in the process. Useful for
-     * diagnostics and the manager UI.
-     */
     public static int amiruRegisteredCount() {
         return amiruCallbacks.size();
     }
 
-    /**
-     * Resolve the ArtMethod address of a java.lang.reflect.Method.
-     *
-     * Tries the public getArtMethod() accessor first (available on
-     * Android 11 and later), then falls back to the private
-     * artMethod field. Returns 0 if neither works.
-     *
-     * This is a Java-side helper; it does not touch the native side.
-     * It lives here because it is shared by NativeBackend and any
-     * future native engine that needs the same lookup.
-     */
     public static long amiruGetArtMethod(Method method) {
         if (method == null) return 0L;
 
-        // Android 11+: Method.getArtMethod() returns a long.
         try {
             Method getArtMethod = Method.class.getDeclaredMethod("getArtMethod");
             getArtMethod.setAccessible(true);
@@ -601,8 +504,6 @@ public final class NativeBridge {
         } catch (Throwable ignored) {
         }
 
-        // Older: read the artMethod field directly. The field type
-        // has been long, int, and Object across versions.
         try {
             Field f = Method.class.getDeclaredField("artMethod");
             f.setAccessible(true);
@@ -620,7 +521,6 @@ public final class NativeBridge {
     // AMIRU — DIAGNOSTICS
     // ═════════════════════════════════════════════════════════════
 
-    /** One-line summary for logs and the manager UI. */
     public static String amiruSummary() {
         return "Amiru{loaded=" + amiruLoaded
             + ", available=" + amiruAvailable
@@ -650,20 +550,34 @@ public final class NativeBridge {
     // ═════════════════════════════════════════════════════════════
     // NATIVES — libamiru
     //
-    // The native symbol for amiruHookMethod matches the C function
-    // name Java_..._amiruHookMethod in libamiru.c, which takes
-    // (Method, String, int, Object[], int). The shorties array is
-    // one element per parameter, each a string like "I" or "J".
+    // These names MUST match the JNI exports in libamiru.c:
+    //   Java_com_shizuposed_manager_core_NativeBridge_amiruProbeLayout
+    //   Java_com_shizuposed_manager_core_NativeBridge_amiruDescribeLayout
+    //   Java_com_shizuposed_manager_core_NativeBridge_amiruHookMethod
+    //   Java_com_shizuposed_manager_core_NativeBridge_amiruUnhook
+    //   Java_com_shizuposed_manager_core_NativeBridge_amiruSetResult
+    //   Java_com_shizuposed_manager_core_NativeBridge_amiruHasResult
+    //
+    // So the Java names are amiruProbeLayout, amiruDescribeLayout,
+    // amiruUnhook, amiruSetResult, amiruHasResult. The public
+    // wrappers (probeAmiruLayout, describeAmiruLayout, unhookAmiru,
+    // setAmiruResult) call these. Don't rename them without also
+    // renaming the C exports.
     // ═════════════════════════════════════════════════════════════
 
-    private static native boolean nAmiruProbeLayout();
-    private static native String  nAmiruDescribeLayout();
-    private static native int     amiruHookMethod(Method method,
-                                                  String name,
-                                                  int argCount,
-                                                  Object[] argTypes,
-                                                  int flags);
-    private static native int     nAmiruUnhook(int slot);
+    private static native boolean amiruProbeLayout();
+    private static native String  amiruDescribeLayout();
+    private static native int     amiruHookMethodNative(Method method,
+                                                        String name,
+                                                        int argCount,
+                                                        Object[] argTypes,
+                                                        int flags);
+    private static native int     amiruUnhook(int slot);
+    private static native void    amiruSetResult(int slot,
+                                                 boolean skip,
+                                                 boolean hasValue,
+                                                 long value);
+    private static native int     amiruHasResult();
     public static native void amiruSetDebugLogging(boolean enabled);
     public static native String amiruDescribeStubTemplate();
 }

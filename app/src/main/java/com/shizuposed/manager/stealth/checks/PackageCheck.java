@@ -4,6 +4,8 @@ import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.ResolveInfo;
+import android.content.pm.Signature;
+import android.content.pm.SigningInfo;
 import android.os.IBinder;
 import android.os.Parcel;
 
@@ -18,6 +20,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XC_MethodHook.MethodHookParam;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
@@ -26,7 +29,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * PackageCheck
  *
  * Hides Shizuku and ShizuPosed from PackageManager lookups, at
- * three levels:
+ * four levels:
  *
  *   Level 1 — PackageManager API hooks
  *     Every Java method on PackageManager / ApplicationPackageManager
@@ -46,9 +49,15 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *     A target that shells out `dumpsys package <pkg>` via a
  *     Binder.dump(...) call sends a DUMP_TRANSACTION whose parcel
  *     starts with a file descriptor rather than an interface
- *     descriptor. The parser reads the args array, looks for a
- *     `package` / `packages` service name followed by the hidden
- *     package name, and refuses.
+ *     descriptor.
+ *
+ *   Level 4 — Signature fingerprinting (NEW 1.4.10)
+ *     A target that reads PackageInfo.signatures, SigningInfo, or
+ *     calls checkSignatures() against a hidden package can
+ *     fingerprint the certificate. Level 4 strips signatures from
+ *     hidden packages' PackageInfo results, zeroes the signature
+ *     flags on the in-flight call, and returns
+ *     SIGNATURE_NEITHER_SIGNED from checkSignatures.
  *
  * A Binder.ProxyTransactListener is also installed for
  * observation. It fires on every proxy transaction and drives the
@@ -62,14 +71,6 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *   • Calls from a helper process the target spawned.
  *   • Native code that opens /dev/binder directly.
  *   • Calls made before the hooks are installed.
- *
- * STEALTH BUILD
- * -------------
- * The package name to hide is read from XStealthConfig at install
- * time, not hardcoded. In the standard build it's
- * "com.shizuposed.manager"; in the stealth build it's the
- * scrambled com.<x>.<y>. This lets the same check code work for
- * both builds.
  */
 public final class PackageCheck {
 
@@ -77,12 +78,6 @@ public final class PackageCheck {
 
     public static final String SHIZUKU_PKG = "moe.shizuku.privileged.api";
 
-    /**
-     * Actual package name to hide. Resolved from XStealthConfig
-     * at install() time. Falls back to the standard name so an
-     * old config that predates this field still hides the
-     * standard package.
-     */
     private static volatile String sShizuPosedPackage = null;
 
     private static String shizuPosedPackage() {
@@ -101,7 +96,6 @@ public final class PackageCheck {
         return sShizuPosedPackage;
     }
 
-    /** Binder descriptor for the package manager service. */
     private static final String PM_DESCRIPTOR =
         "android.content.pm.IPackageManager";
 
@@ -109,9 +103,18 @@ public final class PackageCheck {
 
     private static volatile Map<Integer, String> sPmCodes = null;
 
-    private static final AtomicLong sTransactTotal     = new AtomicLong();
-    private static final AtomicLong sTransactPmRefused = new AtomicLong();
-    private static final AtomicLong sDumpRefused       = new AtomicLong();
+    private static final AtomicLong sTransactTotal      = new AtomicLong();
+    private static final AtomicLong sTransactPmRefused  = new AtomicLong();
+    private static final AtomicLong sDumpRefused        = new AtomicLong();
+    // Counters for signature hiding.
+    private static final AtomicLong sSigStripped         = new AtomicLong();
+    private static final AtomicLong sSigFlagsZeroed      = new AtomicLong();
+    private static final AtomicLong sSigCheckRefused     = new AtomicLong();
+
+    private static volatile int sFlagGetSignatures            = -1;
+    private static volatile int sFlagGetSigningCertificates   = -1;
+    private static volatile int sFlagGetSignaturesAndCerts    = -1;
+    private static volatile int sSignatureMask                = 0;
 
     private PackageCheck() {}
 
@@ -125,38 +128,39 @@ public final class PackageCheck {
 
         final boolean hideShizuku    = config.hideShizukuPackage;
         final boolean hideShizuPosed = config.hideShizuPosedPackage;
+        final boolean hideSignatures = hideShizuku || hideShizuPosed;
 
-        // Resolve the actual package name once, before any hooks
-        // fire. Doing this at install time means the first query
-        // is as correct as every subsequent one.
         shizuPosedPackage();
+        computeSignatureFlags();
 
-        hookGetPackageInfoInt(pmClass, hideShizuku, hideShizuPosed);
-        hookGetApplicationInfoInt(pmClass, hideShizuku, hideShizuPosed);
-        hookGetInstalledPackagesInt(pmClass, hideShizuku, hideShizuPosed);
-        hookGetInstalledApplicationsInt(pmClass, hideShizuku, hideShizuPosed);
-        hookGetInstalledModules(pmClass, hideShizuku, hideShizuPosed);
+        hookGetPackageInfoInt(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+        hookGetApplicationInfoInt(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+        hookGetInstalledPackagesInt(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+        hookGetInstalledApplicationsInt(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+        hookGetInstalledModules(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
 
-        hookGetPackageInfoFlags(pmClass, hideShizuku, hideShizuPosed);
-        hookGetApplicationInfoFlags(pmClass, hideShizuku, hideShizuPosed);
-        hookGetInstalledPackagesFlags(pmClass, hideShizuku, hideShizuPosed);
-        hookGetInstalledApplicationsFlags(pmClass, hideShizuku, hideShizuPosed);
+        hookGetPackageInfoFlags(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+        hookGetApplicationInfoFlags(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+        hookGetInstalledPackagesFlags(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+        hookGetInstalledApplicationsFlags(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
 
-        hookGetPackagesForUid(pmClass, hideShizuku, hideShizuPosed);
-        hookGetPackageUid(pmClass, hideShizuku, hideShizuPosed);
-        hookGetPackageUidFlags(pmClass, hideShizuku, hideShizuPosed);
-        hookGetNamesForUids(pmClass, hideShizuku, hideShizuPosed);
+        hookGetPackagesForUid(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+        hookGetPackageUid(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+        hookGetPackageUidFlags(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+        hookGetNamesForUids(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
 
-        hookGetInstallerPackageName(pmClass, hideShizuku, hideShizuPosed);
-        hookGetInstallSourceInfo(pmClass, hideShizuku, hideShizuPosed);
+        hookGetInstallerPackageName(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+        hookGetInstallSourceInfo(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
 
-        hookGetLaunchIntentForPackage(pmClass, hideShizuku, hideShizuPosed);
-        hookGetLeanbackLaunchIntentForPackage(pmClass, hideShizuku, hideShizuPosed);
-        hookGetApplicationEnabledSetting(pmClass, hideShizuku, hideShizuPosed);
+        hookGetLaunchIntentForPackage(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+        hookGetLeanbackLaunchIntentForPackage(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+        hookGetApplicationEnabledSetting(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
 
-        hookQueryIntentActivities(pmClass, hideShizuku, hideShizuPosed);
-        hookResolveActivity(pmClass, hideShizuku, hideShizuPosed);
-        hookQueryIntentServices(pmClass, hideShizuku, hideShizuPosed);
+        hookQueryIntentActivities(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+        hookResolveActivity(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+        hookQueryIntentServices(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
+
+        hookCheckSignatures(pmClass, hideShizuku, hideShizuPosed, hideSignatures);
 
         buildPmCodeTable();
         hookBinderTransact(hideShizuku, hideShizuPosed);
@@ -165,7 +169,9 @@ public final class PackageCheck {
         XposedBridge.log(TAG + ": PackageCheck installed ("
             + "pm=API, binder="
             + (sPmCodes != null ? "with-code-table" : "descriptor-only")
-            + ", dump=parsed, hidePkg=" + shizuPosedPackage() + ")");
+            + ", dump=parsed, sig=" + hideSignatures
+            + ", sigMask=0x" + Integer.toHexString(sSignatureMask)
+            + ", hidePkg=" + shizuPosedPackage() + ")");
         XStealthRegistry.record("PackageCheck");
     }
 
@@ -173,8 +179,106 @@ public final class PackageCheck {
         return "transact=" + sTransactTotal.get()
             + " pmRefused=" + sTransactPmRefused.get()
             + " dumpRefused=" + sDumpRefused.get()
+            + " sigStripped=" + sSigStripped.get()
+            + " sigFlagsZeroed=" + sSigFlagsZeroed.get()
+            + " sigCheckRefused=" + sSigCheckRefused.get()
             + " pmCodes=" + (sPmCodes != null ? sPmCodes.size() : 0)
             + " hidePkg=" + shizuPosedPackage();
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // SIGNATURE FLAG COMPUTATION
+    // ═════════════════════════════════════════════════════════════
+
+    private static void computeSignatureFlags() {
+        if (sSignatureMask != 0) return;
+
+        try {
+            Class<?> pm = android.content.pm.PackageManager.class;
+
+            try {
+                java.lang.reflect.Field f = pm.getField("GET_SIGNATURES");
+                sFlagGetSignatures = f.getInt(null);
+            } catch (Throwable ignored) {}
+
+            try {
+                java.lang.reflect.Field f = pm.getField("GET_SIGNING_CERTIFICATES");
+                sFlagGetSigningCertificates = f.getInt(null);
+            } catch (Throwable ignored) {}
+
+            try {
+                java.lang.reflect.Field f = pm.getField(
+                    "GET_SIGNATURES_AND_CERTIFICATES");
+                sFlagGetSignaturesAndCerts = f.getInt(null);
+            } catch (Throwable ignored) {}
+
+            int mask = 0;
+            if (sFlagGetSignatures > 0)          mask |= sFlagGetSignatures;
+            if (sFlagGetSigningCertificates > 0) mask |= sFlagGetSigningCertificates;
+            if (sFlagGetSignaturesAndCerts > 0)  mask |= sFlagGetSignaturesAndCerts;
+
+            sSignatureMask = mask;
+
+            if (sSignatureMask == 0) {
+                XposedBridge.log(TAG + ": signature flag computation "
+                    + "produced 0 — no signature flags found via reflection. "
+                    + "Signature hiding will fall back to post-processing.");
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": computeSignatureFlags failed: " + t);
+        }
+    }
+
+    private static void stripSignatureFlags(MethodHookParam p,
+                                             boolean hideSignatures,
+                                             boolean hideShizuku,
+                                             boolean hideShizuPosed) {
+        if (!hideSignatures) return;
+        if (sSignatureMask == 0) return;
+        if (p.args == null || p.args.length < 2) return;
+
+        Object pkgArg = p.args[0];
+        if (!(pkgArg instanceof String)) return;
+        if (!shouldHide((String) pkgArg, hideShizuku, hideShizuPosed)) return;
+
+        try {
+            Object flagsArg = p.args[1];
+            if (flagsArg instanceof Integer) {
+                int flags = (Integer) flagsArg;
+                int stripped = flags & ~sSignatureMask;
+                if (stripped != flags) {
+                    p.args[1] = stripped;
+                    sSigFlagsZeroed.incrementAndGet();
+                }
+            } else {
+                try {
+                    Field valueField = findIntFieldInObject(flagsArg);
+                    if (valueField != null) {
+                        valueField.setAccessible(true);
+                        int flags = valueField.getInt(flagsArg);
+                        int stripped = flags & ~sSignatureMask;
+                        if (stripped != flags) {
+                            valueField.setInt(flagsArg, stripped);
+                            sSigFlagsZeroed.incrementAndGet();
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": stripSignatureFlags failed: " + t);
+        }
+    }
+
+    private static Field findIntFieldInObject(Object obj) {
+        if (obj == null) return null;
+        Class<?> c = obj.getClass();
+        while (c != null && c != Object.class) {
+            for (Field f : c.getDeclaredFields()) {
+                if (f.getType() == int.class) return f;
+            }
+            c = c.getSuperclass();
+        }
+        return null;
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -396,7 +500,8 @@ public final class PackageCheck {
 
     private static void hookGetPackageInfoInt(Class<?> pmClass,
                                               boolean hideShizuku,
-                                              boolean hideShizuPosed) {
+                                              boolean hideShizuPosed,
+                                              boolean hideSignatures) {
         try {
             XposedHelpers.findAndHookMethod(
                 pmClass, "getPackageInfo",
@@ -418,7 +523,8 @@ public final class PackageCheck {
 
     private static void hookGetApplicationInfoInt(Class<?> pmClass,
                                                   boolean hideShizuku,
-                                                  boolean hideShizuPosed) {
+                                                  boolean hideShizuPosed,
+                                                  boolean hideSignatures) {
         try {
             XposedHelpers.findAndHookMethod(
                 pmClass, "getApplicationInfo",
@@ -440,7 +546,8 @@ public final class PackageCheck {
 
     private static void hookGetInstalledPackagesInt(Class<?> pmClass,
                                                     boolean hideShizuku,
-                                                    boolean hideShizuPosed) {
+                                                    boolean hideShizuPosed,
+                                                    boolean hideSignatures) {
         try {
             XposedHelpers.findAndHookMethod(
                 pmClass, "getInstalledPackages", int.class,
@@ -458,7 +565,8 @@ public final class PackageCheck {
 
     private static void hookGetInstalledApplicationsInt(Class<?> pmClass,
                                                         boolean hideShizuku,
-                                                        boolean hideShizuPosed) {
+                                                        boolean hideShizuPosed,
+                                                        boolean hideSignatures) {
         try {
             XposedHelpers.findAndHookMethod(
                 pmClass, "getInstalledApplications", int.class,
@@ -476,7 +584,8 @@ public final class PackageCheck {
 
     private static void hookGetInstalledModules(Class<?> pmClass,
                                                 boolean hideShizuku,
-                                                boolean hideShizuPosed) {
+                                                boolean hideShizuPosed,
+                                                boolean hideSignatures) {
         try {
             XposedHelpers.findAndHookMethod(
                 pmClass, "getInstalledModules", int.class,
@@ -497,7 +606,8 @@ public final class PackageCheck {
 
     private static void hookGetPackageInfoFlags(Class<?> pmClass,
                                                 boolean hideShizuku,
-                                                boolean hideShizuPosed) {
+                                                boolean hideShizuPosed,
+                                                boolean hideSignatures) {
         Class<?> flagsClass = XposedHelpers.findClassIfExists(
             "android.content.pm.PackageManager$PackageInfoFlags", null);
         if (flagsClass == null) return;
@@ -514,6 +624,8 @@ public final class PackageCheck {
                             throw new android.content.pm.PackageManager
                                 .NameNotFoundException(pkg);
                         }
+                        stripSignatureFlags(p, hideSignatures,
+                            hideShizuku, hideShizuPosed);
                     }
                 });
         } catch (Throwable t) {
@@ -523,7 +635,8 @@ public final class PackageCheck {
 
     private static void hookGetApplicationInfoFlags(Class<?> pmClass,
                                                     boolean hideShizuku,
-                                                    boolean hideShizuPosed) {
+                                                    boolean hideShizuPosed,
+                                                    boolean hideSignatures) {
         Class<?> flagsClass = XposedHelpers.findClassIfExists(
             "android.content.pm.PackageManager$ApplicationInfoFlags", null);
         if (flagsClass == null) return;
@@ -540,6 +653,8 @@ public final class PackageCheck {
                             throw new android.content.pm.PackageManager
                                 .NameNotFoundException(pkg);
                         }
+                        stripSignatureFlags(p, hideSignatures,
+                            hideShizuku, hideShizuPosed);
                     }
                 });
         } catch (Throwable t) {
@@ -549,7 +664,8 @@ public final class PackageCheck {
 
     private static void hookGetInstalledPackagesFlags(Class<?> pmClass,
                                                       boolean hideShizuku,
-                                                      boolean hideShizuPosed) {
+                                                      boolean hideShizuPosed,
+                                                      boolean hideSignatures) {
         Class<?> flagsClass = XposedHelpers.findClassIfExists(
             "android.content.pm.PackageManager$PackageInfoFlags", null);
         if (flagsClass == null) return;
@@ -571,7 +687,8 @@ public final class PackageCheck {
 
     private static void hookGetInstalledApplicationsFlags(Class<?> pmClass,
                                                           boolean hideShizuku,
-                                                          boolean hideShizuPosed) {
+                                                          boolean hideShizuPosed,
+                                                          boolean hideSignatures) {
         Class<?> flagsClass = XposedHelpers.findClassIfExists(
             "android.content.pm.PackageManager$ApplicationInfoFlags", null);
         if (flagsClass == null) return;
@@ -597,7 +714,8 @@ public final class PackageCheck {
 
     private static void hookGetPackagesForUid(Class<?> pmClass,
                                               boolean hideShizuku,
-                                              boolean hideShizuPosed) {
+                                              boolean hideShizuPosed,
+                                              boolean hideSignatures) {
         try {
             XposedHelpers.findAndHookMethod(
                 pmClass, "getPackagesForUid", int.class,
@@ -616,7 +734,8 @@ public final class PackageCheck {
 
     private static void hookGetPackageUid(Class<?> pmClass,
                                           boolean hideShizuku,
-                                          boolean hideShizuPosed) {
+                                          boolean hideShizuPosed,
+                                          boolean hideSignatures) {
         try {
             XposedHelpers.findAndHookMethod(
                 pmClass, "getPackageUid", String.class, int.class,
@@ -635,7 +754,8 @@ public final class PackageCheck {
 
     private static void hookGetPackageUidFlags(Class<?> pmClass,
                                                boolean hideShizuku,
-                                               boolean hideShizuPosed) {
+                                               boolean hideShizuPosed,
+                                               boolean hideSignatures) {
         Class<?> flagsClass = XposedHelpers.findClassIfExists(
             "android.content.pm.PackageManager$PackageInfoFlags", null);
         if (flagsClass == null) return;
@@ -658,7 +778,8 @@ public final class PackageCheck {
 
     private static void hookGetNamesForUids(Class<?> pmClass,
                                             boolean hideShizuku,
-                                            boolean hideShizuPosed) {
+                                            boolean hideShizuPosed,
+                                            boolean hideSignatures) {
         try {
             XposedHelpers.findAndHookMethod(
                 pmClass, "getNamesForUids", int[].class,
@@ -680,7 +801,8 @@ public final class PackageCheck {
 
     private static void hookGetInstallerPackageName(Class<?> pmClass,
                                                     boolean hideShizuku,
-                                                    boolean hideShizuPosed) {
+                                                    boolean hideShizuPosed,
+                                                    boolean hideSignatures) {
         try {
             XposedHelpers.findAndHookMethod(
                 pmClass, "getInstallerPackageName", String.class,
@@ -698,7 +820,8 @@ public final class PackageCheck {
 
     private static void hookGetInstallSourceInfo(Class<?> pmClass,
                                                  boolean hideShizuku,
-                                                 boolean hideShizuPosed) {
+                                                 boolean hideShizuPosed,
+                                                 boolean hideSignatures) {
         try {
             Class<?> sourceInfoClass = XposedHelpers.findClassIfExists(
                 "android.content.pm.InstallSourceInfo", null);
@@ -736,7 +859,8 @@ public final class PackageCheck {
 
     private static void hookGetLaunchIntentForPackage(Class<?> pmClass,
                                                       boolean hideShizuku,
-                                                      boolean hideShizuPosed) {
+                                                      boolean hideShizuPosed,
+                                                      boolean hideSignatures) {
         try {
             XposedHelpers.findAndHookMethod(
                 pmClass, "getLaunchIntentForPackage", String.class,
@@ -755,7 +879,8 @@ public final class PackageCheck {
 
     private static void hookGetLeanbackLaunchIntentForPackage(Class<?> pmClass,
                                                               boolean hideShizuku,
-                                                              boolean hideShizuPosed) {
+                                                              boolean hideShizuPosed,
+                                                              boolean hideSignatures) {
         try {
             XposedHelpers.findAndHookMethod(
                 pmClass, "getLeanbackLaunchIntentForPackage", String.class,
@@ -773,7 +898,8 @@ public final class PackageCheck {
 
     private static void hookGetApplicationEnabledSetting(Class<?> pmClass,
                                                           boolean hideShizuku,
-                                                          boolean hideShizuPosed) {
+                                                          boolean hideShizuPosed,
+                                                          boolean hideSignatures) {
         try {
             XposedHelpers.findAndHookMethod(
                 pmClass, "getApplicationEnabledSetting", String.class,
@@ -799,7 +925,8 @@ public final class PackageCheck {
 
     private static void hookQueryIntentActivities(Class<?> pmClass,
                                                    boolean hideShizuku,
-                                                   boolean hideShizuPosed) {
+                                                   boolean hideShizuPosed,
+                                                   boolean hideSignatures) {
         try {
             XposedHelpers.findAndHookMethod(
                 pmClass, "queryIntentActivities",
@@ -818,7 +945,8 @@ public final class PackageCheck {
 
     private static void hookResolveActivity(Class<?> pmClass,
                                              boolean hideShizuku,
-                                             boolean hideShizuPosed) {
+                                             boolean hideShizuPosed,
+                                             boolean hideSignatures) {
         try {
             XposedHelpers.findAndHookMethod(
                 pmClass, "resolveActivity",
@@ -841,7 +969,8 @@ public final class PackageCheck {
 
     private static void hookQueryIntentServices(Class<?> pmClass,
                                                  boolean hideShizuku,
-                                                 boolean hideShizuPosed) {
+                                                 boolean hideShizuPosed,
+                                                 boolean hideSignatures) {
         try {
             XposedHelpers.findAndHookMethod(
                 pmClass, "queryIntentServices",
@@ -855,6 +984,63 @@ public final class PackageCheck {
                 });
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": queryIntentServices hook failed: " + t);
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // SIGNATURE CHECK HOOKS
+    // ═════════════════════════════════════════════════════════════
+
+    private static void hookCheckSignatures(Class<?> pmClass,
+                                             boolean hideShizuku,
+                                             boolean hideShizuPosed,
+                                             boolean hideSignatures) {
+        if (!hideSignatures) return;
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                pmClass, "checkSignatures",
+                String.class, String.class,
+                new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        String pkg1 = (String) p.args[0];
+                        String pkg2 = (String) p.args[1];
+                        if (shouldHide(pkg1, hideShizuku, hideShizuPosed)
+                                || shouldHide(pkg2, hideShizuku, hideShizuPosed)) {
+                            sSigCheckRefused.incrementAndGet();
+                            p.setResult(android.content.pm.PackageManager
+                                .SIGNATURE_NEITHER_SIGNED);
+                        }
+                    }
+                });
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": checkSignatures(String,String) hook failed: "
+                + t);
+        }
+
+        try {
+            Class<?> signingDetailsClass = XposedHelpers.findClassIfExists(
+                "android.content.pm.SigningDetails", null);
+            if (signingDetailsClass != null) {
+                XposedHelpers.findAndHookMethod(
+                    pmClass, "checkSignatures",
+                    String.class, String.class, signingDetailsClass,
+                    new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam p) {
+                            String pkg1 = (String) p.args[0];
+                            String pkg2 = (String) p.args[1];
+                            if (shouldHide(pkg1, hideShizuku, hideShizuPosed)
+                                    || shouldHide(pkg2, hideShizuku, hideShizuPosed)) {
+                                sSigCheckRefused.incrementAndGet();
+                                p.setResult(android.content.pm.PackageManager
+                                    .SIGNATURE_NEITHER_SIGNED);
+                            }
+                        }
+                    });
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": checkSignatures(...,SigningDetails) "
+                + "hook failed: " + t);
         }
     }
 

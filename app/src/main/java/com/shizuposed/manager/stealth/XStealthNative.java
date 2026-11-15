@@ -2,6 +2,46 @@ package com.shizuposed.manager.stealth;
 
 import android.util.Log;
 
+/**
+ * XStealthNative
+ *
+ * Java-side bridge to libxstealth.so.
+ *
+ * LOAD ORDER
+ * ----------
+ * libxstealth.so must be loaded before libsysku.so. libsysku
+ * depends on libxstealth's exports (xstealth_path_is_blocked,
+ * xstealth_fd_resolves_to_hidden, xstealth_is_active,
+ * xstealth_set_active). If libsysku loads first, its interposers
+ * resolve to NULL and it stays inert — a startup warning appears
+ * in the log.
+ *
+ * ACTIVATION
+ * ----------
+ * setActive(boolean) forwards to nativeSetActive(), which calls
+ * xstealth_set_active() in the native library. The flag is read
+ * by both libxstealth's own interposers and libsysku's (via
+ * xstealth_is_active()). The two share one switch.
+ *
+ * setActive() does NOT gate on sAvailable. If nativeInit() failed
+ * but the library loaded, the flag still reaches the C side via
+ * the JNI bridge and libsysku can still read it. A failed init
+ * means libxstealth's own interposers are inactive (missing
+ * symbols), but the flag itself is always delivered.
+ *
+ * TRUSTED PREFIX
+ * --------------
+ * After load(), nativeSetTrustedPackage() is called with the
+ * manager's package name. In the standard build this is
+ * "com.shizuposed.manager." and is redundant (the C side already
+ * has it built in). In the stealth build the prefix is the
+ * scrambled name, which only this call conveys.
+ *
+ * getTrustedPrefix() returns the prefix that was actually set,
+ * for diagnostics. If the C side has one but Java doesn't know
+ * it, the two are out of sync and the diagnostics show the
+ * mismatch.
+ */
 public final class XStealthNative {
 
     private static final String TAG = "XStealthNative";
@@ -9,6 +49,15 @@ public final class XStealthNative {
     private static volatile boolean sLoaded = false;
     private static volatile boolean sAvailable = false;
     private static volatile long sLoadedAtMs = 0L;
+
+    /**
+     * The trusted package prefix that was successfully delivered to
+     * the native side. Null until load() runs and the native call
+     * returns. Used by SyskuNative.load() to confirm libxstealth's
+     * exports will resolve, and by diagnostics to show the actual
+     * prefix in use.
+     */
+    private static volatile String sTrustedPrefix = null;
 
     private XStealthNative() {}
 
@@ -37,6 +86,18 @@ public final class XStealthNative {
             return sAvailable;
         }
 
+        // The native side starts with g_xstealth_active = 0. The
+        // caller flips it on after load() returns, once it has
+        // read XStealthPrefs.isEnabled(). Setting it explicitly
+        // here makes the initial state unambiguous even if
+        // nativeInit() left it at some stale value from a
+        // previous load attempt in the same process (which can
+        // happen in post-application mode if two modules
+        // initialize the framework).
+        try {
+            nativeSetActive(false);
+        } catch (Throwable ignored) {}
+
         // Tell the native side which package prefix to trust. Must
         // happen before any hooks are installed, because the
         // trusted check gates the framework's own syscalls.
@@ -44,13 +105,29 @@ public final class XStealthNative {
             String pkg = currentPackageName();
             if (pkg != null && !pkg.isEmpty()) {
                 nativeSetTrustedPackage(pkg);
+                sTrustedPrefix = pkg.endsWith(".") ? pkg : pkg + ".";
                 Log.i(TAG, "trusted package set to " + pkg);
             }
         } catch (Throwable t) {
             Log.w(TAG, "nativeSetTrustedPackage failed: " + t.getMessage());
+            sTrustedPrefix = null;
         }
 
         return sAvailable;
+    }
+
+    /** True if load() has run and the library is loaded. */
+    public static boolean isLoaded() {
+        return sLoaded;
+    }
+
+    /**
+     * The trusted package prefix the native side is using, with a
+     * trailing dot. Null until load() has successfully called
+     * nativeSetTrustedPackage().
+     */
+    public static String getTrustedPrefix() {
+        return sTrustedPrefix;
     }
 
     /**
@@ -109,8 +186,21 @@ public final class XStealthNative {
         return sAvailable;
     }
 
+    /**
+     * Flip the shared XStealth / Sysku activation flag.
+     *
+     * Does NOT gate on sAvailable. If the library loaded but
+     * nativeInit() failed (some libc symbols missing), the flag
+     * still reaches xstealth_set_active() so libsysku — which
+     * reads xstealth_is_active() independently of whether
+     * libxstealth's own interposers resolved — sees the correct
+     * value.
+     */
     public static void setActive(boolean active) {
-        if (!sAvailable) return;
+        if (!sLoaded) {
+            Log.w(TAG, "setActive(" + active + "): library not loaded");
+            return;
+        }
         try {
             nativeSetActive(active);
             Log.i(TAG, "native hiding active=" + active);
@@ -303,11 +393,51 @@ public final class XStealthNative {
     }
 
     // ═════════════════════════════════════════════════════════════
+    // TRUSTED PREFIX
+    // ═════════════════════════════════════════════════════════════
+
+    /**
+     * Public wrapper around the JNI setter, for callers that want
+     * to change the trusted prefix after load (e.g. a stealth build
+     * whose package name is only known at runtime). Not normally
+     * needed — load() already sets it.
+     *
+     * Returns the prefix that was sent to the native side (with a
+     * trailing dot), or null on failure.
+     */
+    public static String setTrustedPackage(String packageName) {
+        if (!sLoaded) return null;
+        if (packageName == null || packageName.isEmpty()) return null;
+        try {
+            nativeSetTrustedPackage(packageName);
+            sTrustedPrefix = packageName.endsWith(".")
+                ? packageName : packageName + ".";
+            return sTrustedPrefix;
+        } catch (Throwable t) {
+            Log.w(TAG, "setTrustedPackage failed: " + t.getMessage());
+            return null;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════
     // JNI — single declaration block
     // ═════════════════════════════════════════════════════════════
 
     private static native boolean nativeInit();
-    private static native boolean nativeSetActive(boolean active);
+
+    /**
+     * Forwarded to xstealth_set_active() in libxstealth.so.
+     *
+     * Return type is void to match the C side. The previous
+     * declaration was boolean, which mismatched the C JNI bridge
+     * `JNIEXPORT void JNICALL
+     * Java_com_shizuposed_manager_stealth_XStealthNative_nativeSetActive`.
+     * If your C side still declares `JNIEXPORT jboolean`, revert
+     * this line to `private static native boolean nativeSetActive(
+     * boolean active);` — otherwise keep it void.
+     */
+    private static native void    nativeSetActive(boolean active);
+
     private static native boolean nativeIsActive();
     private static native String  nativeDescribe();
 

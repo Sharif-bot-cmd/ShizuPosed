@@ -160,12 +160,18 @@ public class XStealthModule implements IXposedHookLoadPackage {
         // This is the earliest point at which the config has been
         // read, the scope has been checked, and the target is
         // known to be in scope. It cannot be moved earlier.
+        boolean nativeActive = false;
+        boolean nextActive = false;
+
         try {
             String libDir = System.getProperty("shizuposed.shell.libs",
                 "/data/user/0/com.android.shell/files/libs");
             if (XStealthNative.load(libDir)) {
                 XStealthNative.setActive(true);
-                XposedBridge.log(TAG + ": native hiding active (preloaded)");
+                nativeActive = XStealthNative.isActive();
+                XposedBridge.log(TAG + ": native hiding "
+                    + (nativeActive ? "active (preloaded)" : "loaded but "
+                        + "not active"));
             } else {
                 XposedBridge.log(TAG + ": native hiding unavailable");
             }
@@ -180,12 +186,18 @@ public class XStealthModule implements IXposedHookLoadPackage {
                     "/data/user/0/com.android.shell/files/libs");
                 if (XStealthNativeNext.load(libDir)) {
                     XStealthNativeNext.setActive(true);
-                    if (XStealthNativeNext.isActive()) {
+                    nextActive = XStealthNativeNext.isEffectivelyActive();
+                    if (nextActive) {
                         XposedBridge.log(TAG
-                            + ": Next hiding active (preloaded)");
+                            + ": Next hiding active ("
+                            + XStealthNativeNext.getPatchCount()
+                            + " patches via "
+                            + XStealthNativeNext.getStrategy() + ")");
                     } else {
                         XposedBridge.log(TAG
-                            + ": Next hiding failed to install");
+                            + ": Next hiding failed to install "
+                            + "(loaded but 0 patches applied, strategy="
+                            + XStealthNativeNext.getStrategy() + ")");
                     }
                 } else {
                     XposedBridge.log(TAG + ": Next library unavailable");
@@ -338,12 +350,22 @@ public class XStealthModule implements IXposedHookLoadPackage {
             registerBridgeListeners();
         }
 
-        if (XStealthRegistry.count() > 0) {
+        // ─── Final activation flag ───────────────────────────────
+        //
+        // isActive() reports "is any layer of hiding running in
+        // this process?" That includes the native engines, not
+        // just the Java checks. A process where every check is
+        // off but the native engine is filtering is still hiding
+        // the framework, and isActive() should say so.
+        boolean anyJavaCheck = XStealthRegistry.count() > 0;
+        if (anyJavaCheck || nativeActive || nextActive) {
             sActive = true;
         }
 
         XposedBridge.log(TAG + ": active in " + lpparam.packageName
-            + " (" + XStealthRegistry.count() + " checks)");
+            + " (java=" + XStealthRegistry.count()
+            + ", native=" + (nativeActive ? "on" : "off")
+            + ", next=" + (nextActive ? "on" : "off") + ")");
     }
 
     // ═════════════════════════════════════════════════════════════
@@ -367,7 +389,8 @@ public class XStealthModule implements IXposedHookLoadPackage {
             ClassLoadingBridge.registerClassLoadListener(
                 (className, loader) -> {
                     if (className == null) return;
-                    if (className.startsWith("de.robv.android.xposed.")) {
+                    if (className.startsWith("de.robv.android.xposed.")
+                            || className.startsWith("io.github.libxposed.")) {
                         XposedBridge.log(TAG
                             + ": target is loading Xposed shim class: "
                             + className);

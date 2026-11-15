@@ -14,63 +14,51 @@ import java.util.Set;
 /**
  * Standard Xposed API shim.
  *
- * Version 100 (LSPosed generation 93 + fork revisions 94-100).
- * Modules that check getXposedVersion() >= N for N <= 100 accept
- * ShizuPosed as compatible. Modules that guard on 101 or higher
- * correctly believe ShizuPosed doesn't support those fork
- * revisions.
+ * Version 101 (LSPosed generation 93 + fork revisions 94-101).
  *
- * VERSION HISTORY OF THIS SHIM
- * ----------------------------
- *   82 — XposedHelpers.setStaticBooleanField, getStaticBooleanField
- *        and the wider primitive-field helpers.
- *   89 — XposedBridge.hookAllMethods returns Set.
- *   90 — Non-legacy XSharedPreferences.
- *   93 — LSPosed base: IXUnhook, isModuleActive/isModuleEnabled
- *        no-arg overloads, provider-backed state queries.
- *   94 — XposedBridge.hookAllMethods returns
- *        Set<XC_MethodHook.Unhook>.
- *   95 — XposedBridge.hookAllConstructors returns the same.
- *   96 — MethodHookParam.isReturnEarly() exposed; hookAll*
- *        semantics stabilized.
- *   97 — Instance field accessors on XposedBridge:
- *        getObjectField, setObjectField.
- *   98 — Static field accessors on XposedBridge and
- *        XposedHelpers.getSurroundingThis.
- *   99 — Method invokers on XposedBridge: callMethod,
- *        callStaticMethod.
- *  100 — ShizuPosed-specific extensions: getShizuPosedApiMin,
- *        getShizuPosedApiMax, supportsApi.
+ * AUTHORITY AND MANAGER-NAME RESOLUTION
+ * -------------------------------------
+ * Both are runtime-derived, never hardcoded. The cloak flow
+ * patches AndroidManifest.xml, which changes the package name
+ * but not the dex. A hardcoded "com.shizuposed.manager.status"
+ * would make a cloaked build query the wrong authority and
+ * every module would report "not activated".
  *
- * ADDITIVE ONLY
- * -------------
- * Every revision past 93 is additive. No existing signature was
- * changed, no method was removed. A module compiled against an
- * earlier revision still loads and behaves the same way under this
- * shim, because the shim still exposes the earlier surface.
+ * Resolution order for both:
+ *   1. System property set by the spawn (shizuposed.*.authority
+ *      / shizuposed.manager.package). The cloak flow passes
+ *      these when it spawns app_process so modules in the
+ *      cloaked process see the cloaked authority.
+ *   2. getPackageName() + suffix, via the app instance.
+ *   3. The canonical literal — ONLY as a pre-init fallback,
+ *      never as the steady-state answer.
  */
 public final class XposedBridge {
 
-    /**
-     * Reported framework version.
-     *
-     * Modules guard on this number before using a feature. We report
-     * 100 because we implement everything the 82-100 surface
-     * requires. Modules that guard on 101+ correctly believe we
-     * don't support the newer fork revisions.
-     */
-    public static final int XPOSED_BRIDGE_VERSION = 100;
+    public static final int XPOSED_BRIDGE_VERSION = 101;
 
-    /** Logcat tag for XposedBridge.log output. */
     private static final String LOG_TAG = "Xposed";
-
-    /** Logcat tag for framework-level diagnostics. */
     private static final String FRAMEWORK_TAG = "ShizuPosed";
 
     private static String providerAuthority() {
         String prop = System.getProperty("shizuposed.status.authority");
         if (prop != null && !prop.isEmpty()) return prop;
+        String pkg = currentPackageName();
+        if (pkg != null) return pkg + ".status";
         return "com.shizuposed.manager.status";
+    }
+
+    private static String currentPackageName() {
+        try {
+            com.shizuposed.manager.ShizuPosedManagerApp app =
+                com.shizuposed.manager.ShizuPosedManagerApp.getInstance();
+            if (app != null) return app.getPackageName();
+        } catch (Throwable ignored) {}
+        try {
+            Context ctx = currentApplication();
+            if (ctx != null) return ctx.getPackageName();
+        } catch (Throwable ignored) {}
+        return null;
     }
 
     private XposedBridge() {}
@@ -87,32 +75,20 @@ public final class XposedBridge {
         return XPOSED_BRIDGE_VERSION;
     }
 
-    /**
-     * API 100 extension. Lowest Xposed API revision this shim
-     * provides the full surface for.
-     */
     public static int getShizuPosedApiMin() {
         return 82;
     }
 
-    /**
-     * API 100 extension. Highest Xposed API revision this shim
-     * provides the full surface for.
-     */
     public static int getShizuPosedApiMax() {
         return XPOSED_BRIDGE_VERSION;
     }
 
-    /**
-     * API 100 extension. True if a module compiled against API
-     * {@code api} will function correctly under this shim.
-     */
     public static boolean supportsApi(int api) {
         return api >= 82 && api <= XPOSED_BRIDGE_VERSION;
     }
 
     // ═════════════════════════════════════════════════════════════
-    // HOOK INSTALLATION
+    // HOOK INSTALLATION (unchanged)
     // ═════════════════════════════════════════════════════════════
 
     public static IXUnhook<XC_MethodHook> hookMethod(Method method,
@@ -175,7 +151,45 @@ public final class XposedBridge {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // HOOK ALL — API 94 / 95
+    // INVOKE ORIGINAL (unchanged)
+    // ═════════════════════════════════════════════════════════════
+
+    public static Object invokeOriginalMethod(
+            java.lang.reflect.Member method, Object thisObject, Object[] args)
+            throws Throwable {
+        if (method == null) {
+            throw new IllegalArgumentException("method is null");
+        }
+
+        if (method instanceof Method) {
+            Method m = (Method) method;
+            com.shizuposed.manager.core.compat.HiddenApiBypass
+                .forceAccessible(m);
+            try {
+                return m.invoke(thisObject, args);
+            } catch (java.lang.reflect.InvocationTargetException e) {
+                Throwable cause = e.getCause();
+                throw cause != null ? cause : e;
+            }
+        } else if (method instanceof Constructor) {
+            Constructor<?> c = (Constructor<?>) method;
+            com.shizuposed.manager.core.compat.HiddenApiBypass
+                .forceAccessible(c);
+            try {
+                return c.newInstance(args);
+            } catch (java.lang.reflect.InvocationTargetException e) {
+                Throwable cause = e.getCause();
+                throw cause != null ? cause : e;
+            }
+        }
+
+        throw new IllegalArgumentException(
+            "invokeOriginalMethod: unsupported Member type "
+            + method.getClass().getName());
+    }
+
+    // ═════════════════════════════════════════════════════════════
+    // HOOK ALL — API 94 / 95 (unchanged)
     // ═════════════════════════════════════════════════════════════
 
     public static Set<XC_MethodHook.Unhook> hookAllMethods(
@@ -219,7 +233,7 @@ public final class XposedBridge {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // API 97-100 — ADDITIVE FIELD / METHOD ACCESSORS
+    // API 97-100 — ADDITIVE FIELD / METHOD ACCESSORS (unchanged)
     // ═════════════════════════════════════════════════════════════
 
     public static Object getObjectField(Object obj, String fieldName) {
@@ -258,7 +272,7 @@ public final class XposedBridge {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // LOGGING
+    // LOGGING (unchanged)
     // ═════════════════════════════════════════════════════════════
 
     public static void log(String text) {
@@ -291,7 +305,7 @@ public final class XposedBridge {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // ENABLED STATE
+    // ENABLED STATE (unchanged except authority source)
     // ═════════════════════════════════════════════════════════════
 
     public static boolean isModuleEnabled() {
@@ -367,7 +381,7 @@ public final class XposedBridge {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // ACTIVE STATE
+    // ACTIVE STATE (delegates to LSPosedManager, unchanged)
     // ═════════════════════════════════════════════════════════════
 
     public static boolean isModuleActive() {
@@ -394,20 +408,6 @@ public final class XposedBridge {
         return LSPosedManager.isModuleActive(context, modulePackage);
     }
 
-    /**
-     * Has this module been loaded into ANY process ShizuPosed has
-     * bootstrapped? This is the LSPosed-style "am I active
-     * anywhere" question.
-     *
-     * Distinct from isModuleActive(pkg), which asks whether the
-     * module is loaded into a specific target's process. Under
-     * LSPosed, the two questions have the same answer, because
-     * LSPosed injects into every process. Under ShizuPosed they
-     * differ, so this method exists to answer the broader question
-     * without changing what isModuleActive(pkg) means.
-     *
-     * See LSPosedManager.isModuleActiveAnywhere for details.
-     */
     public static boolean isModuleActiveAnywhere(String modulePackage) {
         Context ctx = currentApplication();
         if (ctx == null) {
@@ -434,7 +434,7 @@ public final class XposedBridge {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // PACKAGE VISIBILITY DIAGNOSTIC
+    // PACKAGE VISIBILITY DIAGNOSTIC (unchanged except authority)
     // ═════════════════════════════════════════════════════════════
 
     private static void logVisibilityHint(String call, String packageName) {
@@ -455,7 +455,7 @@ public final class XposedBridge {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // CALLING PACKAGE RESOLUTION
+    // CALLING PACKAGE RESOLUTION (unchanged)
     // ═════════════════════════════════════════════════════════════
 
     private static String getCallingPackage() {
@@ -492,7 +492,7 @@ public final class XposedBridge {
     }
 
     // ═════════════════════════════════════════════════════════════
-    // CONTEXT RESOLUTION
+    // CONTEXT RESOLUTION (unchanged)
     // ═════════════════════════════════════════════════════════════
 
     private static Context currentApplication() {

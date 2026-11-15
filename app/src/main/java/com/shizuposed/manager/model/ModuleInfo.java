@@ -23,57 +23,58 @@ public class ModuleInfo implements Serializable {
     // ============================================================
     // LSPOSED-STYLE: Track which apps this module hooks
     // ============================================================
-    public Set<String> hookedApps;          // Package names of apps to hook
-    public boolean hookAllApps;             // If true, hook all apps
-    public boolean hookSystemApps;          // If true, hook system apps
+    public Set<String> hookedApps;
+    public boolean hookAllApps;
+    public boolean hookSystemApps;
 
     // ============================================================
     // RECOMMENDED SCOPE
-    //
-    // Package names the module declares as its recommended scope,
-    // read from assets/scope.list in the module APK. This is the
-    // LSPosed convention: the module author lists the packages the
-    // module is designed for, and the scope editor surfaces them
-    // with a badge and a "Recommended" quick-select chip.
-    //
-    // Distinct from hookedApps, which is the user's actual
-    // selection. A package can be recommended without being
-    // selected, and selected without being recommended.
-    //
-    // Empty when the module declares no scope.list. Never null.
     // ============================================================
     public Set<String> recommendedApps;
 
     public boolean hasXposedInit;
     public boolean hasNativeInit;
 
-    /**
-     * True if the module APK declares a launcher activity.
-     *
-     * Used only by the scope editor: a module with a UI can select
-     * its own package in its own scope, so it can be launched under
-     * ShizuPosed and hook itself. Headless modules do not see their
-     * own package.
-     */
     public boolean hasUi = false;
 
     // ============================================================
     // MANUAL ADD PROTECTION (R-6.5+)
-    //
-    // True if the user added this module manually via the Add
-    // Module dialog. The scanner's automatic purge pass skips any
-    // module with this flag set — the user's explicit intent takes
-    // precedence over the apkExists / packageInstalled checks.
-    //
-    // This matters because a manually-added module often has a
-    // package name that doesn't resolve through PackageManager:
-    // modules that hook by targeting another app's package rather
-    // than shipping their own.
-    //
-    // Auto-detected modules leave this false and are still subject
-    // to the purge pass if their APK disappears.
     // ============================================================
     public boolean manuallyAdded = false;
+
+    // ============================================================
+    // DETECTION SOURCE
+    //
+    // The marker that caused this module to be registered.
+    // Populated by ModuleScanner when a module is discovered
+    // (see ModuleScanner.DETECTED_* constants). Null for
+    // manually-added modules.
+    //
+    // Values:
+    //   "assets/xposed_init"                 — canonical marker
+    //   "assets/xposed_module"               — older convention
+    //   "META-INF/xposed/module.prop"        — EdXposed-era
+    //   "assets/native_init"                 — weak signal
+    //   "meta-data:xposedminversion"         — classic manifest meta
+    //   "meta-data:xposed_module"            — libxposed manifest meta
+    //   "application-class"                  — heuristic (tier 3)
+    //   "deep-scan"                          — dex walk (tier 4)
+    //
+    // Shown by the module detail sheet so the user can see *why*
+    // a module appears in the list. Persisted by Gson with the
+    // rest of the ModuleInfo.
+    // ============================================================
+    public String detectedVia;
+
+    // ============================================================
+    // XPOSED API VERSION (LSPosed-style)
+    // ============================================================
+    public int apiVersion = -1;
+    public int targetApiVersion = -1;
+    public int xposedMinVersion = -1;
+
+    /** Ceiling of what ShizuPosed's Xposed API shim advertises. */
+    public static final int SHIZUPOSED_API_MAX = 100;
 
     public ModuleInfo() {
         this.enabled = true;
@@ -88,6 +89,10 @@ public class ModuleInfo implements Serializable {
         this.hasUi = false;
         this.recommendedApps = new HashSet<>();
         this.manuallyAdded = false;
+        this.apiVersion = -1;
+        this.targetApiVersion = -1;
+        this.xposedMinVersion = -1;
+        this.detectedVia = null;
     }
 
     public ModuleInfo(String packageName, String name) {
@@ -139,7 +144,7 @@ public class ModuleInfo implements Serializable {
     }
 
     public int getHookedAppCount() {
-        if (hookAllApps) return -1; // All apps
+        if (hookAllApps) return -1;
         return hookedApps != null ? hookedApps.size() : 0;
     }
 
@@ -161,6 +166,40 @@ public class ModuleInfo implements Serializable {
         return recommendedApps != null && !recommendedApps.isEmpty();
     }
 
+    // ============================================================
+    // API VERSION HELPERS
+    // ============================================================
+
+    public int getDisplayApiVersion() {
+        if (apiVersion > 0) return apiVersion;
+        if (xposedMinVersion > 0) return xposedMinVersion;
+        if (targetApiVersion > 0) return targetApiVersion;
+        return -1;
+    }
+
+    public boolean hasApiVersion() {
+        return getDisplayApiVersion() > 0;
+    }
+
+    /**
+     * Human-readable detection source for the detail sheet.
+     * Null when the module was manually added (no source to show).
+     */
+    public String getDetectedViaLabel() {
+        if (detectedVia == null || detectedVia.isEmpty()) return null;
+        switch (detectedVia) {
+            case "assets/xposed_init":              return "xposed_init";
+            case "assets/xposed_module":            return "xposed_module";
+            case "META-INF/xposed/module.prop":     return "module.prop";
+            case "assets/native_init":              return "native_init";
+            case "meta-data:xposedminversion":      return "manifest meta-data";
+            case "meta-data:xposed_module":         return "libxposed meta-data";
+            case "application-class":               return "application class (heuristic)";
+            case "deep-scan":                       return "deep scan";
+            default:                                return detectedVia;
+        }
+    }
+
     @Override
     public String toString() {
         return "ModuleInfo{" +
@@ -175,6 +214,9 @@ public class ModuleInfo implements Serializable {
                 ", hasXposedInit=" + hasXposedInit +
                 ", hasUi=" + hasUi +
                 ", manuallyAdded=" + manuallyAdded +
+                ", apiVersion=" + apiVersion +
+                ", targetApiVersion=" + targetApiVersion +
+                ", detectedVia='" + detectedVia + '\'' +
                 '}';
     }
 }

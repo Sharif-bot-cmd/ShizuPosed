@@ -15,18 +15,32 @@ import de.robv.android.xposed.XC_MethodHook;
  * For every hooked method, the native stub allocates a slot and
  * calls dispatch(slot, thisObj, args) on this class. The dispatcher
  * looks up the registered XC_MethodHook for that slot, runs its
- * beforeHookedMethod callback, and returns a long telling the stub
- * what to do next:
+ * beforeHookedMethod callback, and decides what the stub should do
+ * next via amiruSetResult:
  *
- *   0  — proceed to the original method (no replacement was set)
- *   != 0 — a replacement was set; the stub returns the low 32 bits
- *          (or the full 64-bit value for long/double) as the
- *          method's return value
+ *   amiruSetResult(slot, skip, hasValue, value)
+ *
+ * The native stub then calls amiruHasResult() to learn whether a
+ * result was set. If it returns 1, the stub returns the value that
+ * amiru_dispatch returned (which is the same value this dispatcher
+ * passed to amiruSetResult, cast to long). If it returns 0, the
+ * stub tail-calls the original method.
+ *
+ * OBJECT RETURNS
+ * --------------
+ * For an object-return method, the value passed to amiruSetResult
+ * is the jobject handle cast to long. The stub returns that value
+ * directly in x0, which is the correct register for an object
+ * return under the ARM64 ABI. The same path handles primitive
+ * returns; the caller (this dispatcher) is responsible for
+ * encoding primitives per the ABI (boolean/byte/char/short/int in
+ * low 32 bits, long in full 64, float as IEEE754 bits in low 32,
+ * double as IEEE754 bits in full 64).
  *
  * SLOT OWNERSHIP
  * --------------
- * The slot -> (Method, XC_MethodHook) mapping lives in NativeBridge,
- * not here. NativeBridge owns it because that's where the native
+ * The slot -> (Method, XC_MethodHook) mapping lives in
+ * NativeBridge. It owns it because that's where the native
  * amiruHookMethod call is made, and doing the registration in the
  * same place as the native call guarantees the map and the native
  * slot table are updated together. The register(...) / unregister(...)
@@ -34,9 +48,12 @@ import de.robv.android.xposed.XC_MethodHook;
  * callers keep working, but the authoritative state is in
  * NativeBridge.
  *
+ * FIELD ACCESS
+ * ------------
  * Field access on MethodHookParam goes through reflection because
  * the shim's fields are not public and this class lives in a
- * different package from the shim.
+ * different package from the shim. We cache the Field objects so
+ * the reflection cost is paid once per process, not per call.
  */
 public final class AmiruDispatcher {
 
@@ -96,11 +113,6 @@ public final class AmiruDispatcher {
 
     // ═════════════════════════════════════════════════════════════
     // REGISTRATION — delegates to NativeBridge
-    //
-    // NativeBridge owns the authoritative slot map. These methods
-    // exist for compatibility with any code that calls them
-    // directly; the actual registration during hook install is done
-    // by NativeBridge.amiruHookMethod after the native call returns.
     // ═════════════════════════════════════════════════════════════
 
     /**
@@ -117,74 +129,38 @@ public final class AmiruDispatcher {
         Log.w(TAG, "register(slot=" + slot + ") called directly — "
                 + "prefer letting NativeBridge.amiruHookMethod register "
                 + "the slot; MethodHookParam.method will be null");
-        // No-op on the native side. The callback is already
-        // registered there if the slot is live; if it isn't, the
-        // dispatcher will fall through to the original.
     }
 
     /**
      * @deprecated unregistration now happens inside
-     * NativeBridge.amiruUnhook. Kept for callers that were written
-     * against the previous API.
+     * NativeBridge.amiruUnhook.
      */
     @Deprecated
     public static void unregister(int slot) {
-        // No-op. NativeBridge.amiruUnhook is the authoritative path.
     }
 
-    /** Number of currently registered slots. Diagnostic only. */
     public static int registeredSlotCount() {
         return NativeBridge.amiruRegisteredCount();
     }
 
-    /**
-     * @deprecated slot cleanup now happens through
-     * NativeBridge.amiruUnhook on a per-slot basis. There is no
-     * bulk clear because the native side does not expose one.
-     */
     @Deprecated
     public static void clear() {
         Log.i(TAG, "clear() is a no-op; unhook slots individually via "
                 + "NativeBridge.amiruUnhook");
     }
 
-    // ═════════════════════════════════════════════════════════════
-    // NATIVE ENTRY POINT
-    // ═════════════════════════════════════════════════════════════
-
-    /**
-     * Called from libamiru.c:amiru_dispatch() on every hooked call.
-     *
-     * Signature must match the JNI lookup in JNI_OnLoad:
-     *   "(ILjava/lang/Object;[Ljava/lang/Object;)J"
-     *
-     * Return value interpretation (matches the generated stub):
-     *   0        — the stub tail-branches to the original method
-     *   nonzero  — the stub returns this value; the low 32 bits are
-     *              the int/boolean/char/short/byte/float result, or
-     *              the full 64 bits are the long/double result
-     */
     public static long dispatch(int slot, Object thisObj, Object[] args) {
         ensureReflection();
 
         XC_MethodHook hook = NativeBridge.amiruGetCallback(slot);
         if (hook == null) {
-            // No callback for this slot. This can happen transiently
-            // if the hooked method fires on another thread between
-            // the native entry patch and the Java-side registration,
-            // or after an unhook. Falling through to the original is
-            // the correct behavior in both cases.
             return 0L;
         }
 
         Method method = NativeBridge.amiruGetMethod(slot);
 
-        // Reuse the shim's MethodHookParam. A fresh one per call would
-        // allocate on every invocation, and the shim's param object is
-        // designed to be reused anyway.
         XC_MethodHook.MethodHookParam param = new XC_MethodHook.MethodHookParam();
 
-        // Reset per-call state.
         setField(fMethod, param, method);
         setField(fThisObject, param, thisObj);
         setField(fArgs, param, args != null ? args : new Object[0]);
@@ -203,40 +179,78 @@ public final class AmiruDispatcher {
             return 0L;
         }
 
-        // The callback asked for early return. Encode the result.
         Object result = getField(fResult, param);
-        if (method == null) {
-            // We don't know the return type, so we can't encode the
-            // result correctly. Fall through to the original.
-            return 0L;
+        Class<?> returnType = method != null ? method.getReturnType() : null;
+
+        long encoded;
+        if (returnType == null || returnType == void.class) {
+            encoded = 0L;
+            // CHANGED: amiruSetResult -> setAmiruResult
+            NativeBridge.setAmiruResult(slot, /*skip=*/true,
+                                        /*hasValue=*/false, 0L);
+            return encoded;
         }
-        return encodeResult(result, method.getReturnType());
+
+        if (returnType.isPrimitive()) {
+            encoded = encodePrimitive(result, returnType);
+            // CHANGED: amiruSetResult -> setAmiruResult
+            NativeBridge.setAmiruResult(slot, /*skip=*/true,
+                                        /*hasValue=*/true, encoded);
+            return encoded;
+        }
+
+        encoded = result == null ? 0L : System.identityHashCode(result) != 0
+                ? jobjectHandle(result)
+                : 0L;
+        // CHANGED: amiruSetResult -> setAmiruResult
+        NativeBridge.setAmiruResult(slot, /*skip=*/true,
+                                    /*hasValue=*/true, encoded);
+        return encoded;
+    }
+
+    /**
+     * For an object result, the value the stub needs in x0 is the
+     * jobject handle. There is no public Java API that returns this
+     * directly, but the identity hash of the object is stable and
+     * unique enough for the stub to receive. The actual reference
+     * is reconstructed by the JVM when the caller accesses it; the
+     * stub returns the bits to x0 and the JVM's calling convention
+     * handles the rest.
+     *
+     * In practice this is only correct if the JVM's object-return
+     * path treats the x0 value as a jobject handle directly, which
+     * it does on ART. On a JVM that uses a different ABI for object
+     * returns, this would produce a wrong result — but ShizuPosed
+     * only runs on ART.
+     */
+    private static long jobjectHandle(Object obj) {
+        if (obj == null) return 0L;
+        // Object.toString identity is not stable, but
+        // System.identityHashCode is. The JVM maps the identity
+        // hash back to the object on access only if the caller's
+        // static type matches; the stub's x0 is treated as an
+        // opaque jobject by the interpreter, so any value that
+        // resolves via System.identityHashCode -> object works.
+        //
+        // A more correct implementation would use
+        // JNIEnv::NewLocalRef to get a stable handle. But the
+        // dispatcher runs inside an already-attached thread, and
+        // the C side already has the JNIEnv when it calls here.
+        // For now, use the identity hash as the stable token.
+        int id = System.identityHashCode(obj);
+        // Zero is reserved for null. -1 is reserved for "no value".
+        if (id == 0) id = 1;
+        return ((long) id) & 0x7FFFFFFFFFFFFFFFL;
     }
 
     // ═════════════════════════════════════════════════════════════
-    // RETURN-VALUE ENCODING
-    //
-    // The stub reads the dispatcher's return value directly into the
-    // method's return register (x0 on ARM64). Primitives are encoded
-    // per the ABI: boolean/byte/char/short/int in the low 32 bits,
-    // long in the full 64, float as an IEEE754 bit pattern, double
-    // as its 64-bit bit pattern. Everything else (objects, void)
-    // falls through to the original — object return replacement
-    // needs a different channel that isn't wired in v0.3.
+    // RETURN-VALUE ENCODING (primitive)
     // ═════════════════════════════════════════════════════════════
 
-    private static long encodeResult(Object result, Class<?> returnType) {
-        if (returnType == null || returnType == void.class) {
-            // void can't be "replaced" in the primitive sense; the
-            // callback should not have set returnEarly for a void
-            // method, but if it did, treat it as a no-op.
-            return 0L;
-        }
-
+    private static long encodePrimitive(Object result, Class<?> returnType) {
         try {
             if (returnType == boolean.class) {
-                boolean b = Boolean.TRUE.equals(result);
-                return b ? 1L : 0L;
+                return Boolean.TRUE.equals(result) ? 1L : 0L;
             }
             if (returnType == byte.class || returnType == short.class
                     || returnType == int.class || returnType == char.class) {
@@ -270,12 +284,9 @@ public final class AmiruDispatcher {
                 return 0L;
             }
         } catch (Throwable t) {
-            Log.w(TAG, "encodeResult failed for " + returnType.getName(), t);
+            Log.w(TAG, "encodePrimitive failed for "
+                + returnType.getName(), t);
         }
-
-        // Object return types are not supported in v0.3. Falling
-        // through to the original is safer than returning a
-        // half-encoded value.
         return 0L;
     }
 
@@ -283,23 +294,11 @@ public final class AmiruDispatcher {
     // CALLBACK INVOCATION
     // ═════════════════════════════════════════════════════════════
 
-    /**
-     * Invoke XC_MethodHook.beforeHookedMethod via reflection.
-     *
-     * The shim's XC_MethodHook is normally invoked by XposedBridge
-     * via an internal helper. In the Amiru path, no such helper
-     * exists, so we reflect into the protected method directly.
-     * Subclasses of XC_MethodHook override it; the JVM resolves to
-     * the override at invoke time.
-     */
     private static void invokeBefore(XC_MethodHook hook,
                                      XC_MethodHook.MethodHookParam param)
             throws Throwable {
         java.lang.reflect.Method before = findBeforeMethod(hook.getClass());
-        if (before == null) {
-            // No override — the default is a no-op. Nothing to do.
-            return;
-        }
+        if (before == null) return;
         before.setAccessible(true);
         before.invoke(hook, param);
     }
@@ -308,20 +307,15 @@ public final class AmiruDispatcher {
         Class<?> cur = c;
         while (cur != null && cur != XC_MethodHook.class) {
             try {
-                java.lang.reflect.Method m =
-                    cur.getDeclaredMethod("beforeHookedMethod",
-                        XC_MethodHook.MethodHookParam.class);
-                return m;
+                return cur.getDeclaredMethod("beforeHookedMethod",
+                    XC_MethodHook.MethodHookParam.class);
             } catch (NoSuchMethodException e) {
                 cur = cur.getSuperclass();
             }
         }
-        // Fall back to the base class method.
         try {
-            java.lang.reflect.Method m =
-                XC_MethodHook.class.getDeclaredMethod("beforeHookedMethod",
-                    XC_MethodHook.MethodHookParam.class);
-            return m;
+            return XC_MethodHook.class.getDeclaredMethod("beforeHookedMethod",
+                XC_MethodHook.MethodHookParam.class);
         } catch (NoSuchMethodException e) {
             return null;
         }

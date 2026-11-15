@@ -3,7 +3,8 @@
 #
 # Design:
 #   - Class names that are load-time linked (Xposed API, Shizuku,
-#     Android entrypoints, JNI) are kept with full member names.
+#     libxposed API, Android entrypoints, JNI) are kept with full
+#     member names.
 #   - Class names that anti-tamper scanners grep for are renamed
 #     when they are provably not reflected on.
 #   - Debug metadata is trimmed (source file names) but line
@@ -31,10 +32,82 @@
 
 -renamesourcefileattribute SourceFile
 
-# ── Xposed API shims ────────────────────────────────────────
+# ── Xposed classic API shims ────────────────────────────────
+#
+# Covers IXposedHookLoadPackage, IXposedHookZygoteInit,
+# IXposedHookInitPackageResources, IXposedHookCmdInit,
+# IXposedHookDynamic, IXposedMod, the XC_* callback types, and
+# the XposedBridge / XposedHelpers shims. Every class in this
+# package is loaded by name from a module's entry class
+# (implemented interface) or from the framework's own shim
+# lookup. Keep the whole package.
 -keep class de.robv.android.xposed.** { *; }
 -keep interface de.robv.android.xposed.** { *; }
 -keep class de.robv.android.xposed.callbacks.** { *; }
+
+# IXposedHookCmdInit and IXposedHookDynamic are load-bearing
+# for the "class-load fix" behavior in 1.4.9: a module that
+# implements either interface must be able to resolve the
+# interface at class load. Covered by the package-wide keep
+# above, restated here for the next reader.
+-keep interface de.robv.android.xposed.IXposedHookCmdInit { *; }
+-keep interface de.robv.android.xposed.IXposedHookDynamic { *; }
+-keep class de.robv.android.xposed.IXposedHookCmdInit$StartupParam { *; }
+
+# ── libxposed API (vendored, io.github.libxposed.api.*) ────
+#
+# The vendored libxposed API 102 surface. Every class in this
+# package is reachable through the driver:
+#
+#   • XposedInterface / XposedInterfaceWrapper — the driver
+#     instantiates XposedInterfaceWrapper per module and calls
+#     attachFramework(...) reflectively.
+#   • XposedModule — the driver checks whether a module's entry
+#     class extends this class to decide which lifecycle to
+#     drive. Renaming it would break the check and every
+#     libxposed module would be silently ignored.
+#   • XposedModuleInterface / its nested Param types — the
+#     driver calls the callbacks reflectively.
+#   • HookBuilder / HookHandle / Hooker / Chain / Invoker /
+#     CtorInvoker / ExceptionMode — the driver's adapter
+#     implements these; module code links against them.
+#   • @SinceApi and @InternalApi — R8's annotation stripping
+#     would remove the runtime-visible annotations the driver
+#     uses to decide which methods exist on which API level.
+#     (They're CLASS retention, but the driver's own reflection
+#     on the *declared* methods survives annotation stripping.
+#     Keep the annotations anyway so a future driver that uses
+#     `getAnnotation(SinceApi.class)` doesn't break silently.)
+-keep class io.github.libxposed.api.** { *; }
+-keep interface io.github.libxposed.api.** { *; }
+-keep class io.github.libxposed.api.error.** { *; }
+-keep class io.github.libxposed.annotation.** { *; }
+
+# XposedInterfaceWrapper.attachFramework uses reflection on
+# its own fields to bind the base. Keep the fields and the
+# method by name.
+-keepclassmembers class io.github.libxposed.api.XposedInterfaceWrapper {
+    <fields>;
+    public final void attachFramework(
+        io.github.libxposed.api.XposedInterface,
+        java.lang.Runnable);
+    public final void detach();
+}
+
+# XposedModule is the marker the driver uses to decide which
+# lifecycle to drive. The class body is kept whole above; the
+# concrete subclass check relies on `extends XposedModule`, so
+# R8 must not inline or rename the base.
+-keep class io.github.libxposed.api.XposedModule { *; }
+-keepclassmembers class * extends io.github.libxposed.api.XposedModule {
+    <methods>;
+}
+
+# The driver's per-module driver class. It is called
+# reflectively from ShizuPosedXposedInterface? No — it is
+# called directly. But it in turn calls XposedInterfaceWrapper
+# reflectively, so pin it.
+-keep class com.shizuposed.manager.core.libxposed.** { *; }
 
 # ── Hook engine (named in Class.forName / app_process) ──────
 -keep class com.shizuposed.manager.core.XposedHook { *; }
@@ -60,8 +133,34 @@
                                 long[]);
 }
 
+# NativeBridge's JNI surface. The whole class is kept above;
+# restated here so the JNI entry points (including the ones
+# added in 1.4.9: amiruProbeLayout, amiruDescribeLayout,
+# amiruUnhook, amiruSetResult, amiruHasResult,
+# amiruHookMethodNative) survive any future selective keep.
+-keepclassmembers class com.shizuposed.manager.core.NativeBridge {
+    native <methods>;
+}
+
+# AmiruDispatcher is the JNI-resolved callback class for the
+# Amiru backend. The class is instantiated on every hooked
+# call; its static dispatch method is resolved by name from
+# libamiru.c's JNI_OnLoad. Keep it whole.
+-keep class com.shizuposed.manager.core.AmiruDispatcher { *; }
+-keepclassmembers class com.shizuposed.manager.core.AmiruDispatcher {
+    public static long dispatch(int, java.lang.Object, java.lang.Object[]);
+    public static int amiruHasResult();
+}
+
 -keep class com.shizuposed.manager.updates.UpdateChecker { *; }
+-keep class com.shizuposed.manager.updates.UpdateDownloader { *; }
+-keep class com.shizuposed.manager.updates.UpdateInfo { *; }
+-keep class com.shizuposed.manager.updates.UpdateInstallActivity { *; }
+-keep class com.shizuposed.manager.updates.UpdateProgressDialog { *; }
 -keep class com.shizuposed.manager.monitor.ForegroundMonitor { *; }
+
+-keep class org.bouncycastle.** { *; }
+-dontwarn org.bouncycastle.**
 
 # ── Runtime timing preferences ──────────────────────────────
 #
@@ -111,6 +210,37 @@
     public static java.lang.String describe();
 }
 
+# libxstealth_bridge.so JNI surface (added 1.4.x).
+-keep class com.shizuposed.manager.stealth.XStealthBridge { *; }
+-keepclassmembers class com.shizuposed.manager.stealth.XStealthBridge {
+    native <methods>;
+    public static boolean load(java.lang.String);
+    public static boolean isAvailable();
+    public static void setActive(boolean);
+    public static boolean isActive();
+    public static java.lang.String describe();
+    public static java.lang.String nativeDescribe();
+}
+
+# libsysku.so JNI surface (optional; see XposedHook.loadNativeLibs).
+-keep class com.shizuposed.manager.stealth.SyskuNative { *; }
+-keepclassmembers class com.shizuposed.manager.stealth.SyskuNative {
+    native <methods>;
+    public static boolean load(java.lang.String);
+    public static int nativeInit(java.lang.String, boolean);
+    public static boolean isAvailable();
+}
+
+# Sysku controller — state stored in shell-side JSON, read
+# by the manager's Settings tab. Reflected on by Gson when
+# reading state.json and heartbeat.json, so the fields and
+# the class need to survive R8's renaming.
+-keep class com.shizuposed.manager.runtime.SyskuController { *; }
+-keepclassmembers class com.shizuposed.manager.runtime.SyskuController {
+    <fields>;
+    <methods>;
+}
+
 -keep class com.shizuposed.manager.stealth.checks.ApiProtectionCheck { *; }
 -keepclassmembers class com.shizuposed.manager.stealth.checks.ApiProtectionCheck {
     public static void install(de.robv.android.xposed.callbacks.XC_LoadPackage$LoadPackageParam);
@@ -123,6 +253,39 @@
 
 # ── Compat layer ────────────────────────────────────────────
 -keep class com.shizuposed.manager.core.compat.** { *; }
+
+# ── Cloak flow (Hide / Unhide ShizuPosed app) ───────────────
+#
+# ManagerCloakFlow and ManagerCloak are invoked from the
+# Settings fragment as direct Java calls, but ManagerCloak
+# loads BouncyCastle classes reflectively via Jca* helpers,
+# and ManagerCloak.selfSign's X509 certificate construction
+# is byte-code sensitive (the BouncyCastle builders inspect
+# parameter types via reflection). Keep the whole package.
+#
+# AxmlPatcher is a static utility. It is called directly
+# (AxmlPatcher.replacePackageName / replaceLabel), but keeping
+# it whole ensures the string-pool walker's inner classes and
+# any future reflective use survive.
+#
+# ManagerMigrate is called from ShizuPosedManagerApp.onCreate
+# as a direct Java call, but its `write` helper is reflection-
+# adjacent (it opens files under the target's data dir), and
+# a future caller that reflects on it shouldn't be broken by
+# this ruleset.
+-keep class com.shizuposed.manager.cloak.** { *; }
+-keepclassmembers class com.shizuposed.manager.cloak.ManagerCloak {
+    <fields>;
+    <methods>;
+}
+-keepclassmembers class com.shizuposed.manager.cloak.ManagerMigrate {
+    <fields>;
+    <methods>;
+}
+-keepclassmembers class com.shizuposed.manager.cloak.AxmlPatcher {
+    <fields>;
+    <methods>;
+}
 
 # ── Pine ────────────────────────────────────────────────────
 -keep class top.canyie.pine.** { *; }
@@ -458,9 +621,10 @@
 #   debug-logging path. Users diagnosing a release build lose
 #   all debug output. XStealth's activation log lines, the
 #   interposed-symbol traces from libxstealth.so, the stub-
-#   patch traces from libxstealth_next.so, and the dex2oat
-#   fallback traces from DexOptimizeWrapper would all be
-#   stripped by this rule.
+#   patch traces from libxstealth_next.so, the dex2oat
+#   fallback traces from DexOptimizeWrapper, and the update
+#   flow's `UpdateChecker` / `UpdateDownloader` logging would
+#   all be stripped by this rule.
 
 # -assumenosideeffects class java.io.PrintStream { ... }
 #   Same problem. CompatLog's last-resort fallback uses
@@ -481,8 +645,11 @@
 #   Increasing it lets R8 strip methods it thinks are unused
 #   but which are only reached through reflection. The stealth
 #   package's static installer methods, XStealthNative's JNI
-#   surface, XStealthNativeNext's JNI surface, and
-#   ApiProtectionCheck's private hook setup methods are all
+#   surface, XStealthNativeNext's JNI surface,
+#   XStealthBridge's JNI surface, SyskuNative's JNI surface,
+#   ApiProtectionCheck's private hook setup methods, the
+#   libxposed driver's reflective callbacks, and the update
+#   flow's reflective activity launch are all
 #   reflection-sensitive.
 
 # -keepclassmembers,allowobfuscation on the stealth package:
@@ -519,23 +686,38 @@
 #   in the rest of the package unnecessarily. The explicit
 #   Slider constructor keep above is sufficient.
 
-# RuntimePrefs keep-whole:
-#   RuntimePrefs is reflected on by nothing. Its methods are
-#   called from ProcessMonitor and ShizuPosedService as direct
-#   Java calls. The keep rule above uses allowobfuscation, so
-#   R8 will rename the class and its members; only the
-#   interface it exposes to the two callers matters at compile
-#   time, and R8 resolves those call sites statically.
+# -keep class com.shizuposed.manager.cloak.** { *; }
+#   Added in 1.4.10. The whole package is kept because
+#   ManagerCloak's selfSign() calls BouncyCastle builders
+#   reflectively, AxmlPatcher's string-pool walker has inner
+#   anonymous classes that R8 would rename, and
+#   ManagerCloakFlow's ProgressListener is implemented by an
+#   anonymous inner class in the Settings fragment whose
+#   callback methods are resolved through the interface — if
+#   the interface were renamed to match the implementation,
+#   the callback would still work, but if R8 overload-
+#   aggressively collapsed the two `onMessage` / `onSuccess` /
+#   `onError` methods, it could pick the wrong one.
 
-# -keep,allowobfuscation on com.shizuposed.manager.watcher:
-#   Considered and rejected. The watcher's class name appears
-#   in AndroidManifest.xml as
-#       android:name=".watcher.ShizukuBinderWatcher"
-#   and R8 does not treat manifest attributes as class
-#   references. Renaming it would produce a
-#   ClassNotFoundException at app start, before any of the
-#   watcher's runtime checks could report what went wrong.
-#   Unlike the stealth package (where a runtime mapping file
-#   could translate names), the watcher is instantiated by the
-#   Android framework, so there is no place to insert a
-#   lookup. Keep it whole.
+# -keep io.github.libxposed.api.** (without the interface and
+#   error sub-package rules)
+#   Considered and rejected. The `io.github.libxposed.api` and
+#   `io.github.libxposed.api.error` sub-packages need their
+#   own keeps because XposedFrameworkError / HookFailedError
+#   are caught by name in module code, and HookFailedError
+#   is thrown by the driver. A single `api.**` rule would
+#   also keep the annotations, but the annotations have
+#   CLASS retention and would survive anyway; keeping them
+#   explicitly is harmless and makes the intent clear.
+
+# -keep class kotlinx.coroutines.** { *; }
+#   The app is pure Java; kotlinx.coroutines isn't on the
+#   classpath. The -dontwarn entry above is for transitive
+#   dependencies of libraries, not for the app's own code.
+
+# -keepclassmembers,allowobfuscation class io.github.libxposed.api.**
+#   Would hide the libxposed class names, but the driver uses
+#   the exact package name (`io.github.libxposed.api.XposedModule`)
+#   to decide which lifecycle to drive. Renaming breaks the
+#   check silently — every libxposed module would be treated
+#   as a classic module or ignored. Keep the package whole.

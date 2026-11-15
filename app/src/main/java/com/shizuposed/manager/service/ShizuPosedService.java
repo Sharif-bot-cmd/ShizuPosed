@@ -32,6 +32,7 @@ import com.shizuposed.manager.utils.Logger;
 import com.shizuposed.manager.utils.ShellUtils;
 import com.shizuposed.manager.stealth.SmartForegroundController;
 import com.shizuposed.manager.stealth.XStealthPrefs;
+import com.shizuposed.manager.runtime.SyskuController;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -102,6 +103,7 @@ public class ShizuPosedService extends Service {
     private static final String LIB_SHIZUPOSED  = "libshizuposed.so";
     private static final String LIB_XSTEALTH    = "libxstealth.so";
     private static final String LIB_XSTEALTH_NEXT = "libxstealth_next.so";
+    private static final String LIB_SYSKU        = "libsysku.so";
     private static final String LIB_CALLSITE    = "libcallsite.so";
     private static final String LIB_XSTEALTH_BRIDGE = "libxstealth_bridge.so";
 
@@ -370,22 +372,8 @@ public class ShizuPosedService extends Service {
         super.onCreate();
         isServiceRunning = true;
 
-        // Create the notification channel before startForeground,
-        // because startForeground on Android 8+ requires the channel
-        // to exist. But keep the channel creation minimal — no
-        // Logger, no file I/O — so it can't eat into the 5-second
-        // FGS window.
         createNotificationChannel();
 
-        // Foreground FIRST. Android gives a startForegroundService()
-        // caller only 5 seconds to call startForeground() before it
-        // kills the whole process with
-        // ForegroundServiceDidNotStartInTimeException. On a slow ROM
-        // or a busy device, initialising the Logger (which opens
-        // files, reads prefs, and can block on shared prefs for
-        // hundreds of ms) can easily consume that budget. Doing
-        // startForeground before any of that makes the contract
-        // impossible to miss.
         try {
             startForeground(NOTIFICATION_ID,
                 buildNotification("Service running"));
@@ -394,10 +382,6 @@ public class ShizuPosedService extends Service {
             foregroundStarted.set(false);
             android.util.Log.e("ShizuPosedService",
                 "startForeground failed in onCreate", t);
-            // Retry once on the main thread. If the second attempt
-            // fails too, the service runs as a background service
-            // and the caller's FGS contract will eventually kill us —
-            // but at least the first 5-second window is past.
             new Handler(Looper.getMainLooper()).postDelayed(() -> {
                 try {
                     startForeground(NOTIFICATION_ID,
@@ -410,8 +394,6 @@ public class ShizuPosedService extends Service {
             }, 200);
         }
 
-        // Now that the FGS contract is satisfied, set up the Logger.
-        // A Logger failure here can no longer kill the process.
         try {
             logger = Logger.getInstance(this);
         } catch (Throwable t) {
@@ -498,11 +480,39 @@ public class ShizuPosedService extends Service {
         });
     }
 
+    /**
+     * Compare an incoming action against the runtime-derived
+     * authorization action.
+     *
+     * The action string is derived from getPackageName() at call
+     * time (see ShizuPosedManagerApp.actionShizukuAuthorized()).
+     * After a cloak, the manager's package changes, so the
+     * comparison must be against the CURRENT package's action,
+     * not a compile-time constant. This helper centralizes that
+     * comparison and also accepts the legacy literal
+     * "com.shizuposed.manager.ACTION_SHIZUKU_AUTHORIZED" for the
+     * brief transition window where an old service instance is
+     * still running while the new manager dispatches.
+     */
+    private boolean isAuthorizedAction(String action) {
+        if (action == null) return false;
+        ShizuPosedManagerApp app = ShizuPosedManagerApp.getInstance();
+        if (app != null && action.equals(
+                ShizuPosedManagerApp.actionShizukuAuthorized())) {
+            return true;
+        }
+        // Legacy literal: covers the cloak's install-and-switch
+        // window, where the old service instance has the old
+        // package name but the new manager (already installed)
+        // sends the new action. The legacy action is still
+        // recognized so the old service doesn't miss the
+        // authorization signal mid-transition.
+        return action.equals(
+            "com.shizuposed.manager.ACTION_SHIZUKU_AUTHORIZED");
+    }
+
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        // Foreground FIRST, before any other work. onStartCommand
-        // can be called after a service restart, where the 5-second
-        // FGS window is already ticking.
         try {
             startForeground(NOTIFICATION_ID,
                 buildNotification("Service running"));
@@ -517,11 +527,10 @@ public class ShizuPosedService extends Service {
         if (workerHandler == null) {
             setupWorkerInfrastructure();
         }
-   
+
         if (workerHandler == null) {
             if (intent != null
-                    && ShizuPosedManagerApp.ACTION_SHIZUKU_AUTHORIZED
-                        .equals(intent.getAction())) {
+                    && isAuthorizedAction(intent.getAction())) {
                 if (logger != null) {
                     logger.i("ACTION_SHIZUKU_AUTHORIZED arrived before "
                         + "worker ready — will dispatch after setup");
@@ -536,12 +545,17 @@ public class ShizuPosedService extends Service {
                 return START_NOT_STICKY;
             }
 
-            switch (action) {
-                case ShizuPosedManagerApp.ACTION_SHIZUKU_AUTHORIZED:
-                    logger.i("ACTION_SHIZUKU_AUTHORIZED received");
-                    onShizukuAuthorized();
-                    break;
+            // The authorization action is handled BEFORE the
+            // switch, because its case label must be a
+            // compile-time constant and the value is now derived
+            // at runtime. Everything else stays in the switch.
+            if (isAuthorizedAction(action)) {
+                logger.i("ACTION_SHIZUKU_AUTHORIZED received");
+                onShizukuAuthorized();
+                return START_NOT_STICKY;
+            }
 
+            switch (action) {
                 case ACTION_ENSURE_RUNNING:
                     logger.i("ACTION_ENSURE_RUNNING received");
                     onEnsureRunning();
@@ -819,24 +833,6 @@ public class ShizuPosedService extends Service {
         return null;
     }
 
-    /**
-     * Write a Settings.Global value through the manager's own
-     * ContentResolver, then read it back to confirm the write
-     * actually took.
-     *
-     * The read-back is important because some ROMs (and some
-     * banking apps in their own anti-tamper logic) will revert
-     * development_settings_enabled / adb_enabled shortly after the
-     * write. When that happens, putInt returns true, but a read a
-     * few ms later returns the old value. Logging the mismatch
-     * makes it visible instead of silently letting the disable
-     * evaporate.
-     *
-     * Direct-only. No shell fallback, ever — writing adb_enabled
-     * over Shizuku tears down the ADB transport and kills
-     * Shizuku's binder, which is what the banking app was
-     * detecting.
-     */
     private boolean writeGlobalSetting(String key, String value) {
         try {
             int intValue = -1;
@@ -870,8 +866,6 @@ public class ShizuPosedService extends Service {
                     + "process");
             }
 
-            // Read back to confirm the value stuck. A ROM or
-            // another process may have reverted it.
             String after = readGlobalSetting(key);
             if (after != null && !after.equals(value)) {
                 logger.w("writeGlobalSetting: " + key + " write to "
@@ -911,7 +905,6 @@ public class ShizuPosedService extends Service {
 
         String pkg = getPackageName();
 
-        // Step 1: pm grant.
         try {
             ShellUtils.CommandResult r = shizukuHelper.executeCommand(
                 "pm grant " + pkg
@@ -931,14 +924,11 @@ public class ShizuPosedService extends Service {
                 + "failed: " + t.getMessage());
         }
 
-        // Step 2: direct write probe. Sets sWriteSecureEffective.
-        // Uses a key that always exists and is inert when rewritten
-        // to its own value.
         try {
             final String probeKey = "wifi_sleep_policy";
             String current = Settings.Global.getString(
                 getContentResolver(), probeKey);
-            int value = 2; // WIFI_SLEEP_POLICY_NEVER
+            int value = 2;
             if (current != null) {
                 try {
                     value = Integer.parseInt(current);
@@ -1127,14 +1117,22 @@ public class ShizuPosedService extends Service {
                     + "re-run this diagnostic.\n");
             }
 
+            // Derive the authority at runtime. On a cloaked
+            // install, the authority is <cloakedPackage>.status,
+            // not the canonical one. Print the actual current
+            // authority so the module author can copy it into
+            // their <queries> block.
+            String authority = getStatusAuthority();
             sb.append("  Manifest <queries> check: not queryable from here.\n");
             sb.append("  → On Android 11+, the module must declare:\n");
             sb.append("      <queries>\n");
-            sb.append("        <provider android:authorities="
-                + "\"com.shizuposed.manager.status\" />\n");
+            sb.append("        <provider android:authorities=\"")
+              .append(authority).append("\" />\n");
             sb.append("      </queries>\n");
             sb.append("    Without it, XposedBridge.isModuleActive returns "
                 + "false regardless of marker state.\n");
+            sb.append("    (This install's authority is ")
+              .append(authority).append(".)\n");
 
         } catch (Throwable t) {
             sb.append("  Diagnostic failed: ")
@@ -1502,6 +1500,29 @@ public class ShizuPosedService extends Service {
     // NATIVE LIBRARY DEPLOYMENT
     // ═════════════════════════════════════════════════════════════
 
+    public void undeploySyskuLibIfGateAbsent() {
+        if (!shizukuHelper.isAuthorized()) return;
+
+        String base = resolveShellBaseDir();
+        if (base == null) return;
+
+        if (isSyskuGateLive(base)) {
+            logger.d("undeploySyskuLibIfGateAbsent: gate live — keeping .so");
+            return;
+        }
+
+        try {
+            String libsDir = shellPath(base, SUB_DIR_LIBS);
+            ShellUtils.CommandResult r = shizukuHelper.executeCommand(
+                "rm -f " + libsDir + "/" + LIB_SYSKU);
+            if (r != null && r.isSuccess()) {
+                logger.i("libsysku.so removed from shell side — gate absent");
+            }
+        } catch (Throwable t) {
+            logger.w("undeploySyskuLibIfGateAbsent failed: " + t.getMessage());
+        }
+    }
+
     private boolean deployNativeLibsToShellDir() {
         if (!shizukuHelper.isAuthorized()) {
             logger.w("Cannot deploy native libs: Shizuku not authorized");
@@ -1535,6 +1556,37 @@ public class ShizuPosedService extends Service {
             boolean bridgeOk = pushOneLib(LIB_XSTEALTH_BRIDGE,
                 libsDir + "/" + LIB_XSTEALTH_BRIDGE);
 
+            boolean syskuOk = false;
+            boolean syskuAttempted = false;
+            try {
+                boolean syskuEnabled =
+                    SyskuController.readSyskuStateEnabled(base);
+                if (syskuEnabled) {
+                    syskuAttempted = true;
+                    syskuOk = pushOneLib(LIB_SYSKU,
+                        libsDir + "/" + LIB_SYSKU);
+                    if (!syskuOk) {
+                        logger.w("libsysku.so push failed even though "
+                            + "state.json says enabled=true — syscall "
+                            + "interposer will be unavailable for this "
+                            + "deploy");
+                    }
+                } else {
+                    ShellUtils.CommandResult rm =
+                        shizukuHelper.executeCommand(
+                            "rm -f " + libsDir + "/" + LIB_SYSKU);
+                    if (rm != null && rm.isSuccess()) {
+                        logger.d("libsysku.so removed — state.json says "
+                            + "disabled");
+                    } else {
+                        logger.d("libsysku.so not present and state.json "
+                            + "says disabled — nothing to remove");
+                    }
+                }
+            } catch (Throwable t) {
+                logger.w("libsysku.so deploy check threw: " + t.getMessage());
+            }
+
             if (!amiruOk && !szpOk && !xsOk && !xsNextOk && !csOk) {
                 logger.e("No native libs deployed");
                 return false;
@@ -1545,6 +1597,12 @@ public class ShizuPosedService extends Service {
             if (!xsNextOk) logger.w("libxstealth_next.so not deployed");
             if (!csOk)     logger.w("libcallsite.so not deployed");
             if (!bridgeOk) logger.w("libxstealth_bridge.so not deployed");
+            if (syskuAttempted && !syskuOk) {
+                logger.w("libsysku.so not deployed (gate live but push failed)");
+            } else if (!syskuAttempted) {
+                logger.i("libsysku.so skipped — gate.live absent "
+                    + "(Sysku disabled or module not running)");
+            }
 
             logger.i("Native libs deployed to: " + libsDir);
             libsDeployed.set(true);
@@ -1552,6 +1610,67 @@ public class ShizuPosedService extends Service {
 
         } catch (Exception e) {
             logger.e("deployNativeLibsToShellDir error: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private boolean isSyskuGateLive(String base) {
+        if (base == null || base.isEmpty()) return false;
+
+        String gatePath = base + "/sysku/gate.live";
+        try {
+            String script = "if [ -f \"" + gatePath + "\" ]; then "
+                + "  echo TS=$(stat -c %Y \"" + gatePath + "\" 2>/dev/null"
+                + "        || echo 0); "
+                + "  echo SIZE=$(stat -c %s \"" + gatePath + "\" 2>/dev/null"
+                + "        || echo 0); "
+                + "else "
+                + "  echo TS=0; echo SIZE=0; "
+                + "fi";
+
+            ShellUtils.CommandResult r = shizukuHelper.executeCommand(
+                ABS_SH + " -c '" + script.replace("'", "'\\''") + "'");
+
+            if (r == null || !r.isSuccess() || r.getStdoutString() == null) {
+                logger.d("isSyskuGateLive: stat failed — treating gate as absent");
+                return false;
+            }
+
+            long tsSec = 0;
+            long size = 0;
+            for (String line : r.getStdoutString().split("\n")) {
+                String t = line.trim();
+                if (t.startsWith("TS=")) {
+                    try { tsSec = Long.parseLong(t.substring(3)); }
+                    catch (NumberFormatException ignored) {}
+                } else if (t.startsWith("SIZE=")) {
+                    try { size = Long.parseLong(t.substring(5)); }
+                    catch (NumberFormatException ignored) {}
+                }
+            }
+
+            if (tsSec <= 0 || size <= 0) {
+                logger.d("isSyskuGateLive: gate.live missing or empty");
+                return false;
+            }
+
+            long ageMs = System.currentTimeMillis() - (tsSec * 1000L);
+            if (ageMs < 0) {
+                logger.d("isSyskuGateLive: gate mtime is in the future "
+                    + "(ageMs=" + ageMs + ") — assuming live");
+                return true;
+            }
+            if (ageMs > 5 * 60 * 1000L) {
+                logger.d("isSyskuGateLive: gate.live stale (ageMs="
+                    + ageMs + ") — treating as absent");
+                return false;
+            }
+
+            logger.d("isSyskuGateLive: gate.live live (ageMs=" + ageMs + ")");
+            return true;
+
+        } catch (Throwable t) {
+            logger.d("isSyskuGateLive threw: " + t.getMessage());
             return false;
         }
     }
@@ -1683,6 +1802,7 @@ public class ShizuPosedService extends Service {
             LIB_SHIZUPOSED,
             LIB_AMIRU,
             LIB_CALLSITE,
+            LIB_SYSKU,
         };
 
         try {
@@ -2625,6 +2745,24 @@ public class ShizuPosedService extends Service {
         }
     }
 
+    /**
+     * Return this install's status provider authority.
+     *
+     * Derived from getPackageName() at call time, NOT from a
+     * hardcoded literal. After a cloak, the manifest's
+     * ModuleStatusProvider authority is rewritten to
+     * <cloakedPackage>.status by ManagerCloak, so the runtime
+     * lookup must reflect the current package.
+     *
+     * Order:
+     *   1. PackageManager lookup of this package's providers —
+     *      authoritative, since it reads the *installed* manifest.
+     *   2. getPackageName() + ".status" — fallback if the
+     *      provider lookup fails (e.g. before the package is
+     *      fully registered).
+     *   3. The canonical literal — ONLY as a last resort, never
+     *      as the steady-state answer.
+     */
     private String getStatusAuthority() {
         try {
             android.content.pm.PackageInfo info = getPackageManager()
@@ -2640,8 +2778,14 @@ public class ShizuPosedService extends Service {
             }
         } catch (Throwable t) {
             if (logger != null) {
-                logger.d("getStatusAuthority failed: " + t.getMessage());
+                logger.d("getStatusAuthority PackageManager lookup failed: "
+                    + t.getMessage());
             }
+        }
+        // Fallback: derive from the current package name.
+        String pkg = getPackageName();
+        if (pkg != null && !pkg.isEmpty()) {
+            return pkg + ".status";
         }
         return "com.shizuposed.manager.status";
     }

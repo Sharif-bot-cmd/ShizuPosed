@@ -44,9 +44,20 @@ import rikka.sui.Sui;
  *      binaries itself, but canRead() confirms the path exists,
  *      and Shizuku's shell will still run it on the launch.
  *
- * This resolves on real Android devices and removes any dependency
- * on how a particular Shizuku fork implements provider-side binary
- * lookup.
+ * EXECUTE COMMAND — PIPE SAFETY
+ * -----------------------------
+ * The previous implementation read stdout to EOF, then stderr
+ * to EOF. If a command writes enough to fill the stderr pipe
+ * (64 KB on Linux) while the reader is still draining stdout,
+ * the process blocks on its stderr write and the reader blocks
+ * on its stdout read. Neither side moves. The command "hangs"
+ * until the process is killed.
+ *
+ * The fix merges stderr into stdout with `2>&1` and reads a
+ * single stream. There is no second pipe to fill, so the
+ * deadlock cannot occur. The trade-off is that result.stderr
+ * is always empty — callers that use getStderrString() for
+ * diagnostics still see the output, it's just in stdout.
  */
 public class ShizukuHelper {
     private static final String TAG = "ShizukuHelper";
@@ -420,17 +431,6 @@ public class ShizukuHelper {
         }
     }
 
-    /**
-     * Post the service start to the main thread.
-     *
-     * ShizuPosedManagerApp.autoStartService() internally calls
-     * startForegroundService, which must run on the main thread.
-     * The previous version wrapped the call in a lambda that was
-     * never posted — the outer if-condition was inside the lambda's
-     * body, but the lambda itself was constructed and discarded. So
-     * the service was never actually started from here. The call
-     * now goes directly through the Handler.
-     */
     private void autoStartServiceIfPossible() {
         if (!inAutoStart.compareAndSet(false, true)) return;
         try {
@@ -569,6 +569,19 @@ public class ShizukuHelper {
         }
     }
 
+    /**
+     * Execute a shell command via Shizuku.
+     *
+     * Merges stderr into stdout with `2>&1` and reads a single
+     * stream. This avoids the classic pipe deadlock where a
+     * command writes to both pipes and one fills while the
+     * reader is draining the other. result.stderr is always
+     * empty; all output (including failures) is in result.stdout.
+     *
+     * Callers that used getStderrString() for diagnostics should
+     * use getStdoutString() instead — it now contains the merged
+     * output.
+     */
     public ShellUtils.CommandResult executeCommand(String command) {
         ShellUtils.CommandResult result = new ShellUtils.CommandResult();
         if (!isAvailable() || !isAuthorized) {
@@ -578,15 +591,18 @@ public class ShizukuHelper {
         }
         Process process = null;
         try {
-            process = spawnShellViaAidl(new String[]{"sh", "-c", command}, null, null);
-            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            BufferedReader errorReader = new BufferedReader(new InputStreamReader(process.getErrorStream()));
+            // 2>&1 merges stderr into stdout so a single reader
+            // drains both streams. No second pipe, no deadlock.
+            process = spawnShellViaAidl(
+                new String[]{"sh", "-c", command + " 2>&1"}, null, null);
+            BufferedReader reader = new BufferedReader(
+                new InputStreamReader(process.getInputStream()));
             String line;
-            while ((line = reader.readLine()) != null) result.stdout.add(line);
-            while ((line = errorReader.readLine()) != null) result.stderr.add(line);
+            while ((line = reader.readLine()) != null) {
+                result.stdout.add(line);
+            }
             result.exitCode = process.waitFor();
             reader.close();
-            errorReader.close();
         } catch (Exception e) {
             logger.e("Command execution failed: " + e.getMessage());
             result.stderr.add(e.getMessage());

@@ -1,8 +1,12 @@
 package com.shizuposed.manager.ui;
 
+import android.app.ActivityManager;
 import android.content.Context;
+import android.content.Intent;
+import android.content.pm.ActivityInfo;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.graphics.drawable.Drawable;
 import android.os.Bundle;
 import android.os.Handler;
@@ -52,85 +56,67 @@ import java.util.concurrent.Executors;
  * Selected packages are written to XStealthPrefs when the user
  * taps "Save". On dismiss-without-save, nothing changes.
  *
- * NOTIFYING THE PARENT
- * --------------------
- * Both Save and Cancel set a fragment result before dismissing.
- * This is deliberate: BottomSheetDialogFragment does not reliably
- * resume the parent fragment when a child dialog dismisses — the
- * parent never paused, so onResume doesn't fire. The fragment
- * result is the reliable signal that lets the parent refresh its
- * scope summary and restart the foreground monitor.
+ * SYSTEM APPS WITH DEDICATED UIDs
+ * -------------------------------
+ * A preinstalled app that the OEM assigned a uid >= 10000 is a
+ * normal userspace target. The shell can setuid to it, so the
+ * framework can hook it. These are listed, with the "System"
+ * chip.
  *
- * The result bundle is empty. The parent reads the current scope
- * from XStealthPrefs, which this sheet just wrote.
+ * FILTERED OUT
+ * ------------
+ *   • ShizuPosed's own package.
+ *
+ *   • Packages with uid < 10000 — SYSTEM_UID (1000) and the
+ *     reserved system UID pool (1001-1999). These are the packages
+ *     the shell UID cannot setuid to, so a smart-foreground scope
+ *     entry for them would never fire.
+ *
+ *   • ANY package (system or user, any uid) that exposes neither a
+ *     user-facing UI nor a running process. The monitor can never
+ *     observe such a package come to the foreground, so it is
+ *     skipped. See hasNoUiAndNoProcess().
+ *
+ * NOT FILTERED
+ * ------------
+ *   • Packages with a launcher activity, system or user.
+ *
+ *   • Packages with no launcher activity but a live background
+ *     process. The process probe says they are reachable, so they
+ *     stay listed.
  *
  * ASYNC LOADING
  * -------------
  * getInstalledApplications + getApplicationLabel + getApplicationIcon
- * take 2–3 seconds on a device with 200+ packages. That work has to
+ * take 2-3 seconds on a device with 200+ packages. That work has to
  * happen off the UI thread, because otherwise the sheet doesn't
- * appear until it completes — the user sees a blank screen for a
- * couple of seconds before the picker opens.
+ * appear until it completes.
  *
- * The sheet now appears immediately. onViewCreated seeds the
- * selected set, builds the adapter with an empty list, and posts
- * the loading to a background thread. The adapter renders a single
- * "Loading…" row while mLoading is true. When the load finishes,
- * mLoading flips to false, mAllApps is populated, rebuildFiltered
- * runs, and notifyDataSetChanged swaps the loading row for the
- * real list.
- *
- * The user can dismiss the sheet at any point. If the activity
- * is torn down before the background load finishes, the result is
- * dropped — no crash, no leak.
- *
- * FILTERED OUT
- * ------------
- *   • ShizuPosed's own package
- *   • Packages with uid < 10000 — SYSTEM_UID (1000) and the
- *     reserved system UID pool (1001-1999). These are the packages
- *     the shell UID cannot setuid to, so a smart-foreground scope
- *     entry for them would never fire. System UI, Settings, Phone,
- *     Bluetooth, NFC, Shell, and system_server all live there.
- *
- * NOT FILTERED
- * ------------
- *   • System apps with their own app UID (>= 10000). A preinstalled
- *     app that the OEM assigned a dedicated uid is a normal
- *     userspace target from the shell's point of view. Those are
- *     still listed, marked with a "System" chip.
+ * NOTIFYING THE PARENT
+ * --------------------
+ * Both Save and Cancel set a fragment result before dismissing.
  */
 public class SmartForegroundScopeSheet extends BottomSheetDialogFragment {
 
     private static final String TAG = "SmartFgScope";
 
     /**
-     * FragmentResult key. The parent sheet registers a
-     * FragmentResultListener for this key. When the picker is
-     * dismissed — either by Save or by Cancel — the listener
-     * fires and the parent updates its smart-foreground UI and
-     * restarts the monitor.
+     * The uid boundary below which the shell cannot assume the
+     * target's identity. SYSTEM_UID is 1000; the reserved system
+     * UID pool is 1001-1999. Ordinary app UIDs start at 10000.
      */
+    private static final int FIRST_APP_UID = 10000;
+
     public static final String RESULT_KEY = "smart_fg_scope_result";
 
-    /** The working set while the sheet is open. */
     private final Set<String> mSelected = new HashSet<>();
 
-    /** The full list, filtered by the search field. */
     private final List<AppEntry> mAllApps = new ArrayList<>();
     private final List<AppEntry> mFiltered = new ArrayList<>();
 
-    /** True while the background app load is running. The adapter
-     *  renders a single "Loading…" row in this state. */
     private volatile boolean mLoading = true;
-
-    /** True if the sheet has been destroyed. The background task
-     *  checks this before posting back to the main thread, so a
-     *  late result is dropped rather than crashing. */
     private volatile boolean mDestroyed = false;
 
-    /** Single-thread executor for the background load. Daemon so
-     *  it doesn't keep the process alive. Shutdown in onDestroyView. */
     private ExecutorService mLoadExecutor;
 
     private AppAdapter mAdapter;
@@ -156,12 +142,9 @@ public class SmartForegroundScopeSheet extends BottomSheetDialogFragment {
         if (!isAdded()) return;
         Context ctx = requireContext();
 
-        // Seed the working set from preferences. Cheap, main thread.
         Set<String> initial = XStealthPrefs.getSmartForegroundScope(ctx);
         if (initial != null) mSelected.addAll(initial);
 
-        // Set up the RecyclerView with an empty list. The adapter
-        // renders the "Loading…" row because mLoading is true.
         RecyclerView list = view.findViewById(R.id.recyclerApps);
         if (list != null) {
             list.setLayoutManager(new LinearLayoutManager(ctx));
@@ -169,9 +152,6 @@ public class SmartForegroundScopeSheet extends BottomSheetDialogFragment {
             list.setAdapter(mAdapter);
         }
 
-        // Search field. Wired up before the load finishes so the
-        // user can start typing immediately. rebuildFiltered is a
-        // no-op while mAllApps is empty.
         EditText search = view.findViewById(R.id.editSearch);
         if (search != null) {
             search.addTextChangedListener(new TextWatcher() {
@@ -185,9 +165,6 @@ public class SmartForegroundScopeSheet extends BottomSheetDialogFragment {
             });
         }
 
-        // Select all / clear. Both operate on mFiltered, which is
-        // empty while loading — clicking them during the load does
-        // nothing, which is the right behavior.
         MaterialButton selectAll = view.findViewById(R.id.buttonSelectAll);
         if (selectAll != null) {
             selectAll.setOnClickListener(v -> {
@@ -206,15 +183,11 @@ public class SmartForegroundScopeSheet extends BottomSheetDialogFragment {
             });
         }
 
-        // Cancel.
         MaterialButton cancel = view.findViewById(R.id.buttonCancel);
         if (cancel != null) {
-            cancel.setOnClickListener(v -> {
-                setResultAndDismiss();
-            });
+            cancel.setOnClickListener(v -> setResultAndDismiss());
         }
 
-        // Save.
         MaterialButton save = view.findViewById(R.id.buttonSave);
         if (save != null) {
             save.setOnClickListener(v -> {
@@ -233,28 +206,15 @@ public class SmartForegroundScopeSheet extends BottomSheetDialogFragment {
                         "Could not save scope",
                         Toast.LENGTH_SHORT).show();
                 }
-
                 setResultAndDismiss();
             });
         }
 
         updateCount(view);
 
-        // Kick off the background load. The sheet is already
-        // visible; the adapter is showing the "Loading…" row.
         startAppLoad(ctx);
     }
 
-    /**
-     * Load the installed-app list on a background thread and hand
-     * it back to the adapter when it's ready.
-     *
-     * The three expensive calls — getInstalledApplications,
-     * getApplicationLabel, getApplicationIcon — run here, off the
-     * UI thread. The result posts back to the main thread through
-     * mMainHandler, checked against mDestroyed so a late result
-     * from a dismissed sheet is dropped.
-     */
     private void startAppLoad(Context ctx) {
         final Context appCtx = ctx.getApplicationContext();
         mLoadExecutor = Executors.newSingleThreadExecutor(r -> {
@@ -296,30 +256,39 @@ public class SmartForegroundScopeSheet extends BottomSheetDialogFragment {
         });
     }
 
-    /**
-     * Blocking version of the load. Runs on the background thread.
-     * Touches only appCtx and the package manager, so it's safe to
-     * call from any thread.
-     */
     private List<AppEntry> loadAppsBlocking(Context appCtx) {
         List<AppEntry> out = new ArrayList<>();
         PackageManager pm = appCtx.getPackageManager();
 
+        // MATCH_DISABLED_COMPONENTS makes the query return
+        // preinstalled apps that are flagged as disabled until
+        // first launch. Without it, some OEM preinstalls with
+        // dedicated uids are missing from the list even though
+        // they are installed and hookable.
         List<ApplicationInfo> apps = pm.getInstalledApplications(
-            PackageManager.GET_META_DATA);
+            PackageManager.GET_META_DATA | PackageManager.MATCH_DISABLED_COMPONENTS);
         if (apps == null) return out;
 
         String self = appCtx.getPackageName();
+
+        Set<String> runningProcs = snapshotRunningProcessNames(appCtx);
+
+        int droppedProtected = 0;
+        int droppedNoUi = 0;
 
         for (ApplicationInfo ai : apps) {
             if (ai == null || ai.packageName == null) continue;
             if (self.equals(ai.packageName)) continue;
 
-            // Skip protected-UID packages. The shell UID cannot
-            // setuid to uid 1000 or the reserved pool 1001-1999.
             int uid = ai.uid;
+
+            // Protected-UID packages: the shell cannot setuid to
+            // them, so a scope entry would never fire.
             if (uid > 0) {
-                if (uid < 10000) continue;
+                if (uid < FIRST_APP_UID) {
+                    droppedProtected++;
+                    continue;
+                }
             } else {
                 boolean system = (ai.flags
                     & (ApplicationInfo.FLAG_SYSTEM
@@ -329,9 +298,21 @@ public class SmartForegroundScopeSheet extends BottomSheetDialogFragment {
                     if (pkg.startsWith("android.")
                             || pkg.startsWith("com.android.")
                             || pkg.startsWith("com.google.android.")) {
+                        droppedProtected++;
                         continue;
                     }
                 }
+            }
+
+            // Skip ANY package (system or user, any uid) that has
+            // neither a launcher UI nor a live process. The
+            // foreground monitor can never observe such a package,
+            // so listing it is noise.
+            if (hasNoUiAndNoProcess(ai, pm, runningProcs)) {
+                droppedNoUi++;
+                Log.d(TAG, "dropped ui-less idle pkg: "
+                    + ai.packageName + " (uid=" + ai.uid + ")");
+                continue;
             }
 
             CharSequence labelCs = pm.getApplicationLabel(ai);
@@ -353,12 +334,109 @@ public class SmartForegroundScopeSheet extends BottomSheetDialogFragment {
             out.add(e);
         }
 
-        // Sort by label using the locale collator.
+        Log.d(TAG, "loadAppsBlocking: kept=" + out.size()
+            + " droppedProtected=" + droppedProtected
+            + " droppedNoUi=" + droppedNoUi);
+
         final Collator col = Collator.getInstance(Locale.getDefault());
         col.setStrength(Collator.PRIMARY);
         Collections.sort(out, (a, b) -> col.compare(a.label, b.label));
 
         return out;
+    }
+
+    private Set<String> snapshotRunningProcessNames(Context appCtx) {
+        Set<String> names = new HashSet<>();
+        try {
+            ActivityManager am = (ActivityManager)
+                appCtx.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) return names;
+            List<ActivityManager.RunningAppProcessInfo> procs =
+                am.getRunningAppProcesses();
+            if (procs == null) return names;
+            for (ActivityManager.RunningAppProcessInfo p : procs) {
+                if (p == null) continue;
+                if (p.processName != null) names.add(p.processName);
+                if (p.pkgList != null) {
+                    for (String pkg : p.pkgList) {
+                        if (pkg != null) names.add(pkg);
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.d(TAG, "snapshotRunningProcessNames failed: "
+                + t.getMessage());
+        }
+        return names;
+    }
+
+    /**
+     * True if this package has no user-facing UI AND no process
+     * currently running. Applies to BOTH system and user packages,
+     * regardless of uid. The foreground monitor can never observe
+     * such a package, so it is skipped.
+     *
+     * "Has UI"  = at least one exported ACTION_MAIN + CATEGORY_LAUNCHER
+     *             activity (the same signal the launcher uses).
+     * "Has proc" = the package's processName or packageName appears in
+     *             the ActivityManager snapshot.
+     *
+     * Fails open: if a probe throws, the package is KEPT.
+     */
+    private boolean hasNoUiAndNoProcess(ApplicationInfo ai,
+                                        PackageManager pm,
+                                        Set<String> runningProcs) {
+        try {
+            // A live process keeps the package regardless of UI.
+            if (ai.processName != null
+                    && runningProcs.contains(ai.processName)) {
+                return false;
+            }
+            if (runningProcs.contains(ai.packageName)) {
+                return false;
+            }
+
+            // No process. Keep it if it has a launcher UI.
+            return !hasLauncherActivity(ai.packageName, pm);
+        } catch (Throwable t) {
+            // Fail open: keep the package.
+            return false;
+        }
+    }
+
+    /**
+     * True if the package exposes at least one activity that a
+     * launcher would show: ACTION_MAIN + CATEGORY_LAUNCHER. This
+     * is the same signal the launcher uses, so it is the most
+     * reliable "has a user-facing UI" test available without
+     * extra permission.
+     *
+     * Fails open: on error, returns true so we never hide a
+     * package that might actually be useful.
+     */
+    private boolean hasLauncherActivity(String packageName,
+                                        PackageManager pm) {
+        try {
+            Intent intent = new Intent(Intent.ACTION_MAIN);
+            intent.addCategory(Intent.CATEGORY_LAUNCHER);
+            intent.setPackage(packageName);
+            List<ResolveInfo> ris = pm.queryIntentActivities(
+                intent, 0);
+            if (ris == null || ris.isEmpty()) return false;
+            for (ResolveInfo ri : ris) {
+                if (ri == null) continue;
+                ActivityInfo a = ri.activityInfo;
+                if (a == null) continue;
+                // Exported + has a real class name is the launcher
+                // contract. A non-exported activity can't be
+                // started by the launcher, so it doesn't count.
+                if (a.exported && a.name != null) return true;
+            }
+            return false;
+        } catch (Throwable t) {
+            // Fail open: assume it has UI so we never hide it.
+            return true;
+        }
     }
 
     private void rebuildFiltered(String query) {

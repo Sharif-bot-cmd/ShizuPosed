@@ -63,6 +63,42 @@
                 android:maxLines="1"
                 android:ellipsize="middle" />
 
+            <!-- ═══ NEW: API version badge row ═══
+                 Hidden when the module declares no API version.
+                 The badge is a small "API 93" pill next to an
+                 optional "· target 100" suffix. -->
+            <LinearLayout
+                android:id="@+id/layoutApiBadge"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginTop="2dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:id="@+id/tvApiVersion"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="API 93"
+                    android:textSize="11sp"
+                    android:textStyle="bold"
+                    android:textColor="?attr/colorPrimary"
+                    android:background="?attr/colorSecondaryContainer"
+                    android:paddingHorizontal="6dp"
+                    android:paddingVertical="1dp" />
+
+                <TextView
+                    android:id="@+id/tvTargetApi"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:text="· target 100"
+                    android:textSize="11sp"
+                    android:textColor="?android:attr/textColorSecondary"
+                    android:visibility="gone" />
+            </LinearLayout>
+
             <!-- Enable switch row -->
             <LinearLayout
                 android:layout_width="match_parent"

@@ -17,3 +17,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "ShizuPosedManager"
 include ':app'
+include ':apkzlib'
+project(':apkzlib').projectDir = file('apkzlib')

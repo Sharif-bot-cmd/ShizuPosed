@@ -17,6 +17,37 @@ import de.robv.android.xposed.XC_MethodHook;
  * HookDispatcher
  *
  * Sits between XposedHookBridge and the actual hook backends.
+ *
+ * ENABLE / DISABLE
+ * ----------------
+ * A backend can be present but disabled. Disabled backends are
+ * skipped during dispatch — they still occupy their slot in the
+ * ordering, so re-enabling one doesn't change which backend wins
+ * a tie. This is how Sysku is shipped: the .so is present, the
+ * user hasn't turned it on, so dispatch behaves exactly as if
+ * Sysku weren't there.
+ *
+ * The enable state is exposed via setBackendEnabled(name, on)
+ * and isBackendEnabled(name). Both are safe to call before
+ * initialize() — the flag is stored on the Backend entry, not
+ * on the chosen primary.
+ *
+ * LIBXPOSED
+ * ---------
+ * No code here is specific to libxposed. A libxposed hook is
+ * installed as a LibXposedHookerAdapter (an XC_MethodHook
+ * subclass), and the dispatcher dispatches XC_MethodHook the
+ * same way for both APIs. The HookHandle.replaceHook(Hooker)
+ * swap mutates the adapter in place — the backend holds the
+ * adapter by reference, so the next invocation dispatches to
+ * the new hooker without any dispatcher involvement.
+ *
+ * The one requirement replaceHook imposes on backends: they
+ * must store the callback by reference, not by copy. Every
+ * current backend does. A future backend that wraps the
+ * callback in another XC_MethodHook (to add logging, timing,
+ * etc.) must preserve the reference, or replaceHook will
+ * silently no-op for hooks installed by that backend.
  */
 public final class HookDispatcher {
 
@@ -53,10 +84,14 @@ public final class HookDispatcher {
         public final AtomicInteger ctorDeclined  = new AtomicInteger();
         public final AtomicInteger ctorFailed    = new AtomicInteger();
 
+        /** Skipped because the backend was disabled by the user. */
+        public final AtomicInteger skippedDisabled = new AtomicInteger();
+
         @Override public String toString() {
             return "installed=" + installed.get()
                     + " declined=" + declined.get()
                     + " failed=" + failed.get()
+                    + " skipped(disabled)=" + skippedDisabled.get()
                     + " | ctor installed=" + ctorInstalled.get()
                     + " declined=" + ctorDeclined.get()
                     + " failed=" + ctorFailed.get();
@@ -65,6 +100,15 @@ public final class HookDispatcher {
 
     private final List<Backend> backends = new CopyOnWriteArrayList<>();
     private final ConcurrentHashMap<Backend, BackendStats> stats =
+            new ConcurrentHashMap<>();
+
+    /**
+     * Per-backend enable state. Key is backend.name(), value is
+     * whether it's enabled. A backend with no entry defaults to
+     * enabled — this preserves existing behavior for every backend
+     * that doesn't opt into the Sysku pattern.
+     */
+    private final ConcurrentHashMap<String, Boolean> enabledByName =
             new ConcurrentHashMap<>();
 
     private volatile Backend primary;
@@ -100,10 +144,30 @@ public final class HookDispatcher {
     }
 
     // ─────────────────────────────────────────────────────────────
+    // ENABLE / DISABLE
+    // ─────────────────────────────────────────────────────────────
+
+    public void setBackendEnabled(String name, boolean enabled) {
+        if (name == null || name.isEmpty()) return;
+        enabledByName.put(name, enabled);
+        log("Backend " + name + " "
+                + (enabled ? "enabled" : "disabled") + " by user");
+    }
+
+    public boolean isBackendEnabled(String name) {
+        if (name == null) return true;
+        Boolean v = enabledByName.get(name);
+        return v == null || v;
+    }
+
+    public boolean isBackendEnabled(Backend b) {
+        return b == null || isBackendEnabled(b.name());
+    }
+
+    // ─────────────────────────────────────────────────────────────
     // REGISTRATION
     // ─────────────────────────────────────────────────────────────
 
-    /** Register a backend. Order matters — earlier = higher priority. */
     public synchronized void register(Backend backend) {
         if (backend == null) return;
         if (initialized) {
@@ -112,13 +176,10 @@ public final class HookDispatcher {
         }
         backends.add(backend);
         stats.put(backend, new BackendStats());
-        log("Registered backend: " + backend.name());
+        log("Registered backend: " + backend.name()
+                + (isBackendEnabled(backend.name()) ? "" : " (disabled)"));
     }
 
-    /**
-     * Called once after all backends have been registered. Picks the
-     * first one that reports itself available.
-     */
     public synchronized void initialize() {
         if (initialized) return;
         initialized = true;
@@ -129,6 +190,10 @@ public final class HookDispatcher {
         }
 
         for (Backend b : backends) {
+            if (!isBackendEnabled(b)) {
+                log("Backend skipped (disabled): " + b.name());
+                continue;
+            }
             try {
                 if (b.isAvailable()) {
                     primary = b;
@@ -157,7 +222,7 @@ public final class HookDispatcher {
         ensureInitialized();
 
         Backend p = primary;
-        if (p != null && backends.indexOf(p) != 0) {
+        if (p != null && backends.indexOf(p) != 0 && isBackendEnabled(p)) {
             if (tryHook(p, original, callback, true)) return true;
         }
 
@@ -166,7 +231,7 @@ public final class HookDispatcher {
             if (tryHook(b, original, callback, false)) return true;
         }
 
-        if (p != null && backends.indexOf(p) == 0) {
+        if (p != null && backends.indexOf(p) == 0 && isBackendEnabled(p)) {
             if (tryHook(p, original, callback, true)) return true;
         }
 
@@ -183,7 +248,7 @@ public final class HookDispatcher {
         ensureInitialized();
 
         Backend p = primary;
-        if (p != null && backends.indexOf(p) != 0) {
+        if (p != null && backends.indexOf(p) != 0 && isBackendEnabled(p)) {
             if (tryCtorHook(p, original, callback, true)) return true;
         }
 
@@ -192,7 +257,7 @@ public final class HookDispatcher {
             if (tryCtorHook(b, original, callback, false)) return true;
         }
 
-        if (p != null && backends.indexOf(p) == 0) {
+        if (p != null && backends.indexOf(p) == 0 && isBackendEnabled(p)) {
             if (tryCtorHook(p, original, callback, true)) return true;
         }
 
@@ -208,6 +273,12 @@ public final class HookDispatcher {
     private boolean tryHook(Backend b, Method original,
                             XC_MethodHook callback, boolean isPrimary) {
         BackendStats s = stats.get(b);
+
+        if (!isBackendEnabled(b)) {
+            if (s != null) s.skippedDisabled.incrementAndGet();
+            return false;
+        }
+
         try {
             if (b.hook(original, callback)) {
                 if (s != null) s.installed.incrementAndGet();
@@ -240,6 +311,12 @@ public final class HookDispatcher {
     private boolean tryCtorHook(Backend b, Constructor<?> original,
                                 XC_MethodHook callback, boolean isPrimary) {
         BackendStats s = stats.get(b);
+
+        if (!isBackendEnabled(b)) {
+            if (s != null) s.skippedDisabled.incrementAndGet();
+            return false;
+        }
+
         try {
             if (b.hookConstructor(original, callback)) {
                 if (s != null) s.ctorInstalled.incrementAndGet();
@@ -269,12 +346,10 @@ public final class HookDispatcher {
     public Backend getPrimary() { return primary; }
     public boolean isInitialized() { return initialized; }
 
-    /** Snapshot of registered backends, in registration order. */
     public List<Backend> getBackends() {
         return Collections.unmodifiableList(new ArrayList<>(backends));
     }
 
-    /** Stats for a backend, or null if it was never registered. */
     public BackendStats getStats(Backend backend) {
         return backend == null ? null : stats.get(backend);
     }
@@ -286,7 +361,9 @@ public final class HookDispatcher {
           .append("):");
         for (Backend b : backends) {
             BackendStats s = stats.get(b);
-            sb.append("\n  ").append(b.name()).append(": ");
+            sb.append("\n  ").append(b.name())
+              .append(isBackendEnabled(b) ? "" : " [disabled]")
+              .append(": ");
             sb.append(s == null ? "(no stats)" : s.toString());
         }
         return sb.toString();

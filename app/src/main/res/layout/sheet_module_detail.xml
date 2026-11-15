@@ -47,6 +47,20 @@
                     android:textSize="12sp"
                     android:textColor="?android:attr/textColorSecondary" />
 
+                <!-- Xposed API version line. Populated by
+                     bindHeader(); hidden when the module declares
+                     no API version. -->
+                <TextView
+                    android:id="@+id/tvApiVersion"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:text="Xposed API 93 · target 100"
+                    android:textSize="12sp"
+                    android:textStyle="bold"
+                    android:textColor="?attr/colorPrimary"
+                    android:visibility="gone" />
+
                 <TextView
                     android:id="@+id/tvModuleStatus"
                     android:layout_width="wrap_content"

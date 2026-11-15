@@ -3,11 +3,9 @@ package com.shizuposed.manager.stealth.checks;
 import com.shizuposed.manager.core.HookEngine;
 
 import java.lang.reflect.Method;
-import java.lang.reflect.Modifier;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
-import java.util.List;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -50,12 +48,38 @@ import de.robv.android.xposed.XposedBridge;
  * CAPTURE TIMING
  * --------------
  *
- * The capture runs when ApiProtectionCheck.install() is called,
- * which is after XStealth's own checks are installed but before
- * any further modifications. In practice this means the frozen
- * list reflects the method count that a detector would see if it
- * looked immediately after the framework started. What changes
- * after that point is invisible to the detector.
+ * The capture has to run *after* a module's entry point has
+ * installed its hooks, but *before* any further hooks land on the
+ * same class. That's not "at ApiProtectionCheck.install()" —
+ * install() runs during bootstrap, before any module's
+ * handleLoadPackage (classic) or onPackageLoaded (libxposed) has
+ * fired. Calling captureDynamicBaselines() from there captures the
+ * empty set.
+ *
+ * The right place is XposedHook.loadModule: after the entry point
+ * returns, call captureDynamicBaselines() once. That captures
+ * every class the just-finished module hooked, so the baseline
+ * reflects the pre-hook state for those classes. The next module's
+ * entry point adds its classes, and so on.
+ *
+ * LIBXPOSED
+ * ---------
+ *
+ * libxposed modules install hooks via HookHandle.intercept(), which
+ * lands in XposedHookBridge.hook() -> HookDispatcher.installHook()
+ * -> HookEngine, the same path classic modules use. The
+ * HookEngine.getHookedClassNames() set therefore includes
+ * libxposed-hooked classes, and captureOne() sees them.
+ *
+ * replaceHook(Hooker) does NOT change the method list of the hooked
+ * class — it swaps the live callback on the same Method object.
+ * getDeclaredMethods() still returns the same array. The frozen
+ * baseline is still correct after a replaceHook, and no further
+ * capture is needed.
+ *
+ * A detector that fingerprints *behavior* (calling the method and
+ * observing that the return value changed after a replaceHook) is
+ * not defended against by this class. That's outside its scope.
  *
  * WHAT THIS DEFENDS
  * -----------------
@@ -90,6 +114,11 @@ import de.robv.android.xposed.XposedBridge;
  *     class. Those methods are visible because they aren't in the
  *     frozen list. In practice, XStealth's hooks are installed
  *     before the freeze, so this is rare.
+ *
+ *   • A libxposed module that calls replaceHook(Hooker) to swap
+ *     the live callback. The method list doesn't change, so the
+ *     frozen baseline is accurate, but a behavior-fingerprinting
+ *     detector would see the swap. Out of scope.
  */
 public final class MethodBaselineCheck {
 
@@ -112,7 +141,15 @@ public final class MethodBaselineCheck {
     private static final Map<String, Method[]> PUBLIC_BASELINE =
         new ConcurrentHashMap<>();
 
-    /** Classes that have already had a baseline captured. */
+    /**
+     * Classes that have already had a baseline captured.
+     *
+     * A class is added only on *success*. If Class.forName() throws
+     * (transient classloader failure, class not yet loadable), the
+     * class is not marked as captured and a later call can retry.
+     * Marking before the try was a bug: a single transient failure
+     * would permanently exclude the class.
+     */
     private static final Set<String> CAPTURED =
         ConcurrentHashMap.newKeySet();
 
@@ -134,30 +171,61 @@ public final class MethodBaselineCheck {
         }
     }
 
+    /**
+     * Capture baselines for every class HookEngine has recorded as
+     * hooked, that hasn't been captured yet.
+     *
+     * Call this from XposedHook.loadModule after each module's
+     * entry point returns. Calling it at ApiProtectionCheck.install()
+     * time captures nothing useful (no hooks exist yet) and is why
+     * the baseline set was empty for module-hooked classes before
+     * the per-module call was added.
+     *
+     * Idempotent: CAPTURED guards re-capture, and only successful
+     * captures are marked, so a transient failure on one class
+     * doesn't lose it for the rest of the process.
+     */
     public static void captureDynamicBaselines(ClassLoader classLoader) {
         try {
             Set<String> hooked = HookEngine.getHookedClassNames();
             if (hooked == null || hooked.isEmpty()) return;
+
+            int newly = 0;
             for (String name : hooked) {
-                captureOne(name, classLoader);
+                if (name == null) continue;
+                if (CAPTURED.contains(name)) continue;
+                if (captureOne(name, classLoader)) newly++;
             }
-            XposedBridge.log(TAG + ": MethodBaselineCheck captured "
-                + hooked.size() + " hooked classes");
+            if (newly > 0) {
+                XposedBridge.log(TAG + ": MethodBaselineCheck captured "
+                    + newly + " new class baselines ("
+                    + hooked.size() + " hooked total, "
+                    + DECLARED_BASELINE.size() + " baselines)");
+            }
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": MethodBaselineCheck dynamic capture "
                 + "failed: " + t.getMessage());
         }
     }
 
-    private static void captureOne(String className, ClassLoader classLoader) {
-        if (className == null || className.isEmpty()) return;
-        if (!CAPTURED.add(className)) return;
+    /**
+     * Capture one class's baseline.
+     *
+     * Returns true if a baseline was captured (or already existed).
+     * Returns false if the class couldn't be loaded.
+     *
+     * IMPORTANT: CAPTURED is added only after the capture succeeds.
+     * Marking it before the try would let a transient
+     * Class.forName() failure permanently exclude the class.
+     */
+    private static boolean captureOne(String className, ClassLoader classLoader) {
+        if (className == null || className.isEmpty()) return false;
+        if (CAPTURED.contains(className)) return true;
+
         try {
             Class<?> clazz = Class.forName(className, false, classLoader);
-            if (clazz == null) return;
+            if (clazz == null) return false;
 
-            // Capture a defensive copy of each method array so
-            // later mutation of the class doesn't affect us.
             Method[] declared = clazz.getDeclaredMethods();
             Method[] publicMethods = null;
             try {
@@ -173,9 +241,18 @@ public final class MethodBaselineCheck {
             if (publicMethods != null) {
                 PUBLIC_BASELINE.put(className, publicMethods.clone());
             }
+
+            // Only mark captured after the put() calls succeed.
+            // If we're here, the arrays were captured (or the
+            // class legitimately has zero methods).
+            CAPTURED.add(className);
+            return true;
         } catch (Throwable ignored) {
             // Class not present, not loadable, or reflection
-            // refused. Skip.
+            // refused. Don't mark as captured — a later call can
+            // retry (e.g. after the class's DexClassLoader is
+            // constructed).
+            return false;
         }
     }
 
@@ -279,6 +356,27 @@ public final class MethodBaselineCheck {
             Method[] v = e.getValue();
             out.put(e.getKey(), v == null ? 0 : v.length);
         }
+        return out;
+    }
+
+    /**
+     * Diagnostic: classes that have been hooked but whose baseline
+     * capture failed (class not loadable, or capture threw before
+     * the put). Empty in the normal case. Non-empty indicates a
+     * classloader issue, not a framework bug.
+     */
+    public static Set<String> pendingCapture() {
+        Set<String> out = new HashSet<>();
+        try {
+            Set<String> hooked = HookEngine.getHookedClassNames();
+            if (hooked != null) {
+                for (String name : hooked) {
+                    if (name != null && !CAPTURED.contains(name)) {
+                        out.add(name);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
         return out;
     }
 }

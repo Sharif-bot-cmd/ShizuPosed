@@ -1,5 +1,26 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!--
+        app_name is retained for any code that reads R.string.app_name
+        (About screen, share intents, accessibility labels). It is NOT
+        what the launcher shows after a cloak:
+
+          • The manifest's <application android:label="..."> is a
+            LITERAL ("ShizuPosed"), not a @string/app_name reference.
+            This is required so the Hide ShizuPosed app flow can patch
+            the launcher label in place (AXML string-pool rewrite,
+            same-length only). A @string/ reference resolves through
+            resources.arsc, which the cloak does not patch.
+
+          • After a cloak, the launcher shows the patched literal
+            (e.g. "Calculator"). The About screen / share intent
+            still shows this resource ("ShizuPosed"), so the two
+            disagree. That's a cosmetic mismatch, not a detection
+            risk.
+
+        If nothing reads R.string.app_name, delete it. If something
+        does, leave it here — the manifest no longer depends on it.
+    -->
     <string name="app_name">ShizuPosed</string>
 
     <!-- Navigation -->
@@ -13,8 +34,18 @@
     <string name="status">Status</string>
     <string name="scoped_apps">Scoped Apps</string>
     <string name="active_modules">Active Modules</string>
+    <!--
+        framework_version_label and framework_version_value are
+        legacy labels from the pre-1.4.x UI. The Home card now
+        shows two rows (Classic API 101, libxposed API 102),
+        populated in code from XposedBridge.getXposedVersion()
+        and LSPosedManager.getLibxposedApiVersion(). These two
+        strings are kept in case any older layout still
+        references them; they are not used by fragment_home.xml
+        as of 1.4.9.
+    -->
     <string name="framework_version_label">Framework API</string>
-    <string name="framework_version_value">93 (LSPosed-compatible)</string>
+    <string name="framework_version_value">101 (classic) / 102 (libxposed)</string>
     <string name="tracked_processes">Tracked Processes</string>
     <string name="total_apps">Total Apps</string>
     <string name="refresh">Refresh</string>
@@ -141,7 +172,14 @@
     <string name="shizuku_status">Shizuku</string>
     <string name="service_status">Service</string>
     <string name="hooked_count">Hooked</string>
-    <string name="settings_version">Post v2.2</string>
+    <!--
+        settings_version was "Post v2.2" — a hardcoded version
+        label from before 1.4.x. The Settings About section now
+        reads BuildConfig.VERSION_NAME at runtime. Left as a
+        placeholder in case a legacy layout still references it;
+        it is not the source of truth.
+    -->
+    <string name="settings_version">1.4.10</string>
     <string name="service_restarted">Service restarted</string>
     <string name="service_restart_failed">Failed to restart service</string>
     <string name="clearing_cache">Clearing cache...</string>

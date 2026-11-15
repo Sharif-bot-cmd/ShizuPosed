@@ -41,6 +41,8 @@ import java.util.zip.ZipFile;
  *   • Scanning APKs for entry points (assets/xposed_init) and caching the
  *     module dex so XposedHook can load it from the shell side.
  *   • Reading assets/scope.list to populate ModuleInfo.recommendedApps.
+ *   • Reading the module's declared Xposed API version (LSPosed-style)
+ *     so the row and detail sheet can show an "API N" badge.
  *
  * UNINSTALL SEMANTICS
  * -------------------
@@ -217,6 +219,29 @@ public class ModuleLoader {
                                     }
                                     logger.i("Corrected hasUi for "
                                         + module.packageName + " -> " + module.hasUi);
+                                }
+                            }
+
+                            // ── Xposed API version refresh ──────────
+                            // Populate apiVersion / targetApiVersion /
+                            // xposedMinVersion for modules that don't
+                            // yet have it cached. Modules installed
+                            // before this field existed have -1 here,
+                            // so they get one re-parse on first load
+                            // after the update, then the values are
+                            // written back to JSON and won't be
+                            // re-read on subsequent loads.
+                            if (module.apiVersion == -1
+                                    && module.xposedMinVersion == -1
+                                    && module.targetApiVersion == -1) {
+                                readModuleApiVersions(module);
+                                if (module.hasApiVersion()) {
+                                    try {
+                                        FileUtils.writeFile(file, gson.toJson(module));
+                                    } catch (Throwable t) {
+                                        logger.d("api version writeback failed for "
+                                            + module.packageName + ": " + t.getMessage());
+                                    }
                                 }
                             }
 
@@ -397,6 +422,9 @@ public class ModuleLoader {
                     context, module.packageName);
             } catch (Throwable ignored) {}
 
+            // Read the module's declared Xposed API versions.
+            readModuleApiVersions(module);
+
             if (module.apkPath != null && new File(module.apkPath).exists()) {
                 File cachedDex = new File(dexCacheDir, module.packageName + ".dex");
                 if (!cachedDex.exists() || cachedDex.length() == 0) {
@@ -445,6 +473,7 @@ public class ModuleLoader {
                 + ", hasUi=" + module.hasUi
                 + ", manual=" + module.manuallyAdded
                 + ", apkPath=" + module.apkPath
+                + ", apiVersion=" + module.apiVersion
                 + ", recommended=" + module.getRecommendedAppCount() + ")");
             return true;
         } catch (Exception e) {
@@ -1146,6 +1175,211 @@ public class ModuleLoader {
         } catch (Exception e) {
             logger.e("Failed to scan APK for " + module.packageName + ": " + e.getMessage());
         }
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // XPOSED API VERSION EXTRACTION
+    // ═════════════════════════════════════════════════════════════════
+
+    /**
+     * Populate module.apiVersion, module.targetApiVersion, and
+     * module.xposedMinVersion from the APK.
+     *
+     * Sources, tried in this order:
+     *
+     *   1. PackageManager meta-data (LSPosed convention):
+     *        <meta-data android:name="xposedminversion"
+     *                   android:value="93"/>
+     *        <meta-data android:name="xposedtargetversion"
+     *                   android:value="100"/>
+     *      Only works if the module is actually installed on the
+     *      device (pm sees it). This is the common case.
+     *
+     *   2. META-INF/xposed/module.prop (EdXposed-era):
+     *        minApiVersion=93
+     *        targetApiVersion=100
+     *      Works for any APK, installed or not.
+     *
+     *   3. Best-effort binary AndroidManifest.xml scan for manually-
+     *      added APKs PackageManager can't see. May fail; leaves the
+     *      fields at -1 when it does.
+     *
+     * Fail-open: any exception leaves the fields at -1 (unknown), so
+     * a broken APK doesn't prevent the module from loading.
+     */
+    private void readModuleApiVersions(ModuleInfo module) {
+        if (module == null || module.apkPath == null) return;
+        File apk = new File(module.apkPath);
+        if (!apk.exists()) return;
+
+        // ── Source 1: module.prop (EdXposed-era) ────────────────
+        try (ZipFile zip = new ZipFile(apk)) {
+            ZipEntry prop = zip.getEntry("META-INF/xposed/module.prop");
+            if (prop != null) {
+                try (InputStream is = zip.getInputStream(prop);
+                     BufferedReader reader = new BufferedReader(
+                         new InputStreamReader(is))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        String t = line.trim();
+                        if (t.startsWith("minApiVersion=")) {
+                            module.xposedMinVersion = parseIntSafe(
+                                t.substring("minApiVersion=".length()).trim(), -1);
+                        } else if (t.startsWith("targetApiVersion=")) {
+                            if (module.targetApiVersion == -1) {
+                                module.targetApiVersion = parseIntSafe(
+                                    t.substring("targetApiVersion=".length()).trim(), -1);
+                            }
+                        }
+                    }
+                }
+                if (logger != null) {
+                    logger.d("readModuleApiVersions(module.prop) for "
+                        + module.packageName + ": min=" + module.xposedMinVersion
+                        + " target=" + module.targetApiVersion);
+                }
+            }
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.d("readModuleApiVersions(module.prop): " + t.getMessage());
+            }
+        }
+
+        // ── Source 2: PackageManager meta-data (LSPosed) ────────
+        try {
+            PackageManager pm = context.getPackageManager();
+            android.content.pm.PackageInfo info =
+                pm.getPackageInfo(module.packageName, PackageManager.GET_META_DATA);
+            if (info != null && info.applicationInfo != null
+                    && info.applicationInfo.metaData != null) {
+                android.os.Bundle md = info.applicationInfo.metaData;
+                if (module.apiVersion == -1) {
+                    int v = md.getInt("xposedminversion", -1);
+                    if (v > 0) module.apiVersion = v;
+                }
+                if (module.targetApiVersion == -1) {
+                    int v = md.getInt("xposedtargetversion", -1);
+                    if (v > 0) module.targetApiVersion = v;
+                }
+            }
+            if (logger != null) {
+                logger.d("readModuleApiVersions(manifest) for "
+                    + module.packageName + ": api=" + module.apiVersion
+                    + " target=" + module.targetApiVersion);
+            }
+            return;
+        } catch (PackageManager.NameNotFoundException ignored) {
+            // Manual module whose APK wasn't installed via pm.
+            // Fall through to the binary scan.
+        } catch (Throwable t) {
+            if (logger != null) {
+                logger.d("readModuleApiVersions(manifest): " + t.getMessage());
+            }
+        }
+
+        // ── Source 3: best-effort binary manifest scan ──────────
+        // Only reached for manually-added APKs PackageManager can't
+        // see. The scanner is intentionally simple — it finds the
+        // string pool entry "xposedminversion" and looks for the
+        // next 0x10-typed int within a short window. If the
+        // manifest's layout doesn't match that shape, this returns
+        // -1 and the badge stays hidden. Acceptable: the common
+        // installed-module path above handles the real case.
+        if (module.apiVersion == -1) {
+            try (ZipFile zip = new ZipFile(apk)) {
+                ZipEntry manifestEntry = zip.getEntry("AndroidManifest.xml");
+                if (manifestEntry != null) {
+                    try (InputStream is = zip.getInputStream(manifestEntry)) {
+                        int found = scanBinaryManifestForInt(
+                            is, "xposedminversion");
+                        if (found > 0) {
+                            module.apiVersion = found;
+                            if (logger != null) {
+                                logger.d("readModuleApiVersions(axml) for "
+                                    + module.packageName + ": api=" + found);
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                if (logger != null) {
+                    logger.d("readModuleApiVersions(axml): " + t.getMessage());
+                }
+            }
+        }
+    }
+
+    private static int parseIntSafe(String s, int def) {
+        if (s == null || s.isEmpty()) return def;
+        try { return Integer.parseInt(s); } catch (Throwable t) { return def; }
+    }
+
+    /**
+     * Best-effort scan of a binary AndroidManifest.xml for a
+     * meta-data name's int value.
+     *
+     * AXML format: a string pool followed by resource-map and
+     * element chunks. Doing this properly needs a full AXML parser.
+     * This scanner finds the UTF-16LE bytes of `name` in the raw
+     * file, then scans the next ~256 bytes for a typed int32
+     * attribute (dataType byte 0x10) and returns its 4-byte value.
+     *
+     * Works for the common shape:
+     *   <meta-data android:name="xposedminversion"
+     *              android:value="93"/>
+     * where value is encoded as a literal INT_DEC attribute.
+     *
+     * Returns -1 if not found or the shape doesn't match.
+     */
+    private static int scanBinaryManifestForInt(InputStream is, String name) {
+        try {
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = is.read(buf)) > 0) bos.write(buf, 0, n);
+            byte[] data = bos.toByteArray();
+
+            byte[] needle = name.getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
+            int idx = indexOfBytes(data, needle);
+            if (idx < 0) return -1;
+
+            // AXML Res_value layout is 8 bytes:
+            //   2 bytes size, 1 byte res0, 1 byte dataType,
+            //   4 bytes data.
+            // So from a candidate start, dataType is at offset +3,
+            // data at offset +4. Alignment isn't guaranteed, so
+            // scan every byte, not every 4th.
+            int scan = idx + needle.length;
+            int end = Math.min(data.length - 8, scan + 256);
+            for (int i = scan; i < end; i++) {
+                if ((data[i] & 0xFF) == 0x10) {
+                    int v = readIntLE(data, i + 1);
+                    // Sanity: reject absurd values.
+                    if (v > 0 && v < 10000) return v;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return -1;
+    }
+
+    private static int indexOfBytes(byte[] haystack, byte[] needle) {
+        if (haystack == null || needle == null || needle.length == 0) return -1;
+        outer:
+        for (int i = 0; i <= haystack.length - needle.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (haystack[i + j] != needle[j]) continue outer;
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    private static int readIntLE(byte[] b, int off) {
+        if (off < 0 || off + 4 > b.length) return -1;
+        return (b[off] & 0xFF)
+            | ((b[off + 1] & 0xFF) << 8)
+            | ((b[off + 2] & 0xFF) << 16)
+            | ((b[off + 3] & 0xFF) << 24);
     }
 
     // ═════════════════════════════════════════════════════════════════
