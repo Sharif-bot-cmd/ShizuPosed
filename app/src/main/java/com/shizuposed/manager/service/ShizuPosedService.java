@@ -2411,7 +2411,16 @@ public class ShizuPosedService extends Service {
             String spawnPrefix = buildSpawnPrefix();
 
             String inner =
-                "unset CLASSPATH; unset BOOTCLASSPATH; "
+                "unset CLASSPATH; "
+                + "if [ -z \"$BOOTCLASSPATH\" ]; then "
+                +   "BOOTCLASSPATH=$(strings /apex/com.android.art/etc/classpaths/bootclasspath.pb "
+                +   "/system/etc/classpaths/bootclasspath.pb 2>/dev/null "
+                +   "| grep -o \"/[^ ]*\\.jar\" | awk \"!seen[\\$0]++\" | paste -sd: -); "
+                + "fi; "
+                + "if [ -z \"$DEX2OATBOOTCLASSPATH\" ]; then "
+                +   "DEX2OATBOOTCLASSPATH=\"$BOOTCLASSPATH\"; "
+                + "fi; "
+                + "export BOOTCLASSPATH DEX2OATBOOTCLASSPATH; "
                 + "( "
                 +   (spawnPrefix.isEmpty() ? "" : spawnPrefix + " ")
                 +   binary + " "
