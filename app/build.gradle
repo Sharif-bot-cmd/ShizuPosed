@@ -18,8 +18,8 @@ android {
         applicationId "com.shizuposed.manager"
         minSdk 28
         targetSdk 37
-        versionCode 5870
-        versionName "1.4.10"
+        versionCode 5900
+        versionName "1.5.0"
 
         ndk {
             abiFilters 'arm64-v8a'
@@ -145,9 +145,6 @@ dependencies {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // NATIVE LIBRARY PRESENCE CHECKS
-//
-// Unchanged from before. The checks run against src/main/jniLibs;
-// they are independent of the cloak model and remain required.
 // ═══════════════════════════════════════════════════════════════════════════
 
 def skipNativeCheck = project.hasProperty('skipNativeCheck')
@@ -249,39 +246,75 @@ tasks.register('checkSysku') {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CLOAK LEAK CHECK
-//
-// Fails the build if the literal string "com.shizuposed.manager" appears
-// in classes.dex or resources.arsc. Under the same-length cloak model,
-// the package name is patched in AndroidManifest.xml only; any other
-// occurrence (BuildConfig field, resValue, hardcoded constant) survives
-// the patch and makes the cloaked APK detectable.
-//
-// This is the CI gate for Phase 0.2 of the cloak migration.
+// SDK PATH RESOLUTION (HARDENED)
 // ═══════════════════════════════════════════════════════════════════════════
 
-def androidHome = System.getenv('ANDROID_HOME')
-    ?: System.getenv('ANDROID_SDK_ROOT')
-    ?: project.findProperty('android.sdk.dir')
+def resolveAndroidHome = {
+    def candidates = []
 
-if (androidHome == null) {
-    throw new GradleException("ANDROID_HOME not set — cannot locate build-tools.")
+    if (project.hasProperty('android.sdk.dir')) {
+        candidates << ['-Pandroid.sdk.dir', project.property('android.sdk.dir').toString()]
+    }
+
+    def localProps = rootProject.file('local.properties')
+    if (localProps.exists()) {
+        def lp = new Properties()
+        localProps.withInputStream { lp.load(it) }
+        if (lp.getProperty('sdk.dir')) {
+            candidates << ['local.properties sdk.dir', lp.getProperty('sdk.dir')]
+        }
+    }
+
+    def envHome = System.getenv('ANDROID_HOME')
+    if (envHome) candidates << ['ANDROID_HOME', envHome]
+
+    def envRoot = System.getenv('ANDROID_SDK_ROOT')
+    if (envRoot) candidates << ['ANDROID_SDK_ROOT', envRoot]
+
+    def homeFallback = System.getenv('HOME') ? "${System.getenv('HOME')}/android-sdk" : null
+    if (homeFallback) candidates << ['$HOME/android-sdk', homeFallback]
+
+    for (def pair : candidates) {
+        def src = pair[0]
+        def path = pair[1]
+        if (path == null) continue
+        def f = new File(path)
+        if (f.isDirectory() && new File(f, 'build-tools').isDirectory()) {
+            println "SDK: using ${path}  (source: ${src})"
+            return f
+        }
+    }
+
+    println "SDK: no valid SDK root found. Candidates tried:"
+    candidates.each { pair ->
+        def f = new File(pair[1].toString())
+        println "  - ${pair[0]}: ${pair[1]}  (exists=${f.exists()}, build-tools=${new File(f,'build-tools').exists()})"
+    }
+    throw new GradleException(
+        "No Android SDK with build-tools found. Set ANDROID_HOME, or create " +
+        "local.properties with sdk.dir=/path/to/sdk, or pass -Pandroid.sdk.dir=/path/to/sdk."
+    )
 }
 
-def buildToolsRoot = new File(androidHome.toString(), 'build-tools')
-if (!buildToolsRoot.exists()) {
-    throw new GradleException("No build-tools under $buildToolsRoot")
-}
+def androidHomeDir = resolveAndroidHome()
+def buildToolsRoot = new File(androidHomeDir, 'build-tools')
 
 def latestBuildTools = buildToolsRoot.listFiles()
     .findAll { it.isDirectory() }
     .sort { a, b -> b.name <=> a.name }
     .find()
 
-def dexdumpTool = latestBuildTools != null
-    ? new File(latestBuildTools, 'dexdump') : null
-def aapt2Tool = latestBuildTools != null
-    ? new File(latestBuildTools, 'aapt2') : null
+if (latestBuildTools == null) {
+    throw new GradleException("No build-tools version dirs under $buildToolsRoot")
+}
+println "SDK: latest build-tools = ${latestBuildTools.name}"
+
+def dexdumpTool = new File(latestBuildTools, 'dexdump')
+def aapt2Tool   = new File(latestBuildTools, 'aapt2')
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CLOAK LEAK CHECK
+// ═══════════════════════════════════════════════════════════════════════════
 
 tasks.register('checkNoOldPackageLeak') {
     group = 'verification'
@@ -289,15 +322,15 @@ tasks.register('checkNoOldPackageLeak') {
 
     def apk = layout.buildDirectory.file(
         'outputs/apk/release/app-release.apk').get().asFile
-    def capturedDexdump = dexdumpTool != null ? dexdumpTool.absolutePath : null
-    def capturedAapt2 = aapt2Tool != null ? aapt2Tool.absolutePath : null
+    def capturedDexdump = dexdumpTool.exists() ? dexdumpTool.absolutePath : null
+    def capturedAapt2   = aapt2Tool.exists()   ? aapt2Tool.absolutePath   : null
 
     doLast {
         if (!apk.exists()) {
             throw new GradleException("APK not found: ${apk}")
         }
         if (capturedDexdump == null || capturedAapt2 == null) {
-            logger.warn("checkNoOldPackageLeak: build-tools missing, skipping")
+            logger.warn("checkNoOldPackageLeak: dexdump/aapt2 missing, skipping")
             return
         }
 
@@ -344,35 +377,29 @@ tasks.matching { it.name == 'assembleRelease' }.configureEach {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // XPOSEDHOOK.DEX PIPELINE
-//
-// Compiles the release Java classes, runs d8 on the subset the hook
-// needs (core + xposed shim + libxposed vendor + stealth), and
-// writes build/outputs/dex/XposedHook.dex. That directory is added
-// to sourceSets.main's assets, so the merge*Assets tasks pick it up.
 // ═══════════════════════════════════════════════════════════════════════════
 
-def makeDexBuildToolsRoot = new File(androidHome.toString(), 'build-tools')
-
-def makeDexD8 = makeDexBuildToolsRoot.listFiles()
+def makeDexD8 = buildToolsRoot.listFiles()
     .findAll { it.isDirectory() }
     .sort { a, b -> b.name <=> a.name }
     .collect { new File(it, 'd8') }
     .find { it.exists() }
 
 if (makeDexD8 == null) {
-    throw new GradleException("d8 not found under $makeDexBuildToolsRoot")
+    throw new GradleException("d8 not found under $buildToolsRoot")
 }
+println "SDK: d8 = ${makeDexD8.absolutePath}"
 
 def makeDexCompileSdkVersion = android.compileSdk
 def makeDexCompileSdkMinor = 0
 try { makeDexCompileSdkMinor = android.compileSdkMinor } catch (Throwable ignored) {}
 
-def makeDexPlatformsRoot = new File(androidHome.toString(), 'platforms')
+def makeDexPlatformsRoot = new File(androidHomeDir, 'platforms')
 def makeDexCandidatePlatformDirs = [
     makeDexCompileSdkMinor > 0
         ? "android-${makeDexCompileSdkVersion}.${makeDexCompileSdkMinor}" : null,
     "android-${makeDexCompileSdkVersion}",
-    "android-37.0", "android-36", "android-35",
+    "android-37.0", "android-37", "android-36", "android-35",
 ].findAll { it != null }
 
 def makeDexPlatformJar = null
@@ -382,8 +409,14 @@ for (String name : makeDexCandidatePlatformDirs) {
 }
 
 if (makeDexPlatformJar == null) {
-    throw new GradleException("Could not locate android.jar")
+    def available = makeDexPlatformsRoot.exists()
+        ? makeDexPlatformsRoot.listFiles().findAll { it.isDirectory() }.collect { it.name }
+        : []
+    throw new GradleException(
+        "Could not locate android.jar under ${makeDexPlatformsRoot}. " +
+        "Tried: ${makeDexCandidatePlatformDirs}. Available: ${available}.")
 }
+println "SDK: android.jar = ${makeDexPlatformJar.absolutePath}"
 
 def makeDexCompileClasspathFiles = provider {
     def cp = configurations.findByName('releaseCompileClasspath')
@@ -554,40 +587,22 @@ tasks.register('makeDex') {
         if (!outDex.exists() || outDex.length() == 0) {
             throw new GradleException("d8 produced no usable dex at $outDex")
         }
+        println "makeDex: wrote ${outDex.absolutePath} (${outDex.length()} bytes)"
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // makeDex TASK WIRING
-//
-// sourceSets.main adds build/outputs/dex to the assets source dirs,
-// so every task that reads assets depends on makeDex producing that
-// directory. Declaring the dependency explicitly is required by
-// Gradle 9.8 — it no longer infers it from the sourceSets entry.
-//
-// The consumers fall into four groups:
-//   • Asset merge tasks (merge*Assets)
-//   • Lint analysis (lintVitalAnalyze*, lintAnalyze*, lintVitalReport*)
-//   • Lint model writers (generate*LintVitalReportModel)
-//   • Assembly (assemble*)
-//
-// If you add a new variant or a new task that reads assets, add it
-// to one of these matchers. Missing one produces the same
-// "implicit dependency" error at build time.
 // ═══════════════════════════════════════════════════════════════════════════
 
 tasks.matching { t ->
     def n = t.name
-    // Asset merges
     n == 'mergeReleaseAssets' ||
     n == 'mergeDebugAssets'   ||
-    // Lint analysis
     n.startsWith('lintVitalAnalyze') ||
     n.startsWith('lintAnalyze')      ||
     n.startsWith('lintVitalReport')  ||
-    // Lint model writers
-    n.startsWith('generate') && n.endsWith('LintVitalReportModel') ||
-    // Assemblies
+    (n.startsWith('generate') && n.endsWith('LintVitalReportModel')) ||
     n == 'assembleRelease' ||
     n == 'assembleDebug'
 }.configureEach {
@@ -596,9 +611,6 @@ tasks.matching { t ->
 
 // ═══════════════════════════════════════════════════════════════════════════
 // VERIFICATION WIRING
-//
-// checkNativeShim remains required. The six optional checks stay
-// warn-only. None of them changed under the cloak migration.
 // ═══════════════════════════════════════════════════════════════════════════
 
 tasks.matching { it.name == 'assembleRelease' }.configureEach {

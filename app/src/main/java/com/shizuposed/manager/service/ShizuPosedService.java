@@ -2209,7 +2209,7 @@ public class ShizuPosedService extends Service {
                 "for d in /proc/[0-9]*; do "
                 + "  [ -r \"$d/cmdline\" ] || continue; "
                 + "  if tr '\\0' ' ' < \"$d/cmdline\" 2>/dev/null "
-                + "     | grep -qF -- '" + needle + "'; then "
+                +     "| grep -qF -- '" + needle + "'; then "
                 + "    echo FOUND; exit 0; "
                 + "  fi; "
                 + "done; "
@@ -2410,8 +2410,22 @@ public class ShizuPosedService extends Service {
 
             String spawnPrefix = buildSpawnPrefix();
 
+            // Preserve the inherited BOOTCLASSPATH; only fall back to
+            // parsing the classpath protobufs when the shell has none.
+            // Mirror the result to DEX2OATBOOTCLASSPATH so both ART and
+            // dex2oat see a valid boot classpath. Unset CLASSPATH only
+            // (it would shadow the dex path).
             String inner =
-                "unset CLASSPATH; unset BOOTCLASSPATH; "
+                "unset CLASSPATH; "
+                + "if [ -z \"$BOOTCLASSPATH\" ]; then "
+                +   "BOOTCLASSPATH=$(strings /apex/com.android.art/etc/classpaths/bootclasspath.pb "
+                +   "/system/etc/classpaths/bootclasspath.pb 2>/dev/null "
+                +   "| grep -o \"/[^ ]*\\.jar\" | awk '!seen[$0]++' | paste -sd: -); "
+                + "fi; "
+                + "if [ -z \"$DEX2OATBOOTCLASSPATH\" ]; then "
+                +   "DEX2OATBOOTCLASSPATH=\"$BOOTCLASSPATH\"; "
+                + "fi; "
+                + "export BOOTCLASSPATH DEX2OATBOOTCLASSPATH; "
                 + "( "
                 +   (spawnPrefix.isEmpty() ? "" : spawnPrefix + " ")
                 +   binary + " "
@@ -2518,9 +2532,28 @@ public class ShizuPosedService extends Service {
                     + "bootstrap output.");
             }
 
+            // Spawn-only path: only report success when we actually
+            // have evidence the child survived the bootstrap window
+            // (marker present OR process still alive after the wait).
+            // Previously we unconditionally logged "hooks installed"
+            // here even when the child aborted (e.g. the
+            // BOOTCLASSPATH SIGABRT), which masked real failures.
             if (!openUi) {
+                if (!markerSeen && !processSeen) {
+                    logger.w("Spawn-only launch for " + packageName
+                        + " produced no marker and no live process — "
+                        + "reporting failure (check launch.log)");
+                    if (notifyUi) {
+                        broadcastOnce(packageName, sent, false,
+                            "bootstrap did not survive (no marker, no process)");
+                    }
+                    return false;
+                }
+
                 logger.i("Spawn-only launch for " + packageName
-                    + " — hooks installed, UI not opened"
+                    + " — hooks installed ("
+                    + (markerSeen ? "marker present" : "process alive")
+                    + ")"
                     + (notifyUi ? "" : ", no broadcast"));
                 if (notifyUi) {
                     broadcastOnce(packageName, sent, true, null);
