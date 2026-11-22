@@ -1,31 +1,3 @@
-/*
- * libcallsite.c
- *
- * CallSite backend for ShizuPosed.
- *
- * v0.2.0 changes:
- *   • install_hook_impl now REFUSES every install with a logged
- *     reason. This matches the README's honest statement that
- *     CallSite is non-functional since 8.9 — the old code
- *     returned success for every install while never invoking
- *     any Java callback, which was worse than refusing.
- *   • build_trampoline's literal-load offsets corrected. The
- *     old imm19 values (0x110) pointed ~544 bytes past the ldr
- *     instruction instead of 24 bytes past. The corrected values
- *     (0xd0) load the two 8-byte literals at the intended spots.
- *   • Version bumped to 0.2.0.
- *
- * The interpreter-table scanner, decoder, and patch machinery
- * are preserved as scaffolding for a future implementation that
- * actually invokes Java callbacks. Until that exists, the
- * backend refuses installs.
- *
- * Build:
- *   clang -shared -fPIC -O2 -Wall -Wextra \
- *       -o libcallsite.so libcallsite.c \
- *       -llog -ldl -lpthread
- */
-
 #define _GNU_SOURCE
 
 #include <jni.h>
@@ -45,12 +17,66 @@
 #define ALOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-#define CALLSITE_VERSION "0.2.0"
+#define CALLSITE_VERSION "0.4.1"
 
 #define MAX_PATCHED_SLOTS 32
 #define MAX_INTERCEPTS   256
 
 extern void __clear_cache(void *start, void *end);
+
+/* ─────────────────────────────────────────────────────────────
+ * Native-backend bridge (resolved lazily; absent is a supported
+ * state).
+ *
+ * libshizuposed exports:
+ *
+ *   int64_t shizuposed_lazy_install_artmethod(int64_t art_method);
+ *       → performs the entry-point replacement for an ArtMethod
+ *         that already has a registered callback stub.
+ *         Idempotent: if already hooked, returns the existing
+ *         trampoline. Returns 0 on refusal (no layout, no
+ *         registered callback, allocation failure).
+ *
+ *   int32_t shizuposed_unhook_artmethod(int64_t art_method);
+ *       → direct-C mirror of nUnhookArtMethod, for symmetry.
+ *
+ * If either symbol is absent, installs are refused and
+ * nativeBridgeLinked() returns false.
+ *
+ * Resolved lazily: CallSite may be initialized before
+ * libshizuposed.so is loaded. Both install_hook_impl and
+ * handler_check_impl retry the resolution when g_bridge_ok is 0.
+ * ───────────────────────────────────────────────────────────── */
+
+typedef int64_t (*lazy_install_fn)(int64_t art_method);
+typedef int32_t (*unhook_artmethod_fn)(int64_t art_method);
+
+static lazy_install_fn       g_lazy_install    = NULL;
+static unhook_artmethod_fn   g_lazy_unhook     = NULL;
+static int                   g_bridge_ok       = 0;
+static pthread_mutex_t       g_bridge_mu       = PTHREAD_MUTEX_INITIALIZER;
+
+static int resolve_native_bridge_locked(void) {
+    if (g_bridge_ok) return 1;
+    void *inst = dlsym(RTLD_DEFAULT, "shizuposed_lazy_install_artmethod");
+    if (inst == NULL) {
+        return 0;
+    }
+    void *unh = dlsym(RTLD_DEFAULT, "shizuposed_unhook_artmethod");
+    g_lazy_install = (lazy_install_fn) inst;
+    g_lazy_unhook  = (unhook_artmethod_fn) unh;
+    g_bridge_ok = 1;
+    ALOGI("native bridge resolved (install=%p unhook=%p)", inst, unh);
+    return 1;
+}
+
+static int resolve_native_bridge(void) {
+    if (g_bridge_ok) return 1;
+    pthread_mutex_lock(&g_bridge_mu);
+    int ok = resolve_native_bridge_locked();
+    pthread_mutex_unlock(&g_bridge_mu);
+    return ok;
+}
 
 /* ─────────────────────────────────────────────────────────────
  * ART symbol table
@@ -92,11 +118,15 @@ static pthread_mutex_t g_patch_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ─────────────────────────────────────────────────────────────
  * Intercept registry
+ *
+ * Maps ArtMethod* → cached branch target. The branch target is the
+ * trampoline returned by shizuposed_lazy_install_artmethod on first
+ * sighting; it is 0 until that call succeeds.
  * ───────────────────────────────────────────────────────────── */
 
 typedef struct intercept {
     int64_t art_method;
-    int64_t cb_id;
+    int64_t entry;          /* cached trampoline (0 until installed) */
     struct intercept *next;
 } intercept_t;
 
@@ -119,25 +149,11 @@ static int64_t decode_adrp(uint32_t instr, uint64_t pc) {
     return (int64_t) (pc & ~0xfffULL) + imm;
 }
 
-static uint32_t decode_rd(uint32_t instr) {
-    return instr & 0x1fu;
-}
-
-static uint32_t decode_rn(uint32_t instr) {
-    return (instr >> 5) & 0x1fu;
-}
-
-static uint32_t decode_add_imm(uint32_t instr) {
-    return (instr >> 10) & 0xfffu;
-}
-
-static int decode_ldr_imm(uint32_t instr) {
-    return (int) (((instr >> 10) & 0xfffu) << 3);
-}
-
-static uint32_t decode_movz_imm(uint32_t instr) {
-    return (instr >> 5) & 0xffffu;
-}
+static uint32_t decode_rd(uint32_t instr) { return instr & 0x1fu; }
+static uint32_t decode_rn(uint32_t instr) { return (instr >> 5) & 0x1fu; }
+static uint32_t decode_add_imm(uint32_t instr) { return (instr >> 10) & 0xfffu; }
+static int decode_ldr_imm(uint32_t instr) { return (int) (((instr >> 10) & 0xfffu) << 3); }
+static uint32_t decode_movz_imm(uint32_t instr) { return (instr >> 5) & 0xffffu; }
 
 /* ─────────────────────────────────────────────────────────────
  * ART symbol resolution
@@ -312,22 +328,44 @@ static int discover_interpreter_table(void) {
 }
 
 /* ─────────────────────────────────────────────────────────────
- * Trampoline construction
+ * Trampoline construction (unchanged from v0.3.0)
  *
- * The trampoline saves x0-x7, calls handler_check with x0 = the
- * ArtMethod pointer (set by the interpreter), then either returns
- * (if the handler check returns non-zero) or branches to the
- * original handler.
+ * Layout (byte offsets):
+ *   0x00  stp  x0, x1, [sp, #-0x10]!
+ *   0x04  stp  x2, x3, [sp, #-0x10]!
+ *   0x08  stp  x4, x5, [sp, #-0x10]!
+ *   0x0c  stp  x6, x7, [sp, #-0x10]!
+ *   0x10  ldr  x16, [pc, #+0x18]      → literal 0x30 (handler_check)
+ *   0x14  blr  x16
+ *   0x18  cbnz x0, .use_bridge         ; x0 = branch target (or 0)
+ *   0x1c  ldr  x16, [pc, #+0x18]       → literal 0x38 (original)
+ *   0x20  b    .restore                ; skip the branch-target load
+ *   0x24  .use_bridge:
+ *   0x24  mov  x16, x0
+ *   0x28  .restore:
+ *   0x28  ldp  x6, x7, [sp], #0x10
+ *   0x2c  ldp  x4, x5, [sp], #0x10
+ *   0x30  ldp  x2, x3, [sp], #0x10
+ *   0x34  ldp  x0, x1, [sp], #0x10
+ *   0x38  br   x16
+ *   0x3c  (pad)
+ *   0x30  literal: handler_check address
+ *   0x38  literal: original_handler address
  *
  * Literal offsets:
- *   ldr  at byte offset 0x10  →  loads literal at 0x30
- *   ldr  at byte offset 0x18  →  loads literal at 0x38
- *   pc   for both  =  instruction + 8
- *   0x30 - (0x10 + 8) = 0x18 = 24 bytes = 6 instructions
- *   0x38 - (0x18 + 8) = 0x18 = 24 bytes = 6 instructions
- *   imm19 = 6  →  6 << 5 = 0xC0  →  base 0x58000000 | 0xC0 | Rd
- *   = 0x580000D0 (Rd=16)
+ *   ldr at 0x10, pc = 0x10 + 8 = 0x18, literal at 0x30 → +0x18 → imm19=6 → 0x580000D0
+ *   ldr at 0x1c, pc = 0x1c + 8 = 0x24, literal at 0x38 → +0x14 → imm19=5 → 0x580000B0
+ *
+ * The trampoline uses handler_check's return value:
+ *   - non-zero → branch to the Native backend's trampoline
+ *     (the method has just been hooked lazily)
+ *   - zero     → branch to the original handler (un-hooked)
  * ───────────────────────────────────────────────────────────── */
+
+extern int64_t handler_check_impl(int64_t art_method);
+int64_t handler_check(int64_t art_method) {
+    return handler_check_impl(art_method);
+}
 
 static int64_t build_trampoline(int64_t handler_check_addr,
                                 int64_t original_handler,
@@ -350,24 +388,25 @@ static int64_t build_trampoline(int64_t handler_check_addr,
     p[2]  = 0xa9bf17e4;  /* stp  x4, x5, [sp, #-0x10]! */
     p[3]  = 0xa9bf1fe6;  /* stp  x6, x7, [sp, #-0x10]! */
 
-    /* ldr x16, [pc, #+0x18] — 6 instructions ahead, byte 0x30. */
-    p[4]  = 0x580000d0;
-    /* blr x16 */
-    p[5]  = 0xd63f0200;
+    /* Call handler_check(ArtMethod* in x0). */
+    p[4]  = 0x580000d0;  /* ldr  x16, [pc, #+0x18] → 0x30 */
+    p[5]  = 0xd63f0200;  /* blr  x16 */
 
-    /* ldr x16, [pc, #+0x18] — 6 instructions ahead, byte 0x38. */
-    p[6]  = 0x580000d0;
+    /* If x0 != 0, use x0 as the entry; else use the original. */
+    p[6]  = 0xb50000e0;  /* cbnz x0, +0x1c → 0x24 (.use_bridge) */
+    p[7]  = 0x580000b0;  /* ldr  x16, [pc, #+0x14] → 0x38 (original) */
+    p[8]  = 0x14000002;  /* b    +0x8   → 0x28 (.restore) */
+    /* .use_bridge: */
+    p[9]  = 0xaa0003f0;  /* mov  x16, x0 */
 
-    /* Restore x0-x7. */
-    p[7]  = 0xa8c11fe6;  /* ldp  x6, x7, [sp], #0x10 */
-    p[8]  = 0xa8c117e4;  /* ldp  x4, x5, [sp], #0x10 */
-    p[9]  = 0xa8c10fe2;  /* ldp  x2, x3, [sp], #0x10 */
-    p[10] = 0xa8c107e0;  /* ldp  x0, x1, [sp], #0x10 */
+    /* .restore: */
+    p[10] = 0xa8c11fe6;  /* ldp  x6, x7, [sp], #0x10 */
+    p[11] = 0xa8c117e4;  /* ldp  x4, x5, [sp], #0x10 */
+    p[12] = 0xa8c10fe2;  /* ldp  x2, x3, [sp], #0x10 */
+    p[13] = 0xa8c107e0;  /* ldp  x0, x1, [sp], #0x10 */
+    p[14] = 0xd61f0200;  /* br   x16 */
 
-    /* br x16 */
-    p[11] = 0xd61f0200;
-
-    /* Two 8-byte literals follow the code. */
+    /* Literals. */
     *(int64_t *) ((char *) mem + 0x30) = handler_check_addr;
     *(int64_t *) ((char *) mem + 0x38) = original_handler;
 
@@ -412,12 +451,6 @@ static int patch_handler_slot(void *slot, int64_t tramp) {
     return 1;
 }
 
-extern int64_t handler_check_impl(int64_t art_method);
-
-int64_t handler_check(int64_t art_method) {
-    return handler_check_impl(art_method);
-}
-
 static void install_interpreter_patches(void) {
     if (!g_interp_ok || g_interp.table == 0) return;
 
@@ -448,56 +481,120 @@ static void install_interpreter_patches(void) {
  * Intercept registry
  * ───────────────────────────────────────────────────────────── */
 
-static int64_t lookup_intercept(int64_t art_method) {
+static int64_t lookup_entry(int64_t art_method) {
     if (art_method == 0) return 0;
 
     pthread_mutex_lock(&g_intercepts_lock);
     for (intercept_t *p = g_intercepts; p != NULL; p = p->next) {
         if (p->art_method == art_method) {
-            int64_t id = p->cb_id;
+            int64_t entry = p->entry;
             pthread_mutex_unlock(&g_intercepts_lock);
-            return id;
+            return entry;
         }
     }
     pthread_mutex_unlock(&g_intercepts_lock);
     return 0;
 }
 
+/*
+ * The trampoline calls this. On first sighting of a hooked
+ * ArtMethod, hand off to libshizuposed's direct-C lazy install;
+ * that call performs the entry-point replacement exactly as
+ * nHookArtMethod would, and returns the trampoline to branch to.
+ * The returned trampoline is cached so subsequent hits are O(1).
+ *
+ * If the native bridge refuses (no layout, no registered
+ * callback, already hooked by someone else, allocation failure),
+ * handler_check_impl returns 0 and the trampoline falls through
+ * to the original handler — same behavior as if CallSite
+ * weren't here.
+ *
+ * No callback id is returned to nowhere: the v0.3.0 mistake was
+ * that handler_check returned an id that the trampoline
+ * discarded. The correct contract is "return a branch target or
+ * fall through to original," and this implementation honors it.
+ */
 int64_t handler_check_impl(int64_t art_method) {
-    return lookup_intercept(art_method);
+    if (art_method == 0) return 0;
+
+    int64_t entry = lookup_entry(art_method);
+    if (entry != 0) return entry;
+
+    /*
+     * Retry bridge resolution. libshizuposed may have loaded after
+     * libcallsite; resolve_native_bridge_locked is called under
+     * g_bridge_mu and only does work if g_bridge_ok == 0.
+     */
+    if (!g_bridge_ok && !resolve_native_bridge()) {
+        return 0;
+    }
+
+    if (g_lazy_install != NULL) {
+        int64_t t = g_lazy_install(art_method);
+        if (t != 0) {
+            pthread_mutex_lock(&g_intercepts_lock);
+            for (intercept_t *p = g_intercepts; p != NULL; p = p->next) {
+                if (p->art_method == art_method) { p->entry = t; break; }
+            }
+            pthread_mutex_unlock(&g_intercepts_lock);
+            return t;
+        }
+    }
+    return 0;
 }
 
-static void register_intercept(int64_t art_method, int64_t cb_id) {
+static void register_intercept(int64_t art_method) {
     pthread_mutex_lock(&g_intercepts_lock);
+    for (intercept_t *p = g_intercepts; p != NULL; p = p->next) {
+        if (p->art_method == art_method) {
+            p->entry = 0;  /* re-arm for lazy install */
+            pthread_mutex_unlock(&g_intercepts_lock);
+            return;
+        }
+    }
     intercept_t *n = malloc(sizeof(*n));
     if (n != NULL) {
         n->art_method = art_method;
-        n->cb_id = cb_id;
+        n->entry = 0;
         n->next = g_intercepts;
         g_intercepts = n;
     }
     pthread_mutex_unlock(&g_intercepts_lock);
 }
 
+static void unregister_intercept(int64_t art_method) {
+    pthread_mutex_lock(&g_intercepts_lock);
+    intercept_t **pp = &g_intercepts;
+    while (*pp != NULL) {
+        if ((*pp)->art_method == art_method) {
+            intercept_t *dead = *pp;
+            *pp = dead->next;
+            free(dead);
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&g_intercepts_lock);
+}
+
 /* ─────────────────────────────────────────────────────────────
- * Hook installation — refuses everything
+ * Hook installation (v0.4.1)
  *
- * The interpreter-table patching above is preserved as
- * scaffolding. It correctly patches the table, but the table
- * patch only redirects interpreter dispatch to a trampoline that
- * returns the callback id. It does NOT invoke the Java callback,
- * so the hook is a no-op.
+ * install_hook_impl arms the intercept without touching the
+ * ArtMethod entry point. The entry-point replacement happens
+ * lazily, on the first interpreted invocation, via handler_check
+ * → shizuposed_lazy_install_artmethod.
  *
- * Until a future implementation actually invokes the callback
- * (via JNI CallStaticMethod on the registry), install_hook_impl
- * returns 0 (refused). This matches the README's statement that
- * CallSite is non-functional since 8.9.
+ * The callback itself must already have been registered with the
+ * Native backend via NativeBridge.nRegisterCallback. CallSite
+ * does not own a callback registry; that is the Native backend's
+ * job and CallSite routes into it.
+ *
+ * If the native bridge is absent, install is refused; the Java
+ * layer drops the registration it just made.
  * ───────────────────────────────────────────────────────────── */
 
-static int install_hook_impl(int64_t reflect_method, int64_t cb_id) {
-    (void) reflect_method;
-    (void) cb_id;
-
+static int install_hook_impl(int64_t reflect_method) {
     if (!g_art_ok) {
         ALOGW("callsite: install refused — ART symbols not resolved");
         return 0;
@@ -506,12 +603,32 @@ static int install_hook_impl(int64_t reflect_method, int64_t cb_id) {
         ALOGW("callsite: install refused — interpreter table not found");
         return 0;
     }
+    if (!resolve_native_bridge()) {
+        ALOGW("callsite: install refused — libshizuposed lazy-install "
+              "bridge absent (CallSite is a deferred trigger for the "
+              "Native backend; without it, installs are no-ops)");
+        return 0;
+    }
 
-    ALOGW("callsite: install refused — backend is non-functional "
-          "(table patches redirect to a trampoline that returns "
-          "the callback id without invoking it; a future "
-          "implementation will enable real dispatch)");
-    return 0;
+    register_intercept(reflect_method);
+
+    /*
+     * Do NOT call g_lazy_install here. The first interpreted
+     * invocation does, via handler_check_impl. This preserves the
+     * "entry point untouched until first call" property that is
+     * CallSite's reason for existing.
+     */
+    ALOGI("callsite: armed ArtMethod %p — will install on first "
+          "interpreted invocation", (void *) reflect_method);
+    return 1;
+}
+
+static int uninstall_hook_impl(int64_t reflect_method) {
+    unregister_intercept(reflect_method);
+    if (resolve_native_bridge() && g_lazy_unhook != NULL) {
+        g_lazy_unhook(reflect_method);
+    }
+    return 1;
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -533,29 +650,60 @@ Java_com_shizuposed_manager_core_backends_CallSiteBackend_nativeInit(
         return JNI_FALSE;
     }
 
+    /*
+     * Best-effort bridge resolve at init. May fail if
+     * libshizuposed.so loads later; install_hook_impl and
+     * handler_check_impl retry.
+     */
+    resolve_native_bridge();
     install_interpreter_patches();
 
-    ALOGI("CallSiteBackend ready (non-functional; installs refused)");
+    ALOGI("CallSiteBackend ready (v%s; native-bridge=%s)",
+          CALLSITE_VERSION, g_bridge_ok ? "linked" : "absent");
     return JNI_TRUE;
 }
 
 JNIEXPORT jboolean JNICALL
 Java_com_shizuposed_manager_core_backends_CallSiteBackend_nativeInstallHook(
-        JNIEnv *env, jclass clazz, jobject method, jint cb_id) {
+        JNIEnv *env, jclass clazz, jobject method) {
     (void) env; (void) clazz;
     int64_t m = (int64_t) (intptr_t) method;
-    return install_hook_impl(m, cb_id) ? JNI_TRUE : JNI_FALSE;
+    return install_hook_impl(m) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_shizuposed_manager_core_backends_CallSiteBackend_nativeUninstallHook(
+        JNIEnv *env, jclass clazz, jobject method) {
+    (void) env; (void) clazz;
+    int64_t m = (int64_t) (intptr_t) method;
+    return uninstall_hook_impl(m) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_shizuposed_manager_core_backends_CallSiteBackend_nativeBridgeLinked(
+        JNIEnv *env, jclass clazz) {
+    (void) env; (void) clazz;
+    return resolve_native_bridge() ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT jstring JNICALL
 Java_com_shizuposed_manager_core_backends_CallSiteBackend_nativeDescribe(
         JNIEnv *env, jclass clazz) {
     (void) clazz;
-    char buf[512];
+    char buf[640];
+    int bridge_ok = resolve_native_bridge();
+    const char *art  = g_art_ok  ? "ART symbols resolved" : "ART symbols unavailable";
+    const char *tab  = g_interp_ok ? "interpreter table found" : "interpreter table not found";
+    const char *br   = bridge_ok ? "native bridge linked" : "native bridge absent";
+    int n = 0;
+    pthread_mutex_lock(&g_intercepts_lock);
+    for (intercept_t *p = g_intercepts; p != NULL; p = p->next) n++;
+    pthread_mutex_unlock(&g_intercepts_lock);
     snprintf(buf, sizeof(buf),
-        "callsite: %s | %s | non-functional (installs refused)",
-        g_art_ok ? "ART symbols resolved" : "ART symbols unavailable",
-        g_interp_ok ? "interpreter table found"
-                    : "interpreter table not found");
+        "callsite: %s | %s | %s | %d armed | %s",
+        art, tab, br, n,
+        (g_art_ok && g_interp_ok && bridge_ok)
+            ? "active (deferred via Native backend)"
+            : "inactive");
     return (*env)->NewStringUTF(env, buf);
 }

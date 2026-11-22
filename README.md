@@ -26,6 +26,28 @@ The rest of this document is honest about where that line falls.
 
 ---
 
+## Verification status
+
+ShizuPosed's core primitive has been exercised on-device, but not every link in the chain has been independently verified. This section is the honest ledger.
+
+**Verified on-device (Android 16 / HyperOS, ARM64):**
+
+- `app_process` reaches ART after the `BOOTCLASSPATH` fix (see [The `BOOTCLASSPATH` fix](#the-bootclasspath-fix)). Prior to the fix, `Runtime::ParseOptions` aborted with `BOOTCLASSPATH must not empty`. The inherited shell `BOOTCLASSPATH` is now preserved, with the classpath-protobuf fallback used only when the shell has none.
+- The spawn-only path now requires evidence of survival (marker present or process alive after the bootstrap window) before reporting success. See [Spawn-only success semantics](#spawn-only-success-semantics).
+
+**Not yet independently verified end-to-end:**
+
+- `setuid` to the target UID succeeding from the shell-spawned process.
+- SELinux domain transition to the target's context.
+- AMS not reaping the unregistered PID before hooks fire.
+- Hooks actually firing inside the target's `Application.onCreate`.
+
+These four are the remaining load-bearing assumptions. The code has diagnostics for each — read [Reading the launch log](#reading-the-launch-log) and check the manager's Logs tab. A future release will add explicit log lines for each outcome (target UID readback, SELinux context, process survival window, hook-fire confirmation) so the ledger above can be updated with measurements rather than expectations.
+
+If you can test a build on a device where the old `BOOTCLASSPATH` abort reproduced, open an issue with the `launch.log` and `logcat -s XposedHook`. That's the missing experiment.
+
+---
+
 ## Why `app_process`
 
 Without root, the injection primitives on Android 10+ are narrow. `ptrace` is blocked by SELinux for non-root UIDs. `LD_PRELOAD` needs a writable, executable path the target will load from, and app data directories are mounted `noexec`. Zygote fork requires being inside zygote, which means root or being the ROM. `Runtime.exec` runs as the caller's UID, not the target's. `am instrument` gives you an `Instrumentation` handle only after `Application.onCreate` — too late for bootstrap hooks. ContentProvider hijack works only if the target already declares a provider you can take over.
@@ -33,6 +55,19 @@ Without root, the injection primitives on Android 10+ are narrow. `ptrace` is bl
 `app_process` is the one that works. It's a platform binary that exists on every Android device. Shizuku can invoke it as shell (UID 2000). It starts a Java runtime, so you can load arbitrary dex into it. And Shizuku can pass the target package and UID as arguments.
 
 That's the entire mechanism. Everything else in ShizuPosed is a consequence of it.
+
+### The `BOOTCLASSPATH` fix
+
+`app_process` inherits ART's boot classpath from the invoking shell. If the shell has none, ART aborts in `Runtime::ParseOptions` with `BOOTCLASSPATH must not empty` (SIGABRT). Earlier builds unset `BOOTCLASSPATH` unconditionally before spawning, which caused exactly that abort on ROMs where the shell's environment supplies a valid classpath.
+
+The launch command now:
+
+1. Keeps the inherited `BOOTCLASSPATH`.
+2. Falls back to parsing `/apex/com.android.art/etc/classpaths/bootclasspath.pb` and `/system/etc/classpaths/bootclasspath.pb` with `strings` + `grep` + `awk` + `paste` only when the shell has none. This covers HyperOS's extra `system_ext` jars and mirrors the order init uses.
+3. Mirrors the result to `DEX2OATBOOTCLASSPATH` so both ART and dex2oat see a valid boot classpath.
+4. Unsets `CLASSPATH` only — keeping it would shadow the dex path.
+
+Verified on Android 16 / HyperOS: `app_process64` gets past ART with the inherited value, and the fallback path is portable because `strings`, `grep`, `awk`, and `paste` are all present in Android toybox.
 
 ### What the shell UID can and cannot assume
 
@@ -54,6 +89,7 @@ What it is _not_:
 - **It is not a zygote fork.** Its parent process is `app_process`, not `zygote`. `getppid()` and the `PPid` field in `/proc/self/status` reflect the bootstrapped parent, not zygote's PID. XStealth scrubs both, but the scrub is userspace — a kernel-level reader can still see the real parent.
 - **Its SELinux context can differ** on ROMs that enforce stricter labels for non-zygote processes.
 - **It does not inherit zygote's open file descriptors** for the target's data directory.
+- **It is not registered with ActivityManagerService.** AMS tracks app processes in `ProcessRecord`. A shell-spawned process is not in that list; the code's own post-`am start` diagnostic logs `AMS did not route into the bootstrapped process` when this happens. On most apps the bootstrapped instance and the launcher's instance converge on the same application state, but the two PIDs are distinct and only the launcher's is registered. This is the single largest open question in the verification ledger.
 
 These differences are what XStealth's appearance layer and `libxstealth_bridge`'s `/proc` scrubbing are for. They are userspace scrubs, not lineage changes, and cannot close every gap.
 
@@ -70,7 +106,7 @@ Here's what ShizuPosed can reach in bootstrap mode:
 - `Application.attachBaseContext` — hookable
 - `Application.onCreate` — hookable
 - `ContentProvider.onCreate` — hookable, provider classes pre-loaded
-- `Activity.onCreate` — hookable via Pine, Amiru, Native, or Instrumentation
+- `Activity.onCreate` — hookable via Pine, Amiru, Native, CallSite, or Instrumentation
 - `LayoutInflater.inflate` — hookable, drives `XC_LayoutInflated` callbacks
 - `Service.onCreate` — hookable via `ApplicationThread.scheduleCreateService`
 - `BroadcastReceiver.onReceive` — hookable, receiver classes pre-loaded
@@ -139,7 +175,7 @@ If a headless module "works when I open the app normally" — which is the commo
 
 ### What neither path can do
 
-Neither path can inject into a process that someone else started and that ShizuPosed didn't spawn. The monitor notices the process, but its only injection primitive is "spawn a fresh `app_process` for the same package." It cannot attach to the zygote process.
+Neither path can inject into a process that someone else started and that ShizuPosed didn't spawn. The monitor notices the process, but its only injection primitive is "spawn a fresh `app_process` for the same package." It cannot attach to the zygote process. The `pid` argument to `injectProcess` is used for logging only; it is not the target of an attach.
 
 For most apps, this doesn't matter — the bootstrapped instance and the launcher's instance converge on the same application state, and the module's hooks fire against the running app. For apps where it does matter (aggressive process restarts, process-level locks), the explicit-launch path is the answer, and even it has a fallback case where the app restarts itself and the UI ends up in a zygote process without hooks.
 
@@ -149,13 +185,24 @@ The explicit-launch path:
 
 1. Boot the target process with hooks installed:
    ```
-   unset CLASSPATH; unset BOOTCLASSPATH;
+   unset CLASSPATH;
+   if [ -z "$BOOTCLASSPATH" ]; then ... (parse classpath protobufs) ... fi;
+   if [ -z "$DEX2OATBOOTCLASSPATH" ]; then DEX2OATBOOTCLASSPATH="$BOOTCLASSPATH"; fi;
+   export BOOTCLASSPATH DEX2OATBOOTCLASSPATH;
    <prefix> app_process ... XposedHook <pkg> 0 <uid> & [disown]
    ```
 2. Open the target's UI in that already-running process:
    ```
    am start --user current -n <resolved-component>
    ```
+
+After `am start`, the service compares the target-package process count before and after. If `am start` created a second process (`after > before + 1`), the launcher's UI is in a zygote process without hooks and the log says so:
+
+```
+AM START created a second process for <pkg> (before=N, after=M).
+AMS did not route into the bootstrapped process; the UI is running
+without hooks.
+```
 
 ### Monitor-triggered injection sequence
 
@@ -165,6 +212,15 @@ The headless path:
 2. For each new process whose package is scoped by at least one enabled module, calls `injectProcess`.
 3. `injectProcess` runs a **spawn-only** routed launch (step 1 above, without step 2).
 4. The monitor path is silent — it doesn't broadcast a launch result, so the manager UI never raises a popup for an app the user opened themselves.
+
+### Spawn-only success semantics
+
+A spawn-only launch (monitor path or `injectProcess`) reports success only when there is evidence the child survived the bootstrap window:
+
+- the marker `<shell-base>/hooked/<pkg>.json` exists, **or**
+- the target process is still alive after the wait.
+
+If neither is true, the launch reports failure with `bootstrap did not survive (no marker, no process)` and points at `launch.log`. Earlier builds logged "hooks installed" unconditionally here, which masked real failures (e.g. the `BOOTCLASSPATH` SIGABRT). That path is gone.
 
 ### The marker
 
@@ -338,6 +394,20 @@ Target process (bootstrapped by ShizuPosed)
   │     └── ThreadNameScrub      thread renaming
   └── markers written to         <shell-base>/hooked/
 
+Native backends (loaded into the target process):
+  ├── libpine.so                 Pine AUTO / REPLACEMENT
+  ├── libamiru.so                Amiru per-method stub
+  ├── libshizuposed.so           Native shared-dispatcher engine
+  │     ├── nHookArtMethod       entry-point replacement
+  │     ├── nRegisterCallback    callback stub + registry
+  │     ├── emit_callback_stub   dispatcher stub
+  │     ├── szp_dispatch_c       single dispatch entry (Java side)
+  │     ├── shizuposed_lazy_install_artmethod
+  │     └── shizuposed_unhook_artmethod
+  └── libcallsite.so             interpreter-table deferred trigger
+        ├── handler_check_impl   first-sighting handoff
+        └── interpreter-slot patch (dispatch-table entry)
+
 Manager process
   ├── ProcessMonitor             /proc scan + marker mirror refresh
   ├── MarkerCache                local mirror of <shell-base>/hooked/
@@ -354,6 +424,8 @@ Manager process
         ├── AxmlPatcher          in-place AXML string-pool rewrite
         └── ManagerMigrate       settings / DB / module keystore / cloak key transfer
 ```
+
+**CallSite's path, in one line:** `libcallsite.so` patches ART's interpreter dispatch table; when an interpreted call hits a patched slot, the trampoline calls `handler_check_impl(ArtMethod*)`, which on first sighting hands off to `shizuposed_lazy_install_artmethod`. That call performs the entry-point replacement exactly as `nHookArtMethod` would. After that, the callback stub from `nRegisterCallback` runs, routing through `szp_dispatch_c` — the **same** dispatcher Native hooks use. There is exactly one dispatch path, not two.
 
 ---
 
@@ -380,7 +452,7 @@ This is what makes both of these work through the same `lpparam.classLoader`:
 
 Not every method can be hooked the same way, so the dispatcher tries a fixed order and takes the first backend that succeeds.
 
-**Pine AUTO** is the primary engine. Pine REPLACEMENT catches methods Pine AUTO rejects. Amiru is a per-method stub engine reached when Pine declines. CallSite patches the ART interpreter dispatch table (non-functional; every install is refused — see [CallSite backend status](#callsite-backend-status)). Native is the original `libshizuposed.so` shared-dispatcher engine. Instrumentation covers the Application and Activity lifecycle only. Proxy handles interface methods. Noop always succeeds and does nothing.
+**Pine AUTO** is the primary engine. Pine REPLACEMENT catches methods Pine AUTO rejects. Amiru is a per-method stub engine reached when Pine declines. **CallSite** patches the ART interpreter dispatch table and defers the entry-point replacement until the first interpreted invocation of a hooked method — its purpose is detection-evasion, not a distinct dispatch mechanism. It hands off to the Native backend on first hit. Native is the original `libshizuposed.so` shared-dispatcher engine. Instrumentation covers the Application and Activity lifecycle only. Proxy handles interface methods. Noop always succeeds and does nothing.
 
 ### What each backend can actually hook
 
@@ -389,12 +461,12 @@ Not every method can be hooked the same way, so the dispatcher tries a fixed ord
 | Pine AUTO | yes | yes | yes | yes | yes | yes |
 | Pine REPLACEMENT | yes | yes | yes | yes | yes | yes |
 | Amiru | yes | **yes (1.4.9)** | yes | **yes (1.4.9)** | **yes (1.4.9)** | no |
-| CallSite | n/a | n/a | n/a | n/a | n/a | n/a |
+| CallSite | **delegates to Native** | **delegates to Native** | **delegates to Native** | **delegates to Native** | **delegates to Native** | **delegates to Native** |
 | Native (`libshizuposed`) | yes | **null** | yes | **not replaceable** | **null** | yes |
 | Instrumentation | yes | yes | n/a | n/a | yes | n/a |
 | Proxy | yes | yes | yes | yes | yes | no |
 
-The **Native** row is the one that carries the important limitation. A module that hooks `void foo(String s)` and reads `s` receives `null` if the hook lands on Native.
+The **Native** row is the one that carries the important limitation. A module that hooks `void foo(String s)` and reads `s` receives `null` if the hook lands on Native. CallSite, because it hands off to Native's `nRegisterCallback` + `emit_callback_stub`, inherits that limitation — the deferred trigger changes *when* the hook is installed, not *what* the callback sees.
 
 Amiru carries objects since 1.4.9 (the C-side `box_arg` passes `L` / `[` register values through as `jobject` handles; `AmiruDispatcher` reports results via `setAmiruResult` so the stub distinguishes "returned null" from "did nothing"). Constructors and after-hooks are still unsupported on Amiru.
 
@@ -404,11 +476,23 @@ Pine's `MethodHook` gives a `CallFrame` with `thisObject` and `args`, and `PineB
 
 ### CallSite backend status
 
-CallSite is present in the dispatcher chain, but it is **not functional**. `install_hook_impl` refuses every install with a logged reason. The interpreter-table scanner, decoder, and patch machinery are preserved as scaffolding.
+CallSite is **functional**, but its role is narrower than "another complete hooking engine":
+
+- **It is a deferred trigger, not a dispatcher.** CallSite does not own a callback registry and does not build its own Java-dispatch path. On install it only arms an intercept record and patches ART's interpreter dispatch table. On the first interpreted invocation of a hooked method, it calls `shizuposed_lazy_install_artmethod` — a direct-C export from `libshizuposed.so` — which performs the entry-point replacement that `nHookArtMethod` would have done eagerly. After that, the **Native backend owns the hook** and the callback runs through `szp_dispatch_c`, the single dispatcher Native hooks use.
+- **It preserves its reason for existing.** The ArtMethod entry point is untouched at hook-install time. A pre-launch hook-detection check sees no modification. After the first interpreted call, the entry is replaced like any Native hook, so subsequent interpreted and JIT-compiled calls are also intercepted.
+- **It requires the Native backend.** Without `libshizuposed.so` loaded (`NativeBridge.nIsAvailable()` false, or the `shizuposed_lazy_install_artmethod` symbol unresolved), CallSite refuses every install — there's no dispatch path without it. The Java side reports *"inactive (native bridge absent)"* in that case, and `CallSiteBackend.isAvailable()` returns false so the dispatcher moves on.
+- **It inherits Native's callback contract.** Object arguments arrive as `null`, object returns are not replaceable, `thisObject` is `null`, constructors are hookable. See the Native row in the table above.
+- **Constructors are not supported by CallSite.** `hookConstructor` returns `false` so the dispatcher tries another backend.
+- **Idempotent handoff.** If the method is already hooked by another path when the first interpreted invocation fires, `shizuposed_lazy_install_artmethod` returns the existing trampoline rather than installing a second one. CallSite's branch then goes to the existing hook — no duplicate stub.
+- **Graceful degradation when the bridge refuses.** If `shizuposed_lazy_install_artmethod` returns 0 (no layout, no registered callback, `MAX_ART_HOOKS` exhausted, allocation failure), the interpreter trampoline falls through to the original handler unchanged. CallSite behaves as if it weren't there.
+
+The interpreter-table scanner, ARM64 decoder, validator, and patch machinery are all real and exercised at init; the trampoline's `handler_check` → `cbnz` → branch-to-bridge-or-original control flow is the v0.4.1 design.
 
 ### Native-hook safety gate
 
 `libshizuposed.so`'s `nHookNative` refuses native hooks whose first instruction is PC-relative (ADRP, ADR, B, BL, LDR-literal, ADD/SUB-from-PC). The trampoline replays `src[0]` verbatim; a PC-relative first instruction would compute its target relative to the trampoline instead of the original function. Refusing with `JNI_FALSE` lets the dispatcher fall back to another backend instead of producing a wrong trampoline that crashes.
+
+This gate applies to `nHookNative` (raw native address hooks). It does **not** apply to `nHookArtMethod` or `shizuposed_lazy_install_artmethod` — those replace the ArtMethod entry pointer, which is a data write, not a code patch.
 
 ### Disabling a backend
 
@@ -782,7 +866,9 @@ Layout hooks are classic-only in API 102.
 
 ### Writing a hook that works on every backend
 
-Pine honors every argument mutation. Constructors are hookable on Pine and Native; Amiru and Proxy do not support constructor hooks. Native passes object arguments as `null`; Amiru carries object arguments since 1.4.9.
+Pine honors every argument mutation and every return value. Constructors are hookable on Pine, Native, and CallSite. Amiru and Proxy do not support constructor hooks.
+
+Object arguments are the caveat: Native passes them as `null`, and because CallSite hands off to Native's callback stub, CallSite inherits the same limitation. If your hook reads `String` / `Object` / array arguments, Pine and Amiru (since 1.4.9) are the backends that will actually carry them. CallSite is **not** a workaround for Native's null-object-args — it's a detection-evasion trigger that defers the same Native hook.
 
 ---
 
@@ -882,6 +968,8 @@ The single-flavor release is the only build. `checkNoOldPackageLeak` runs as a `
 
 The six native libraries (`libshizuposed.so`, `libamiru.so`, `libcallsite.so`, `libxstealth.so`, `libxstealth_next.so`, `libxstealth_bridge.so`) and the optional `libsysku.so` build with the Android NDK. Build for API 29 or higher.
 
+`libcallsite.so` (v0.4.1) resolves `shizuposed_lazy_install_artmethod` / `shizuposed_unhook_artmethod` from `libshizuposed.so` (v1.2.3) via `dlsym(RTLD_DEFAULT, ...)` on first use. If `libshizuposed.so` is loaded after `libcallsite.so`, the resolution is retried automatically — order of loading does not matter for correctness.
+
 ### The build checks
 
 `app/build.gradle` includes seven verification tasks: `checkNativeShim` (required), `checkCallSite`, `checkAmiru`, `checkXStealth`, `checkXStealthNext`, `checkXStealthBridge`, `checkSysku` (all optional, warn-only). Skip all seven with `-PskipNativeCheck=true`.
@@ -900,9 +988,17 @@ Every routed launch writes stderr and stdout from `app_process` to `<shell-base>
 cat /data/user/0/com.android.shell/files/.syscall_cache/launch.log
 ```
 
-`logcat -s PineBackend` shows whether Pine initialized and every hook it installed or declined. `logcat -s ShizuPosedAmiru` shows Amiru's slot activity and layout probe result.
+`logcat -s PineBackend` shows whether Pine initialized and every hook it installed or declined. `logcat -s ShizuPosedAmiru` shows Amiru's slot activity and layout probe result. `logcat -s CallSite` shows the interpreter-table scan, `native bridge resolved`, `armed ArtMethod`, and on first interpreted hit, `lazy_install: art_method ... entry -> stub ...`.
 
-Each bootstrap also writes a marker to `<shell-base>/hooked/<pkg>.json` when it completes.
+Each bootstrap also writes a marker to `<shell-base>/hooked/<pkg>.json` when it completes. A spawn-only launch that produced neither a marker nor a live process reports failure — see [Spawn-only success semantics](#spawn-only-success-semantics).
+
+For the verification ledger, the following log lines are the ones to look for:
+
+- `Bootstrap ready for <pkg> (marker at Nms, waited Mms)` — the child survived and wrote its marker.
+- `Bootstrap process up for <pkg> (process at Nms, no marker after Mms)` — the child survived the wait but did not write a marker; the app likely has no applicable modules.
+- `Bootstrap not detected for <pkg> after Nms` — the child died; check `launch.log` for the ART abort reason.
+- `AM START created a second process for <pkg> (before=N, after=M). AMS did not route into the bootstrapped process` — the launcher's UI is in a zygote process without hooks. This is the AMS `ProcessRecord` gap in observable form.
+- `Spawn-only launch for <pkg> produced no marker and no live process — reporting failure` — the false-success path that older builds hit. Now a hard failure.
 
 ---
 
@@ -918,13 +1014,23 @@ These are structural, not bugs to be fixed.
 
 **The process is not a zygote fork.** After `setuid`, its parent is `app_process`, not `zygote`. XStealth's appearance layer scrubs the userspace-visible fields; the kernel task struct is unchanged. `Uid:`, SELinux context, and process start time are unchanged.
 
+**The process is not registered with AMS.** AMS tracks app processes in `ProcessRecord`; a shell-spawned process is not in that list. The code's post-`am start` diagnostic detects when the UI ends up in a different (zygote) process than the bootstrapped one and logs it. Whether AMS actively reaps an unregistered bootstrapped process before hooks fire is the largest open question in the [verification ledger](#verification-status).
+
 **The appearance layer is trust-gated.** Framework threads that call `getppid()` see the real parent PID.
 
 **The appearance layer requires `libxstealth`'s exports.**
 
-**Monitor-triggered injection doesn't attach to the detected pid.** It spawns a fresh `app_process` for the same package. For most headless modules this is the normal workflow and works; for apps that aggressively restart their process, it may not produce a usable hooked instance. See [How a module gets into a target process](#how-a-module-gets-into-a-target-process).
+**Monitor-triggered injection doesn't attach to the detected pid.** It spawns a fresh `app_process` for the same package; the `pid` argument is used for logging only. For most headless modules this is the normal workflow and works; for apps that aggressively restart their process, it may not produce a usable hooked instance. See [How a module gets into a target process](#how-a-module-gets-into-a-target-process).
 
 **Object arguments on the Native backend.** Native passes object arguments to Java callbacks as `null`, and does not accept object return values. `thisObject` is also `null`. Pine, Amiru (since 1.4.9), Instrumentation, and Proxy handle objects correctly.
+
+**CallSite inherits the Native callback contract.** Because CallSite is a deferred trigger in front of the Native backend — not an independent dispatch path — object arguments arrive as `null`, object returns are not replaceable, and `thisObject` is `null`. CallSite's reason for existing is detection-evasion (the entry point is untouched until first interpreted call), not a different callback contract.
+
+**CallSite requires the Native backend.** Without `libshizuposed.so` loaded and `shizuposed_lazy_install_artmethod` resolvable, CallSite refuses every install and `isAvailable()` returns false. There is no separate dispatch path; this is the design.
+
+**CallSite does not support constructors.** `hookConstructor` returns `false` so the dispatcher tries another backend. Constructors are hookable via Pine and Native (not via CallSite).
+
+**CallSite's first-interpreted-call trigger is, by definition, first-call.** Between hook install and first interpreted invocation, the entry point is untouched — that's the point — but it also means a method that is never interpreted (e.g., already JIT-compiled before the hook was armed) is not intercepted by CallSite. When that happens, `handler_check_impl` is never invoked, `shizuposed_lazy_install_artmethod` is never called, and no hook fires. This is the same "interpreted execution only" ceiling as before — but the ceiling is on *trigger delivery*, not on *hook dispatch*: once fired, the hook covers JIT-compiled calls too, because the entry-point replacement is what Native owns.
 
 **Amiru doesn't support constructors or after-hooks.** Constructor hooks fall through to the next backend; after-hooks are not implemented in the stub.
 
@@ -937,8 +1043,6 @@ These are structural, not bugs to be fixed.
 **libxposed API reports 102, not 103.**
 
 **Native hooks refuse non-relocatable first instructions.** A native hook whose first instruction is PC-relative is refused with `JNI_FALSE` so the dispatcher falls back.
-
-**CallSite is non-functional.** Every install is refused.
 
 **`IXposedHookCmdInit` links but never fires.** The `cmd` process is a protected-UID system process and cannot be bootstrapped. A module that implements `IXposedHookCmdInit` loads (no `NoClassDefFoundError`), but its `initCmdProcess` callback is never invoked. Modules whose activation depends on it will report "not activated." This is the same declared-but-never-invoked pattern used for `onSystemServerStarting` and `onHotReloading`.
 

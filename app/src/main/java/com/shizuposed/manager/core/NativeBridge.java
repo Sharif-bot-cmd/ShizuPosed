@@ -32,6 +32,16 @@ import de.robv.android.xposed.XC_MethodHook;
  * public method the native, and move the logging into the native
  * or into the call sites. The wrapper's `try/catch` blocks are
  * the only reason it exists, so that's a bigger change.
+ *
+ * VISIBILITY NOTE
+ * ---------------
+ * The `n*` natives for libshizuposed are public so that backends
+ * outside this package (notably CallSiteBackend, which needs to
+ * register with the Native dispatcher and probe availability
+ * before arming its own deferred trigger) can use them. Callers
+ * that only need the routed behavior should still prefer the
+ * public wrappers (registerCallback, unregisterCallback,
+ * hookArtMethodRouted, unhookArtMethodRouted).
  */
 public final class NativeBridge {
 
@@ -42,6 +52,7 @@ public final class NativeBridge {
     private static volatile boolean dispatchStubResolved = false;
     private static volatile boolean loaded = false;
     private static volatile boolean available = false;
+    private static volatile boolean availableChecked = false;
 
     // ─── libamiru state ────────────────────────────────────────────
     private static volatile boolean amiruLoaded = false;
@@ -86,13 +97,19 @@ public final class NativeBridge {
     public static boolean isAvailable() {
         if (!loaded) return false;
         if (available) return true;
-        try {
-            available = nIsAvailable();
-        } catch (Throwable t) {
-            CompatLog.w(TAG, "nIsAvailable threw", t);
-            available = false;
+        if (availableChecked) return false;
+        synchronized (NativeBridge.class) {
+            if (available) return true;
+            if (availableChecked) return false;
+            try {
+                available = nIsAvailable();
+            } catch (Throwable t) {
+                CompatLog.w(TAG, "nIsAvailable threw", t);
+                available = false;
+            }
+            availableChecked = true;
+            return available;
         }
-        return available;
     }
 
     public static String layoutInfo() {
@@ -530,16 +547,24 @@ public final class NativeBridge {
 
     // ═════════════════════════════════════════════════════════════
     // NATIVES — libshizuposed
+    //
+    // nIsAvailable, nRegisterCallback and nUnregisterCallback are
+    // public because CallSiteBackend (in
+    // com.shizuposed.manager.core.backends) needs them to probe the
+    // dispatcher before arming its deferred trigger. Callers that
+    // only need routed behavior should still use the public
+    // wrappers above (isAvailable, registerCallback,
+    // unregisterCallback).
     // ═════════════════════════════════════════════════════════════
 
-    private static native boolean nIsAvailable();
+    public  static native boolean nIsAvailable();
     private static native String  nLayoutInfo();
     private static native boolean nHookArtMethod(Method m, long replacement, long[] out);
     private static native boolean nUnhookArtMethod(Method m);
     private static native boolean nHookNative(long target, long replacement, long[] out);
     private static native long    nDlsym(String library, String symbol);
-    private static native long    nRegisterCallback(Method m, XC_MethodHook callback);
-    private static native boolean nUnregisterCallback(Method m);
+    public  static native long    nRegisterCallback(Method m, XC_MethodHook callback);
+    public  static native boolean nUnregisterCallback(Method m);
     private static native void    nSetDispatchResult(boolean hasResult,
                                                      boolean isWide,
                                                      long value);

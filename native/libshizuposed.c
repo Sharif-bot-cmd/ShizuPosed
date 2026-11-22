@@ -1,34 +1,3 @@
-/*
- * libshizuposed.c
- *
- * Original shared-dispatcher backend for ShizuPosed.
- *
- * v1.2.2 changes:
- *   • nHookNative now refuses hooks whose first instruction is
- *     PC-relative (ADRP, ADR, B, BL, LDR-literal, ADD/SUB-from-
- *     PC). The trampoline replays src[0] verbatim; a PC-relative
- *     first instruction would compute its target relative to the
- *     trampoline instead of the original function, producing a
- *     wrong result or a crash. The safe behavior is to return
- *     JNI_FALSE so the dispatcher can fall back to another
- *     backend.
- *   • Version bumped to 1.2.2.
- *
- * Provides:
- *   • ArtMethod entry-point hooks (nHookArtMethod)
- *   • Native (inline) hooks at raw addresses (nHookNative)
- *   • A callback registry that maps hooked methods to Java
- *     XC_MethodHook instances (nRegisterCallback)
- *   • Symbol lookup from another library (nDlsym)
- *   • A thread-local dispatch-result slot the Java dispatcher
- *     writes into (nSetDispatchResult, szp_take_dispatch_result)
- *
- * Build:
- *   clang -shared -fPIC -O2 -Wall -Wextra \
- *       -o libshizuposed.so libshizuposed.c \
- *       -llog -ldl -lpthread
- */
-
 #define _GNU_SOURCE
 
 #include <jni.h>
@@ -49,7 +18,7 @@
 #define ALOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-#define SHIZUPOSED_VERSION "1.2.2"
+#define SHIZUPOSED_VERSION "1.2.3"
 
 #define MAX_ART_HOOKS    256
 #define MAX_INLINE_HOOKS 256
@@ -399,7 +368,7 @@ Java_com_shizuposed_manager_core_NativeBridge_nDescribeStubTemplate(
     (void) clazz;
     char buf[256];
     snprintf(buf, sizeof(buf),
-        "stub: self-contained (no template override, v1.2.2)");
+        "stub: self-contained (no template override, v1.2.3)");
     return (*env)->NewStringUTF(env, buf);
 }
 
@@ -788,6 +757,156 @@ Java_com_shizuposed_manager_core_NativeBridge_nSetDispatchResult(
     (void) env; (void) clazz;
     t_dispatchResult.has_result = (skip || override_ret) ? 1 : 0;
     t_dispatchResult.value = (int64_t) value;
+}
+
+/* ─────────────────────────────────────────────────────────────
+ * Direct-C handoff exports for CallSite's deferred-trigger path.
+ *
+ * These are not JNI functions: they take an ArtMethod* directly
+ * and are callable from the interpreter trampoline, where no
+ * JNIEnv* is guaranteed.
+ * ───────────────────────────────────────────────────────────── */
+
+/*
+ * Idempotent entry-point replacement for an ArtMethod that
+ * already has a registered callback stub.
+ *
+ * Called by CallSite's interpreter trampoline on first sighting
+ * of a hooked ArtMethod. Behaviour:
+ *   • If already hooked, returns the existing trampoline
+ *     (so CallSite's branch is idempotent).
+ *   • If a callback stub is registered for this ArtMethod,
+ *     installs it as the entry point exactly as nHookArtMethod
+ *     would, and returns the new trampoline.
+ *   • Otherwise returns 0 — CallSite's trampoline falls through
+ *     to the original handler, unchanged.
+ *
+ * The callback registry is NOT modified here. The Java layer
+ * must have called nRegisterCallback first; this function only
+ * performs the entry-point replacement that CallSite was
+ * deferring.
+ */
+int64_t shizuposed_lazy_install_artmethod(int64_t art_method) {
+    if (art_method == 0 || !g_layout_valid) return 0;
+
+    pthread_mutex_lock(&g_art_mu);
+
+    /* Already hooked? Return the existing trampoline (idempotent). */
+    for (uint32_t i = 0; i < g_art_hook_count; i++) {
+        if (g_art_hooks[i].art_method == art_method) {
+            int64_t t = (int64_t) (intptr_t) g_art_hooks[i].trampoline;
+            pthread_mutex_unlock(&g_art_mu);
+            return t;
+        }
+    }
+
+    if (g_art_hook_count >= MAX_ART_HOOKS) {
+        pthread_mutex_unlock(&g_art_mu);
+        return 0;
+    }
+
+    int64_t orig_entry =
+        *(int64_t *) ((char *) art_method + g_layout_entry_offset);
+    if (orig_entry == 0) {
+        pthread_mutex_unlock(&g_art_mu);
+        return 0;
+    }
+
+    /*
+     * Find the callback stub registered via nRegisterCallback.
+     * Without one there is nothing to install; refuse so CallSite
+     * falls through to the original handler.
+     */
+    int64_t replacement = 0;
+    pthread_mutex_lock(&g_callback_mu);
+    for (uint32_t i = 0; i < g_callback_count; i++) {
+        if (g_callbacks[i].art_method == art_method) {
+            replacement = (int64_t) (intptr_t) g_callbacks[i].stub;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_callback_mu);
+
+    if (replacement == 0) {
+        pthread_mutex_unlock(&g_art_mu);
+        return 0;
+    }
+
+    void *tramp = alloc_code_near(orig_entry, 0x20);
+    if (tramp == NULL) {
+        pthread_mutex_unlock(&g_art_mu);
+        return 0;
+    }
+
+    uint32_t *tp = (uint32_t *) tramp;
+    emit_load64_x9(tp, (uint64_t) orig_entry);
+    tp[4] = INSN_BR_X9;
+    __clear_cache(tramp, (char *) tramp + 0x20);
+    seal_code_page(tramp);
+
+    void *page = (void *) (((int64_t) art_method + g_layout_entry_offset)
+                           & ~0xfffULL);
+    if (mprotect(page, 0x1000, PROT_READ | PROT_WRITE) != 0) {
+        munmap(tramp, 0x20);
+        pthread_mutex_unlock(&g_art_mu);
+        return 0;
+    }
+    *(int64_t *) ((char *) art_method + g_layout_entry_offset) = replacement;
+    __clear_cache((char *) art_method + g_layout_entry_offset,
+                  (char *) art_method + g_layout_entry_offset + 8);
+    mprotect(page, 0x1000, PROT_READ);
+
+    uint32_t slot = g_art_hook_count++;
+    g_art_hooks[slot].art_method = art_method;
+    g_art_hooks[slot].orig_entry = orig_entry;
+    g_art_hooks[slot].trampoline = tramp;
+    g_art_hooks[slot].tramp_len = 0x20;
+
+    ALOGI("lazy_install: art_method %p entry %p -> stub %p (tramp %p)",
+          (void *) art_method, (void *) orig_entry,
+          (void *) replacement, tramp);
+
+    pthread_mutex_unlock(&g_art_mu);
+    return (int64_t) (intptr_t) tramp;
+}
+
+/*
+ * Direct-C mirror of nUnhookArtMethod for CallSite's handoff
+ * path. Restores the original entry point and frees the
+ * trampoline. Returns 1 on success, 0 if the method wasn't
+ * hooked by the ArtMethod path.
+ */
+int32_t shizuposed_unhook_artmethod(int64_t art_method) {
+    if (art_method == 0 || !g_layout_valid) return 0;
+
+    pthread_mutex_lock(&g_art_mu);
+    for (uint32_t i = 0; i < g_art_hook_count; i++) {
+        if (g_art_hooks[i].art_method != art_method) continue;
+
+        int64_t orig_entry = g_art_hooks[i].orig_entry;
+        void *tramp = g_art_hooks[i].trampoline;
+        size_t tramp_len = g_art_hooks[i].tramp_len;
+
+        uint32_t last = --g_art_hook_count;
+        if (i != last) g_art_hooks[i] = g_art_hooks[last];
+
+        pthread_mutex_unlock(&g_art_mu);
+
+        void *page = (void *) (((int64_t) art_method + g_layout_entry_offset)
+                               & ~0xfffULL);
+        if (mprotect(page, 0x1000, PROT_READ | PROT_WRITE) != 0) {
+            return 0;
+        }
+        *(int64_t *) ((char *) art_method + g_layout_entry_offset) = orig_entry;
+        __clear_cache((char *) art_method + g_layout_entry_offset,
+                      (char *) art_method + g_layout_entry_offset + 8);
+        mprotect(page, 0x1000, PROT_READ);
+
+        if (tramp != NULL) munmap(tramp, tramp_len);
+        return 1;
+    }
+    pthread_mutex_unlock(&g_art_mu);
+    return 0;
 }
 
 /* ─────────────────────────────────────────────────────────────

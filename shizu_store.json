@@ -9,8 +9,8 @@
 
   "developer_message": "Built for people who can't root or won't. The Hide ShizuPosed app flow rebuilds the APK under a new package name and re-signs it with a key bundled in the manager — every cloak produces an APK with the same signature, so a target app that fingerprints the signature can still identify it. If a module doesn't work, check the compatibility notes before reporting it as broken — many modules need system_server or zygote coverage, and that's a structural limit, not a bug.",
 
-  "version_name": "1.4.10",
-  "version_code": 5870,
+  "version_name": "1.5.1",
+  "version_code": 5910,
   "min_sdk": 28,
   "target_sdk": 37,
   "license": "Apache-2.0",
